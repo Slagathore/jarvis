@@ -1,0 +1,8 @@
+packages:
+  base: !include node_base.yaml
+
+substitutions:
+  node_name:    "jarvis-node-kitchen"
+  room_display: "Kitchen"
+  room_id:      "kitchen"
+  node_ip:      !secret node_kitchen_ip

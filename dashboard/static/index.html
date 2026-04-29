@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JARVIS — Command Center</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Inter:wght@300;400;500&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div class="scanlines"></div>
+
+    <header>
+      <div class="logo">
+        <span class="logo-j">J</span>ARVIS
+        <span class="version">v1.0</span>
+      </div>
+      <div class="header-status">
+        <div class="clock" id="clock">--:--:--</div>
+        <div class="ws-status" id="ws-status">
+          <span class="dot offline"></span> OFFLINE
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <!-- LEFT COLUMN -->
+      <div class="col col-left">
+        <!-- Activity State Card -->
+        <div class="card card-primary" id="activity-card">
+          <div class="card-label">ACTIVITY STATE</div>
+          <div class="activity-name" id="activity-name">INITIALIZING</div>
+          <div class="activity-sub">
+            <span id="activity-location">—</span>
+            <span class="sep">·</span>
+            <span id="activity-context">—</span>
+          </div>
+
+          <div class="gauge-wrap">
+            <div class="gauge-label">INTERRUPTIBILITY</div>
+            <div class="gauge-track">
+              <div class="gauge-fill" id="gauge-fill" style="width: 50%"></div>
+            </div>
+            <div class="gauge-value" id="gauge-value">0.50</div>
+          </div>
+
+          <div class="signals" id="signals">
+            <!-- Signal chips rendered by JS -->
+          </div>
+
+          <div class="confidence" id="confidence">Confidence: —</div>
+        </div>
+
+        <!-- Appliances Card -->
+        <div class="card" id="appliances-card">
+          <div class="card-label">APPLIANCES</div>
+          <div class="appliance-list">
+            <div class="appliance" id="appl-washer">
+              <div class="appl-icon">⌁</div>
+              <div class="appl-info">
+                <div class="appl-name">WASHER</div>
+                <div class="appl-status" id="appl-washer-status">idle</div>
+              </div>
+              <div class="appl-time" id="appl-washer-time">—</div>
+            </div>
+            <div class="appliance" id="appl-dryer">
+              <div class="appl-icon">◎</div>
+              <div class="appl-info">
+                <div class="appl-name">DRYER</div>
+                <div class="appl-status" id="appl-dryer-status">idle</div>
+              </div>
+              <div class="appl-time" id="appl-dryer-time">—</div>
+            </div>
+            <div class="appliance" id="appl-dishwasher">
+              <div class="appl-icon">≋</div>
+              <div class="appl-info">
+                <div class="appl-name">DISHWASHER</div>
+                <div class="appl-status" id="appl-dishwasher-status">idle</div>
+              </div>
+              <div class="appl-time" id="appl-dishwasher-time">—</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- System Health Card -->
+        <div class="card" id="health-card">
+          <div class="card-label">SYSTEM HEALTH</div>
+          <div class="health-list" id="health-list">
+            <div class="health-item">
+              <span class="dot" id="h-ollama"></span>
+              <span class="health-name">Ollama LLM</span>
+              <span class="health-detail" id="h-ollama-detail">—</span>
+            </div>
+            <div class="health-item">
+              <span class="dot" id="h-mqtt"></span>
+              <span class="health-name">MQTT Broker</span>
+              <span class="health-detail" id="h-mqtt-detail">—</span>
+            </div>
+            <div class="health-item">
+              <span class="dot" id="h-whisper"></span>
+              <span class="health-name">Whisper STT</span>
+              <span class="health-detail" id="h-whisper-detail">—</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CENTER COLUMN -->
+      <div class="col col-center">
+        <!-- Rooms Grid -->
+        <div class="card">
+          <div class="card-label">ROOMS</div>
+          <div class="rooms-grid" id="rooms-grid">
+            <!-- Room cards rendered by JS -->
+          </div>
+        </div>
+
+        <!-- Last Speech -->
+        <div class="card card-speech" id="speech-card">
+          <div class="card-label">LAST JARVIS OUTPUT</div>
+          <div class="speech-text" id="speech-text">—</div>
+          <div class="speech-meta">
+            <span id="speech-room">—</span>
+            <span class="sep">·</span>
+            <span id="speech-time">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT COLUMN -->
+      <div class="col col-right">
+        <!-- Conversation Log -->
+        <div class="card card-tall">
+          <div class="card-label">CONVERSATION LOG</div>
+          <div class="conv-log" id="conv-log">
+            <div class="conv-empty">Waiting for first interaction...</div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

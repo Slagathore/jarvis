@@ -1,0 +1,8 @@
+packages:
+  base: !include node_base.yaml
+
+substitutions:
+  node_name:    "jarvis-node-bedroom"
+  room_display: "Bedroom"
+  room_id:      "bedroom"
+  node_ip:      !secret node_bedroom_ip

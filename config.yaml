@@ -1,0 +1,227 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# JARVIS MASTER CONFIGURATION
+# All tunable values live here. Edit this file, not the source code.
+# ═══════════════════════════════════════════════════════════════════════════
+
+system:
+  name: "Jarvis"
+  version: "1.0.0"
+  log_level: "INFO"           # DEBUG | INFO | WARNING | ERROR
+  data_dir: "data/"
+  dashboard_enabled: true
+  dashboard_port: 7070
+  dashboard_host: "0.0.0.0"  # Set to "127.0.0.1" to restrict to localhost
+
+ollama:
+  model: "gemini-3-flash-preview:cloud"
+  vision_model: "gemini-3-flash-preview:cloud"
+  base_url: "http://localhost:11434"
+  timeout_seconds: 30
+  # Jarvis's core personality and context — edit this to your taste
+  # Customize this prompt to match your household — names, pets, work style, etc.
+  system_prompt: |
+    You are Jarvis, an ambient home AI assistant.
+    You live in the house and pay attention to what's going on around you.
+    You are observant, helpful, and have a dry wit. You know when to stay quiet.
+    You speak like a smart friend, not a customer service bot.
+    Never say "I notice" or "I observe" — just say what you see.
+    Keep responses short unless asked for detail.
+
+voice:
+  whisper:
+    model_size: "base"        # tiny | base | small | medium | large-v3
+    device: "cuda"            # cuda | cpu
+    compute_type: "float16"   # float16 (GPU) | int8 (CPU)
+    language: "en"
+    beam_size: 1              # 1 = fastest, 5 = most accurate
+  tts:
+    engine: "piper"           # piper | sapi
+    voice: "en_US-ryan-high"  # Piper voice model name
+    piper_binary: "piper"     # Path to piper binary or just "piper" if in PATH
+    voices_dir: "data/voices" # Directory where .onnx voice model files live
+    speed: 1.0
+    sample_rate: 22050        # Piper outputs 22050Hz by default
+  wake_word:
+    model: "hey_jarvis"       # openWakeWord model name
+    sensitivity: 0.5          # 0.0-1.0, higher = more sensitive (more false positives)
+    cooldown_seconds: 2
+  recording:
+    sample_rate: 16000
+    silence_threshold_db: -40
+    silence_duration_ms: 800   # Stop recording after this much silence
+    max_duration_seconds: 30
+
+mqtt:
+  broker: "localhost"
+  port: 1883
+  username: ""                 # Set in .env if using auth: MQTT_USERNAME
+  password: ""                 # Set in .env if using auth: MQTT_PASSWORD
+  keepalive: 60
+  reconnect_delay_seconds: 5
+  topics:
+    wake:      "jarvis/nodes/{room}/wake"
+    audio_in:  "jarvis/nodes/{room}/audio/in"
+    audio_out: "jarvis/nodes/{room}/audio/out"
+    status:    "jarvis/nodes/{room}/status"
+    vision:    "jarvis/vision/{room}/frame"
+    reminder:  "jarvis/events/reminder"
+    state:     "jarvis/system/state"         # Broadcast current activity state
+
+rooms:
+  - id: "office"
+    display_name: "Office"
+    camera_source: 0           # USB webcam, OpenCV device index
+    has_node: false            # Set true when ESP32-CAM is deployed
+    node_ip: null
+  - id: "bedroom"
+    display_name: "Bedroom"
+    camera_source: null        # null until ESP32-CAM deployed
+    has_node: false
+    node_ip: null
+  - id: "kitchen"
+    display_name: "Kitchen"
+    camera_source: null
+    has_node: false
+    node_ip: null
+  - id: "living_room"
+    display_name: "Living Room"
+    camera_source: null
+    has_node: false
+    node_ip: null
+
+context:
+  vision_scan_interval_minutes: 5
+  pc_poll_interval_seconds: 10
+  audio_classify_window_seconds: 3
+  posture_analysis_fps: 1
+
+interruptibility:
+  quiet_hours_start: "22:00"
+  quiet_hours_end: "08:00"
+  interrupt_cooldown_minutes: 5
+  activity_scores:
+    sleeping:        0.00
+    napping:         0.00
+    gaming:          0.15
+    coding:          0.20
+    reading:         0.30
+    watching_media:  0.25
+    video_call:      0.05
+    cooking:         0.70
+    eating:          0.50
+    browsing_social: 0.80
+    browsing_general: 0.65
+    writing:         0.25
+    note_taking:     0.40
+    ai_image_gen:    0.60
+    idle:            0.90
+    away:            0.00
+    unknown:         0.50
+
+curiosity:
+  enabled: true
+  topic_cooldowns_hours:
+    gaming:    4
+    reading:   6
+    nap_check: 12
+    morning:   24
+    cooking:   2
+    comfyui:   3
+    coding:    8
+  # Minimum interruptibility score required for proactive speech
+  min_interruptibility: 0.35
+  # How often (seconds) to check for proactive speech opportunities
+  check_interval_seconds: 60
+
+appliances:
+  washer_min_cycle_minutes: 25
+  dryer_done_urgency: 0.8
+  dishwasher_done_urgency: 0.4
+  silence_done_threshold_seconds: 120
+
+memory:
+  db_path: "data/jarvis.db"
+  max_conversation_turns: 20
+  room_baseline_update_hours: 24
+
+# ── Process → Activity mapping for PC monitor ──────────────────────────────
+# Key is the process .exe name (case-insensitive), value is the activity label.
+# Window title keywords (checked against active window title) override process name.
+process_activity_map:
+  # Games & launchers
+  steam.exe:              gaming
+  steamwebhelper.exe:     gaming
+  epicgameslauncher.exe:  gaming
+  gameoverlayui.exe:      gaming
+  leagueclient.exe:       gaming
+  riotclientservices.exe: gaming
+  minecraft.exe:          gaming
+  # Specific game executables
+  cs2.exe:                gaming
+  cyberpunk2077.exe:      gaming
+  elden_ring.exe:         gaming
+  baldursgate3.exe:       gaming
+
+  # Communication
+  discord.exe:            browsing_social
+  zoom.exe:               video_call
+  teams.exe:              video_call
+  slack.exe:              browsing_general
+  signal.exe:             browsing_social
+
+  # Development
+  code.exe:               coding
+  devenv.exe:             coding
+  pycharm64.exe:          coding
+  webstorm64.exe:         coding
+  rider64.exe:            coding
+  windowsterminal.exe:    coding
+  wt.exe:                 coding
+  powershell.exe:         coding
+
+  # Media
+  vlc.exe:                watching_media
+  mpv.exe:                watching_media
+  mpc-hc64.exe:           watching_media
+  potplayermini64.exe:    watching_media
+  wmplayer.exe:           watching_media
+  spotify.exe:            browsing_general
+
+  # Creative / AI
+  comfyui:                ai_image_gen
+  automatic1111:          ai_image_gen
+  invokeai.exe:           ai_image_gen
+  krita.exe:              writing
+  gimp-2.10.exe:          writing
+  blender.exe:            ai_image_gen
+
+  # Writing / Notes
+  notepad++.exe:          writing
+  obsidian.exe:           note_taking
+  notion.exe:             note_taking
+  typora.exe:             writing
+  winword.exe:            writing
+  onenote.exe:            note_taking
+
+# Window title substrings that override process-based detection
+# These are matched case-insensitively against the active window title.
+window_title_activity_map:
+  youtube.com:            watching_media
+  netflix.com:            watching_media
+  twitch.tv:              watching_media
+  hulu.com:               watching_media
+  hbomax.com:             watching_media
+  disneyplus.com:         watching_media
+  primevideo.com:         watching_media
+  twitter.com:            browsing_social
+  x.com:                  browsing_social
+  reddit.com:             browsing_social
+  instagram.com:          browsing_social
+  facebook.com:           browsing_social
+  tiktok.com:             browsing_social
+  github.com:             coding
+  stackoverflow.com:      coding
+  docs.python.org:        coding
+  notion.so:              note_taking
+  obsidian:               note_taking
+  comfyui:                ai_image_gen
