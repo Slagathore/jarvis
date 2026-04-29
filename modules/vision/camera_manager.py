@@ -66,6 +66,10 @@ class CameraManager:
 
     async def load(self) -> None:
         """Open all camera sources defined in config."""
+        if not _CV2_AVAILABLE or cv2 is None:
+            logger.warning("[CameraManager] OpenCV not available — cameras disabled")
+            return
+
         for room_cfg in self._rooms_config:
             room_id = room_cfg.get("id", "unknown")
             source = room_cfg.get("camera_source")
@@ -73,7 +77,6 @@ class CameraManager:
             if source is None and room_cfg.get("has_node", False):
                 node_ip = room_cfg.get("node_ip")
                 if isinstance(node_ip, str) and node_ip.strip():
-                    # OpenCV reads MJPEG streams directly via VideoCapture URL
                     source = f"http://{node_ip}:8080/"
                 else:
                     logger.warning(
@@ -83,18 +86,27 @@ class CameraManager:
             if source is None:
                 continue
 
-            if not _CV2_AVAILABLE or cv2 is None:
-                logger.warning("[CameraManager] OpenCV not available — cannot open cameras")
-                break
-
-            cap = cv2.VideoCapture(source)
-            if cap.isOpened():
-                self._caps[room_id] = cap
-                label = f"camera {source}" if isinstance(source, int) else source
-                logger.info(f"[CameraManager] Opened {label} for '{room_id}'")
-            else:
-                label = f"camera {source}" if isinstance(source, int) else source
-                logger.warning(f"[CameraManager] Could not open {label} for '{room_id}'")
+            label = str(source)
+            logger.info(f"[CameraManager] Connecting to {label} for '{room_id}'...")
+            try:
+                # cv2.VideoCapture blocks (network connection for URLs) — run in thread
+                # with a timeout so an offline node doesn't stall the whole startup.
+                cap = await asyncio.wait_for(
+                    asyncio.to_thread(cv2.VideoCapture, source),
+                    timeout=8.0,
+                )
+                if cap.isOpened():
+                    self._caps[room_id] = cap
+                    logger.info(f"[CameraManager] Opened {label} for '{room_id}'")
+                else:
+                    logger.warning(f"[CameraManager] Could not open {label} for '{room_id}'")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[CameraManager] Timed out connecting to {label} for '{room_id}' — "
+                    "node may be offline"
+                )
+            except Exception as e:
+                logger.warning(f"[CameraManager] Error opening {label} for '{room_id}': {e}")
 
         if not self._caps:
             logger.warning("[CameraManager] No cameras available")
