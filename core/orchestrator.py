@@ -788,5 +788,17 @@ class Orchestrator:
             priority="ambient",
         )
 
-        # Run forever
-        await asyncio.gather(*tasks, return_exceptions=False)
+        # Run forever — cancel all tasks cleanly on exit
+        gather = asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await gather
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            gather.cancel()
+            running = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for t in running:
+                t.cancel()
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
+            logger.info("[Orchestrator] All tasks cancelled. Goodbye.")
