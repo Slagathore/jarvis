@@ -279,7 +279,41 @@ def check_data_files() -> bool:
             warn(f"Could not download YAMNet labels: {e}")
             warn("Audio appliance classification will be limited")
 
+    # openWakeWord models — hey_jarvis_v0.1.onnx is not bundled with the pip package
+    _check_wake_word_models()
+
     return True
+
+
+def _check_wake_word_models() -> None:
+    """Download openWakeWord models if they're missing from the install location."""
+    try:
+        import openwakeword
+        from openwakeword.utils import download_models
+
+        config = _load_config()
+        model_name = config.get("voice", {}).get("wake_word", {}).get("model", "hey_jarvis")
+        onnx_name = f"{model_name}_v0.1.onnx" if not model_name.endswith(".onnx") else model_name
+
+        # Resolve install-local models directory
+        pkg_dir = os.path.dirname(openwakeword.__file__)
+        models_dir = os.path.join(pkg_dir, "resources", "models")
+        onnx_path = os.path.join(models_dir, onnx_name)
+
+        if os.path.exists(onnx_path):
+            ok(f"Wake word model present: {onnx_name}")
+        else:
+            info(f"Downloading wake word model '{model_name}'...")
+            try:
+                versioned = f"{model_name}_v0.1" if not model_name.endswith(("_v0.1", ".onnx", ".tflite")) else model_name
+                download_models(model_names=[versioned])
+                ok(f"Wake word model downloaded: {onnx_name}")
+            except Exception as e:
+                warn(f"Could not download wake word model: {e}")
+                warn("Set voice.wake_word.model in config.yaml to a valid openWakeWord model name")
+
+    except ImportError:
+        pass  # openwakeword not installed — check_packages() will catch it
 
 
 def check_database() -> bool:
