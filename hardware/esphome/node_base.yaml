@@ -1,0 +1,154 @@
+# hardware/esphome/node_base.yaml
+#
+# Base config included by all room nodes via ESPHome packages.
+# Do NOT deploy this file directly — use node_office.yaml, node_bedroom.yaml, etc.
+#
+# Substitution variables provided by each child config:
+#   ${node_name}     — ESPHome device name (e.g., "jarvis-node-office")
+#   ${room_display}  — Human-readable room name (e.g., "Office")
+#   ${room_id}       — Machine-readable room ID (e.g., "office")
+#   ${node_ip}       — Static IP for this node
+
+esphome:
+  name: ${node_name}
+  friendly_name: "Jarvis - ${room_display}"
+
+# Current ESPHome releases require the dedicated esp32: block.
+esp32:
+  board: esp32cam          # AI-Thinker ESP32-CAM
+  framework:
+    type: arduino
+
+# Required by esp32_camera on modern ESPHome releases.
+psram:
+
+i2c:
+  - id: camera_i2c
+    sda: GPIO26
+    scl: GPIO27
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: ${node_ip}
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+  # Fast reconnect — no power saving while running
+  power_save_mode: none
+
+# OTA updates — after first USB flash, deploy wirelessly
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Web server for live debugging (disable in production if bandwidth is a concern)
+web_server:
+  port: 80
+
+logger:
+  level: INFO
+
+mqtt:
+  broker: !secret mqtt_broker_ip
+  port: 1883
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  clean_session: true
+  keepalive: 60s
+  birth_message:
+    topic: jarvis/nodes/${room_id}/status
+    payload: "online"
+    retain: true
+  will_message:
+    topic: jarvis/nodes/${room_id}/status
+    payload: "offline"
+    retain: true
+  on_message:
+    - topic: jarvis/nodes/${room_id}/camera/fps
+      then:
+        - lambda: |-
+            id(node_camera).set_idle_update_interval(
+              (uint32_t)(1000.0f / atof(x.c_str()))
+            );
+    - topic: jarvis/nodes/${room_id}/camera/brightness
+      then:
+        - lambda: |-
+            id(node_camera).set_brightness(atoi(x.c_str()));
+    - topic: jarvis/nodes/${room_id}/camera/saturation
+      then:
+        - lambda: |-
+            id(node_camera).set_saturation(atoi(x.c_str()));
+    - topic: jarvis/nodes/${room_id}/camera/contrast
+      then:
+        - lambda: |-
+            id(node_camera).set_contrast(atoi(x.c_str()));
+
+# ── I2S Audio Bus ──────────────────────────────────────────────────────────
+# Shared clock bus for both INMP441 microphone and MAX98357A speaker amp.
+# NOTE: The current Python repo definitely uses node status + camera stream.
+# Node-side wake/audio MQTT plumbing is still pending.
+i2s_audio:
+  - id: i2s_bus
+    i2s_lrclk_pin: GPIO14    # INMP441 WS + MAX98357A LRC (shared pin)
+    i2s_bclk_pin: GPIO2      # INMP441 SCK + MAX98357A BCLK (shared pin)
+
+# ── INMP441 Microphone ────────────────────────────────────────────────────
+# IMPORTANT: Tie GPIO12 LOW at boot via 10kΩ resistor to GND.
+# GPIO12 is a boot strapping pin on ESP32; if HIGH during boot, flash voltage
+# changes to 1.8V and the module will not start correctly.
+microphone:
+  - platform: i2s_audio
+    id: node_mic
+    i2s_audio_id: i2s_bus
+    i2s_din_pin: GPIO12      # INMP441 SD data pin
+    adc_type: external
+    pdm: false
+
+# ── MAX98357A Speaker Amplifier ───────────────────────────────────────────
+speaker:
+  - platform: i2s_audio
+    id: node_speaker
+    i2s_audio_id: i2s_bus
+    i2s_dout_pin: GPIO15     # MAX98357A DIN data pin
+    dac_type: external
+    i2s_mode: primary
+
+# ── ESP32-CAM Camera ──────────────────────────────────────────────────────
+esp32_camera:
+  id: node_camera
+  name: "${room_display} Camera"
+  external_clock:
+    pin: GPIO0
+    frequency: 20MHz
+  i2c_id: camera_i2c
+  data_pins: [GPIO5, GPIO18, GPIO19, GPIO21, GPIO36, GPIO39, GPIO34, GPIO35]
+  vsync_pin: GPIO25
+  href_pin: GPIO23
+  pixel_clock_pin: GPIO22
+  power_down_pin: GPIO32
+  resolution: 640x480
+  jpeg_quality: 15           # Lower = smaller JPEG = faster WiFi transfer
+  # Only capture on-demand to save bandwidth
+  idle_framerate: 1fps        # One frame every 10 seconds when idle
+
+# Expose MJPEG stream on port 8080 — Python CameraManager connects here
+esp32_camera_web_server:
+  - port: 8080
+    mode: stream
+
+# ── Status LED ────────────────────────────────────────────────────────────
+# GPIO33 is the onboard LED on AI-Thinker ESP32-CAM (active LOW)
+light:
+  - platform: status_led
+    name: "Node Status LED"
+    pin:
+      number: GPIO33
+      inverted: true
+
+# ── Room ID Global ────────────────────────────────────────────────────────
+globals:
+  - id: room_id_global
+    type: std::string
+    restore_value: false
+    initial_value: '"${room_id}"'

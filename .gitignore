@@ -1,0 +1,59 @@
+# Environment
+.env
+.env.*
+!.env.example
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache / tooling
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Runtime data / logs
+*.log
+logs/
+data/*.log
+data/jarvis.db
+data/*.sqlite
+data/*.sqlite3
+data/test_frame_*.jpg
+
+# Local config / secrets
+hardware/esphome/secrets.yaml
+hardware/esphome/.esphome/
+*.pem
+*.key
+*.crt
+
+# ESPHome / PlatformIO build artifacts
+.pio/
+.piolibdeps/
+.pioenvs/
+*.bin
+*.elf
+*.map
+
+# Models (too large for git)
+data/voices/
+*.pt
+*.onnx
+*.gguf
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
