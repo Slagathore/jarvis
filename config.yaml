@@ -70,9 +70,9 @@ mqtt:
 rooms:
   - id: "office"
     display_name: "Office"
-    camera_source: 0           # USB webcam, OpenCV device index
-    has_node: false            # Set true when ESP32-CAM is deployed
-    node_ip: null
+    camera_source: null
+    has_node: true
+    node_ip: "192.168.1.101"
   - id: "bedroom"
     display_name: "Bedroom"
     camera_source: null        # null until ESP32-CAM deployed
