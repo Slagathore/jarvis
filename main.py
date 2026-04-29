@@ -35,7 +35,8 @@ from loguru import logger
 # ── Constants ─────────────────────────────────────────────────────────────
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
-LOG_DIR = Path(__file__).parent / "data"
+LOG_DIR     = Path(__file__).parent / "data"
+PID_FILE    = Path(__file__).parent / "data" / "jarvis.pid"
 
 
 def _configure_event_loop_policy() -> None:
@@ -141,8 +142,15 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    _configure_event_loop_policy()
+
+    # Write PID file so stop.ps1 can find this process
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+
     try:
-        _configure_event_loop_policy()
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    finally:
+        PID_FILE.unlink(missing_ok=True)
