@@ -72,16 +72,15 @@ class PiperTTS:
         self.loaded: bool = False
         self._piper_path: Optional[str] = None
         self._model_path: Optional[str] = None
+        self._active_voice: str = ""
         self._use_sapi: bool = False
         self._sample_rate: int = self._cfg.get("sample_rate", 22050)
 
     def load(self) -> None:
         """
-        Locate the piper binary and voice model file.
-        If piper is unavailable, arms the SAPI fallback silently.
-
-        Raises:
-            TTSError: Only if both piper and SAPI are unavailable.
+        Locate the piper binary and initial voice model.
+        Supports absolute piper_binary path and a voices dict in config.
+        Falls back to Windows SAPI if piper is unavailable.
         """
         engine = self._cfg.get("engine", "piper")
 
@@ -89,34 +88,155 @@ class PiperTTS:
             self._arm_sapi()
             return
 
-        # Try to find piper binary
+        # Resolve piper binary — absolute path takes priority over PATH lookup
         piper_bin = self._cfg.get("piper_binary", "piper")
-        resolved = shutil.which(piper_bin)
-        if resolved:
-            self._piper_path = resolved
-            logger.info(f"[TTS] Piper binary: {resolved}")
+        if Path(piper_bin).is_file():
+            self._piper_path = piper_bin
+            logger.info(f"[TTS] Piper binary: {piper_bin}")
         else:
-            logger.warning(f"[TTS] Piper binary '{piper_bin}' not found in PATH")
-            logger.warning("[TTS] Download piper from: https://github.com/rhasspy/piper/releases")
+            resolved = shutil.which(piper_bin)
+            if resolved:
+                self._piper_path = resolved
+                logger.info(f"[TTS] Piper binary: {resolved}")
+            else:
+                logger.warning(f"[TTS] Piper binary '{piper_bin}' not found")
+                self._arm_sapi()
+                return
+
+        # Load the configured active voice
+        voice_name = self._cfg.get("active_voice") or self._cfg.get("voice", "")
+        if not self._load_voice(voice_name):
             self._arm_sapi()
             return
-
-        # Locate voice model
-        voices_dir = Path(self._cfg.get("voices_dir", "data/voices"))
-        voice_name = self._cfg.get("voice", "en_US-ryan-high")
-        model_file = voices_dir / f"{voice_name}.onnx"
-
-        if not model_file.exists():
-            logger.warning(f"[TTS] Voice model not found: {model_file}")
+        if not self._probe_current_voice():
             logger.warning(
-                f"[TTS] Download from: https://huggingface.co/rhasspy/piper-voices/tree/main"
+                f"[TTS] Voice '{voice_name}' failed Piper self-test — trying fallbacks"
             )
-            self._arm_sapi()
-            return
+            if not self._load_fallback_voice(exclude=voice_name):
+                self._arm_sapi()
+                return
 
-        self._model_path = str(model_file)
         self.loaded = True
-        logger.info(f"[TTS] Piper ready: {voice_name}")
+
+    def _load_voice(self, voice_name: str) -> bool:
+        """
+        Resolve voice_name to a .onnx path using the voices dict, then fall back
+        to voices_dir/{voice_name}.onnx for backward compatibility.
+        Returns True if the model was found, False otherwise.
+        """
+        # Primary: check the voices dict (name → absolute .onnx path)
+        voices = self._cfg.get("voices", {})
+        if voice_name in voices:
+            path = Path(voices[voice_name])
+            if path.is_file():
+                self._model_path = str(path)
+                self._active_voice = voice_name
+                logger.info(f"[TTS] Voice: {voice_name} ({path.name})")
+                return True
+            logger.warning(f"[TTS] Voice model not found: {path}")
+
+        # Fallback: voices_dir/{voice_name}.onnx
+        voices_dir = Path(self._cfg.get("voices_dir", "data/voices"))
+        model_file = voices_dir / f"{voice_name}.onnx"
+        if model_file.exists():
+            self._model_path = str(model_file)
+            self._active_voice = voice_name
+            logger.info(f"[TTS] Voice: {voice_name}")
+            return True
+
+        logger.warning(f"[TTS] No model found for voice '{voice_name}'")
+        return False
+
+    def _load_fallback_voice(self, exclude: str) -> bool:
+        """Try alternate configured voices until one passes synthesis self-test."""
+        for voice_name in self.available_voices():
+            if voice_name == exclude:
+                continue
+            if not self._load_voice(voice_name):
+                continue
+            if self._probe_current_voice():
+                logger.warning(f"[TTS] Falling back to voice '{voice_name}'")
+                return True
+        logger.error("[TTS] No configured Piper voice passed self-test")
+        return False
+
+    def _probe_current_voice(self) -> bool:
+        """
+        Run a short synthesis to verify Piper can actually load the active voice.
+        This catches broken/incompatible voice models early and avoids repeated
+        runtime crashes on every speak() call.
+        """
+        if not self._piper_path or not self._model_path:
+            return False
+
+        probe_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                probe_path = tmp.name
+
+            result = subprocess.run(
+                [
+                    self._piper_path,
+                    "--model", self._model_path,
+                    "--output_file", probe_path,
+                    "--length-scale", str(1.0 / self._cfg.get("speed", 1.0)),
+                ],
+                input=b"Testing voice.",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(f"[TTS] Voice '{self._active_voice}' self-test timed out")
+            return False
+        except Exception as e:
+            logger.warning(f"[TTS] Voice '{self._active_voice}' self-test failed: {e}")
+            return False
+        finally:
+            if probe_path:
+                Path(probe_path).unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            logger.warning(
+                f"[TTS] Voice '{self._active_voice}' self-test crashed "
+                f"(exit={result.returncode} / {self._format_exit_code(result.returncode)}): "
+                f"{stderr or 'no stderr'}"
+            )
+            return False
+
+        return True
+
+    @staticmethod
+    def _format_exit_code(returncode: int) -> str:
+        """Return a stable hex rendering for Windows native crash codes."""
+        unsigned = (returncode + (1 << 32)) % (1 << 32)
+        return hex(unsigned)
+
+    def set_voice(self, voice_name: str) -> bool:
+        """
+        Switch to a different voice at runtime. Returns True on success.
+        The change takes effect on the next speak() call.
+        """
+        if not self._piper_path:
+            logger.warning("[TTS] Cannot switch voice — piper not available")
+            return False
+        previous_voice = self._active_voice
+        previous_model = self._model_path
+        if self._load_voice(voice_name):
+            if self._probe_current_voice():
+                logger.info(f"[TTS] Switched to voice: {voice_name}")
+                return True
+            self._active_voice = previous_voice
+            self._model_path = previous_model
+            logger.warning(f"[TTS] Voice '{voice_name}' failed self-test — keeping '{previous_voice}'")
+            return False
+        logger.warning(f"[TTS] Voice '{voice_name}' not found — keeping '{self._active_voice}'")
+        return False
+
+    def available_voices(self) -> list[str]:
+        """Return list of voice names defined in config."""
+        return list(self._cfg.get("voices", {}).keys())
 
     def _arm_sapi(self) -> None:
         """
@@ -204,7 +324,10 @@ class PiperTTS:
 
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            raise TTSError(f"Piper exited {result.returncode}: {stderr}")
+            raise TTSError(
+                f"Piper exited {result.returncode} ({self._format_exit_code(result.returncode)}): "
+                f"{stderr}"
+            )
 
         if not result.stdout:
             raise TTSError("Piper produced no audio output")

@@ -132,6 +132,8 @@ class WhisperSTT:
                 no_speech_threshold=0.6,
                 log_prob_threshold=-1.0,
                 condition_on_previous_text=False,
+                vad_filter=bool(self._cfg.get("vad_filter", True)),
+                vad_parameters=self._cfg.get("vad_parameters") or None,
             )
             text = " ".join(seg.text for seg in segments).strip()
             logger.debug(f"[STT] Transcript: {text!r}")

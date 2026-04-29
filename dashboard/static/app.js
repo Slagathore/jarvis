@@ -19,6 +19,9 @@
 
 "use strict";
 
+// Keeps the latest room data so updateRooms always renders the full set
+let roomsCache = {};
+
 // ── WebSocket Connection ───────────────────────────────────────────────────
 
 const WS_URL = `ws://${window.location.host}/ws`;
@@ -66,7 +69,8 @@ function applyFullState(state, conversation) {
   updateActivity(state);
   updateAppliances(state.appliances);
   updateHealth(state.system);
-  updateRooms(state.rooms);
+  roomsCache = state.rooms || {};
+  updateRooms(roomsCache);
 
   if (state.last_speech) {
     updateSpeech(state.last_speech);
@@ -218,10 +222,11 @@ function updateRooms(rooms) {
   if (!grid) return;
   grid.innerHTML = "";
 
-  const ROOM_IDS = ["office", "bedroom", "kitchen", "living_room"];
+  const roomIds = Object.keys(rooms || {});
+  if (roomIds.length === 0) return;
 
-  ROOM_IDS.forEach((roomId) => {
-    const data = rooms?.[roomId] || {};
+  roomIds.forEach((roomId) => {
+    const data = rooms[roomId] || {};
     const card = document.createElement("div");
     card.className = "room-card";
     card.id = `room-${roomId}`;
@@ -243,9 +248,10 @@ function updateRooms(rooms) {
 }
 
 function updateRoomVision(roomId, data) {
+  roomsCache[roomId] = Object.assign({}, roomsCache[roomId] || {}, data);
   const card = document.getElementById(`room-${roomId}`);
   if (!card) {
-    updateRooms({ [roomId]: data });
+    updateRooms(roomsCache);
     return;
   }
 
@@ -382,6 +388,63 @@ function updateClock() {
 
 setInterval(updateClock, 1000);
 updateClock();
+
+// ── Voice Switcher ────────────────────────────────────────────────────────
+
+function loadVoices() {
+  fetch("/api/voices")
+    .then((r) => r.json())
+    .then(({ voices, active }) => {
+      const sel = document.getElementById("voice-select");
+      if (!sel) return;
+      sel.innerHTML = voices
+        .map((v) => `<option value="${v}"${v === active ? " selected" : ""}>${v}</option>`)
+        .join("");
+    })
+    .catch(() => {});
+}
+
+function applyVoice() {
+  const sel = document.getElementById("voice-select");
+  if (!sel || !sel.value) return;
+  fetch("/api/voice", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ voice: sel.value }),
+  }).catch((e) => console.warn("[JARVIS] Voice switch failed:", e));
+}
+
+const voiceApplyBtn = document.getElementById("voice-apply");
+if (voiceApplyBtn) voiceApplyBtn.addEventListener("click", applyVoice);
+loadVoices();
+
+// ── Text Chat ─────────────────────────────────────────────────────────────
+
+function sendChat() {
+  const input = document.getElementById("chat-input");
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+
+  appendConversation({
+    role: "cole",
+    text,
+    room: "dashboard",
+    timestamp: new Date().toISOString(),
+  });
+  input.value = "";
+
+  fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, room: "office" }),
+  }).catch((e) => console.warn("[JARVIS] Chat send failed:", e));
+}
+
+const chatInput = document.getElementById("chat-input");
+const chatSend = document.getElementById("chat-send");
+if (chatInput) chatInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+if (chatSend) chatSend.addEventListener("click", sendChat);
 
 // ── Init ──────────────────────────────────────────────────────────────────
 

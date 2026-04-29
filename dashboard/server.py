@@ -46,7 +46,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
@@ -63,6 +63,10 @@ class DashboardServer:
         self._state: dict = self._default_state()
         self._conversation: list[dict] = []  # Last 50 messages
         self._max_conversation = 50
+        self._chat_handler = None   # Callable[[str, str], Awaitable] registered by orchestrator
+        self._voice_handler = None  # Callable[[str], Awaitable] for runtime voice switching
+        self._available_voices: list = []
+        self._active_voice: str = ""
 
         self._setup_routes()
 
@@ -90,6 +94,22 @@ class DashboardServer:
             "last_speech": None,
             "updated_at": datetime.now().isoformat(),
         }
+
+    def set_room_ids(self, room_ids: list) -> None:
+        """Pre-populate the rooms state so the dashboard shows all rooms from startup."""
+        for room_id in room_ids:
+            if room_id not in self._state["rooms"]:
+                self._state["rooms"][room_id] = {}
+
+    def register_chat_handler(self, handler) -> None:
+        """Register the coroutine function the orchestrator uses to handle typed messages."""
+        self._chat_handler = handler
+
+    def register_voice_handler(self, handler, voices: list, active: str) -> None:
+        """Register voice-switch handler and store available voices for the UI."""
+        self._voice_handler = handler
+        self._available_voices = voices
+        self._active_voice = active
 
     def _setup_routes(self):
         app = self.app
@@ -143,6 +163,31 @@ class DashboardServer:
                 "clients": len(self._clients),
                 "updated_at": self._state.get("updated_at"),
             })
+
+        @app.post("/api/chat")
+        async def chat_endpoint(request: Request):
+            body = await request.json()
+            text = str(body.get("text", "")).strip()
+            room = str(body.get("room", "office"))
+            if text and self._chat_handler:
+                asyncio.create_task(self._chat_handler(text, room))
+            return JSONResponse({"ok": True})
+
+        @app.get("/api/voices")
+        async def get_voices():
+            return JSONResponse({
+                "voices": self._available_voices,
+                "active": self._active_voice,
+            })
+
+        @app.post("/api/voice")
+        async def set_voice(request: Request):
+            body = await request.json()
+            voice = str(body.get("voice", "")).strip()
+            if voice and self._voice_handler:
+                asyncio.create_task(self._voice_handler(voice))
+                self._active_voice = voice
+            return JSONResponse({"ok": True, "voice": voice})
 
     async def broadcast(self, event: dict):
         """

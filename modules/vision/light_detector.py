@@ -47,6 +47,11 @@ except ImportError:
 # Default brightness thresholds (0–255 mean luminance)
 DEFAULT_ON_THRESHOLD: float = 60.0     # Mean Y above this → lights on
 DEFAULT_OFF_THRESHOLD: float = 30.0    # Mean Y below this → lights off
+DEFAULT_ON_PERCENTILE: float = 68.0    # 90th percentile luminance above this → lights on
+DEFAULT_OFF_PERCENTILE: float = 35.0   # 90th percentile luminance below this → lights off
+DEFAULT_BRIGHT_PIXEL_THRESHOLD: float = 60.0
+DEFAULT_ON_BRIGHT_RATIO: float = 0.08
+DEFAULT_OFF_BRIGHT_RATIO: float = 0.02
 
 
 class LightDetector:
@@ -65,9 +70,24 @@ class LightDetector:
         self._off_threshold: float = float(
             vision_cfg.get("light_off_threshold", DEFAULT_OFF_THRESHOLD)
         )
-        self._last_state: Optional[bool] = None  # True=on, False=off
+        self._on_percentile_threshold: float = float(
+            vision_cfg.get("light_on_percentile_threshold", DEFAULT_ON_PERCENTILE)
+        )
+        self._off_percentile_threshold: float = float(
+            vision_cfg.get("light_off_percentile_threshold", DEFAULT_OFF_PERCENTILE)
+        )
+        self._bright_pixel_threshold: float = float(
+            vision_cfg.get("light_bright_pixel_threshold", DEFAULT_BRIGHT_PIXEL_THRESHOLD)
+        )
+        self._on_bright_ratio: float = float(
+            vision_cfg.get("light_on_bright_ratio", DEFAULT_ON_BRIGHT_RATIO)
+        )
+        self._off_bright_ratio: float = float(
+            vision_cfg.get("light_off_bright_ratio", DEFAULT_OFF_BRIGHT_RATIO)
+        )
+        self._last_state: dict[str, Optional[bool]] = {}
 
-    def analyze(self, frame: Optional[np.ndarray]) -> Optional[bool]:
+    def analyze(self, frame: Optional[np.ndarray], room: str = "default") -> Optional[bool]:
         """
         Analyze a frame to determine light state.
 
@@ -77,37 +97,56 @@ class LightDetector:
         Returns:
             True if lights are on, False if lights are off, None if unknown.
         """
+        previous_state = self._last_state.get(room)
         if frame is None:
-            return self._last_state  # Return cached state if no new frame
+            return previous_state  # Return cached state if no new frame
 
-        brightness = self._compute_brightness(frame)
-        if brightness is None:
-            return self._last_state
+        stats = self._compute_brightness(frame)
+        if stats is None:
+            return previous_state
 
-        if brightness >= self._on_threshold:
+        mean_luma, p90_luma, bright_ratio = stats
+        is_bright_scene = (
+            mean_luma >= self._on_threshold
+            or p90_luma >= self._on_percentile_threshold
+            or bright_ratio >= self._on_bright_ratio
+        )
+        is_dark_scene = (
+            mean_luma <= self._off_threshold
+            and p90_luma <= self._off_percentile_threshold
+            and bright_ratio <= self._off_bright_ratio
+        )
+
+        if is_bright_scene:
             new_state = True
-        elif brightness <= self._off_threshold:
+        elif is_dark_scene:
             new_state = False
         else:
             # Ambiguous zone — maintain last known state
-            return self._last_state
+            return previous_state
 
-        if new_state != self._last_state:
+        if new_state != previous_state:
             logger.debug(
-                f"[LightDetector] Light state changed: "
-                f"{'ON' if new_state else 'OFF'} (brightness={brightness:.1f})"
+                f"[LightDetector] Room '{room}' light state changed: "
+                f"{'ON' if new_state else 'OFF'} "
+                f"(mean={mean_luma:.1f}, p90={p90_luma:.1f}, bright_ratio={bright_ratio:.3f})"
             )
 
-        self._last_state = new_state
+        self._last_state[room] = new_state
         return new_state
 
-    async def analyze_async(self, frame: Optional[np.ndarray]) -> Optional[bool]:
+    async def analyze_async(
+        self,
+        frame: Optional[np.ndarray],
+        room: str = "default",
+    ) -> Optional[bool]:
         """Async wrapper."""
-        return await asyncio.to_thread(self.analyze, frame)
+        return await asyncio.to_thread(self.analyze, frame, room)
 
-    def _compute_brightness(self, frame: np.ndarray) -> Optional[float]:
+    def _compute_brightness(self, frame: np.ndarray) -> Optional[tuple[float, float, float]]:
         """
-        Convert frame to YCrCb and return mean luminance (Y channel).
+        Convert frame to YCrCb and return luminance statistics:
+        (mean, 90th percentile, bright-pixel ratio).
         Falls back to grayscale mean if OpenCV is unavailable.
         """
         try:
@@ -118,12 +157,14 @@ class LightDetector:
                 # Fallback: simple mean of all channels
                 y_channel = frame.mean(axis=2) if frame.ndim == 3 else frame
 
-            return float(np.mean(y_channel))
+            mean_luma = float(np.mean(y_channel))
+            p90_luma = float(np.percentile(y_channel, 90))
+            bright_ratio = float(np.mean(y_channel >= self._bright_pixel_threshold))
+            return mean_luma, p90_luma, bright_ratio
         except Exception as e:
             logger.debug(f"[LightDetector] Brightness computation failed: {e}")
             return None
 
-    @property
-    def lights_on(self) -> Optional[bool]:
-        """Last known light state (True=on, False=off, None=unknown)."""
-        return self._last_state
+    def last_state(self, room: str = "default") -> Optional[bool]:
+        """Last known light state for a room (True=on, False=off, None=unknown)."""
+        return self._last_state.get(room)

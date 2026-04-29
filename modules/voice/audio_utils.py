@@ -119,7 +119,8 @@ def record_until_silence(
     silence_threshold_db: float = -40.0,
     silence_duration_ms: int = 800,
     max_duration_seconds: float = 30.0,
-    device: Optional[int] = None,
+    speech_start_timeout_seconds: Optional[float] = None,
+    device: Optional[int | str] = None,
 ) -> np.ndarray:
     """
     Record audio from the microphone until a sustained period of silence.
@@ -135,7 +136,10 @@ def record_until_silence(
         silence_threshold_db:  Level below which a block is silent (dBFS).
         silence_duration_ms:   Consecutive ms of silence before stopping.
         max_duration_seconds:  Absolute recording time limit.
-        device:                sounddevice device index. None = system default.
+        speech_start_timeout_seconds:
+                               Stop early if no speech starts within this time.
+                               None waits the full max duration.
+        device:                sounddevice device index or name. None = system default.
 
     Returns:
         Float32 numpy array, shape (N,), at SAMPLE_RATE Hz.
@@ -150,9 +154,16 @@ def record_until_silence(
         (silence_duration_ms / 1000.0) * SAMPLE_RATE / CHUNK_FRAMES
     )
     max_blocks = int(max_duration_seconds * SAMPLE_RATE / CHUNK_FRAMES)
+    speech_start_timeout_blocks: Optional[int] = None
+    if speech_start_timeout_seconds is not None:
+        speech_start_timeout_blocks = max(
+            1,
+            int(speech_start_timeout_seconds * SAMPLE_RATE / CHUNK_FRAMES),
+        )
 
     silence_block_count = 0
     speech_started = False  # Don't stop on pre-speech silence
+    first_speech_frame = 0
 
     try:
         with sd.InputStream(
@@ -179,6 +190,9 @@ def record_until_silence(
 
                 if level_db > silence_threshold_db:
                     # Speech detected
+                    if not speech_started:
+                        # Keep ~250ms of pre-roll so initial consonants are not clipped.
+                        first_speech_frame = max(0, (block_count - 4) * CHUNK_FRAMES)
                     speech_started = True
                     silence_block_count = 0
                 elif speech_started:
@@ -187,6 +201,12 @@ def record_until_silence(
                     if silence_block_count >= silence_blocks_needed:
                         logger.debug("[Audio] Silence detected — stopping")
                         break
+                elif (
+                    speech_start_timeout_blocks is not None
+                    and block_count >= speech_start_timeout_blocks
+                ):
+                    logger.debug("[Audio] No speech detected before timeout — stopping")
+                    break
 
     except sd.PortAudioError as e:
         raise AudioError(f"PortAudio stream failed: {e}") from e
@@ -195,6 +215,8 @@ def record_until_silence(
         raise AudioError("No audio frames were captured — check microphone")
 
     audio = np.concatenate(frames_collected, axis=0).flatten()
+    if speech_started and first_speech_frame > 0:
+        audio = audio[first_speech_frame:]
     duration = len(audio) / SAMPLE_RATE
     logger.debug(f"[Audio] Captured {duration:.2f}s ({len(frames_collected)} blocks)")
     return audio
@@ -204,7 +226,8 @@ async def record_until_silence_async(
     silence_threshold_db: float = -40.0,
     silence_duration_ms: int = 800,
     max_duration_seconds: float = 30.0,
-    device: Optional[int] = None,
+    speech_start_timeout_seconds: Optional[float] = None,
+    device: Optional[int | str] = None,
 ) -> np.ndarray:
     """
     Non-blocking wrapper for record_until_silence.
@@ -215,6 +238,7 @@ async def record_until_silence_async(
         silence_threshold_db=silence_threshold_db,
         silence_duration_ms=silence_duration_ms,
         max_duration_seconds=max_duration_seconds,
+        speech_start_timeout_seconds=speech_start_timeout_seconds,
         device=device,
     )
 
@@ -224,7 +248,7 @@ async def record_until_silence_async(
 def play_audio_array(
     audio: np.ndarray,
     sample_rate: int = SAMPLE_RATE,
-    device: Optional[int] = None,
+    device: Optional[int | str] = None,
 ) -> None:
     """
     Play a float32 numpy audio array through the output device.
@@ -243,13 +267,13 @@ def play_audio_array(
 async def play_audio_array_async(
     audio: np.ndarray,
     sample_rate: int = SAMPLE_RATE,
-    device: Optional[int] = None,
+    device: Optional[int | str] = None,
 ) -> None:
     """Non-blocking wrapper for play_audio_array."""
     await asyncio.to_thread(play_audio_array, audio, sample_rate, device)
 
 
-def play_audio_file(path: str | Path, device: Optional[int] = None) -> None:
+def play_audio_file(path: str | Path, device: Optional[int | str] = None) -> None:
     """
     Load an audio file (WAV, FLAC, OGG) with soundfile and play it.
     Handles mono/stereo conversion automatically.
@@ -269,7 +293,10 @@ def play_audio_file(path: str | Path, device: Optional[int] = None) -> None:
         raise AudioError(f"Failed to play '{path}': {e}") from e
 
 
-async def play_audio_file_async(path: str | Path, device: Optional[int] = None) -> None:
+async def play_audio_file_async(
+    path: str | Path,
+    device: Optional[int | str] = None,
+) -> None:
     """Non-blocking wrapper for play_audio_file."""
     await asyncio.to_thread(play_audio_file, path, device)
 
@@ -304,7 +331,7 @@ def wav_bytes_to_numpy(wav_bytes: bytes) -> tuple[np.ndarray, int]:
 def play_chime(
     frequency: float = 880.0,
     duration_ms: int = 150,
-    device: Optional[int] = None,
+    device: Optional[int | str] = None,
 ) -> None:
     """
     Synthesize a sine-wave tone and play it as the wake-word confirmation sound.
@@ -332,7 +359,7 @@ def play_chime(
 async def play_chime_async(
     frequency: float = 880.0,
     duration_ms: int = 150,
-    device: Optional[int] = None,
+    device: Optional[int | str] = None,
 ) -> None:
     """Non-blocking wrapper for play_chime."""
     await asyncio.to_thread(play_chime, frequency, duration_ms, device)

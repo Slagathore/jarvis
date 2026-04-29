@@ -543,3 +543,102 @@ main {
   color: var(--text-muted);
   margin-top: 4px;
 }
+
+/* ── Dev Controls ────────────────────────────────────────────────────────── */
+.dev-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dev-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.dev-select {
+  flex: 1;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 5px 8px;
+  outline: none;
+  cursor: pointer;
+}
+
+.dev-select:focus {
+  border-color: var(--blue-dim);
+}
+
+.dev-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s;
+}
+
+.dev-btn:hover {
+  border-color: var(--blue-dim);
+  color: var(--blue);
+}
+
+/* ── Chat Input ───────────────────────────────────────────────────────────── */
+.chat-input-wrap {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.chat-input {
+  flex: 1;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.chat-input:focus {
+  border-color: var(--blue-dim);
+}
+
+.chat-input::placeholder {
+  color: var(--text-muted);
+}
+
+.chat-send {
+  background: transparent;
+  border: 1px solid var(--blue-dim);
+  border-radius: var(--radius);
+  color: var(--blue);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.2s, box-shadow 0.2s;
+}
+
+.chat-send:hover {
+  background: var(--blue-dim);
+  box-shadow: var(--glow-blue);
+}

@@ -63,6 +63,8 @@ Variables:
     Orchestrator._current_state    — Last fused ActivityState
 
 #todo: Add persistent reminder system — store reminders in DB, check on timer
+#todo: Add face recognition — identify who is in the room using a face model (DeepFace/InsightFace)
+#todo: Add voice recognition — identify speaker from voice embedding so "Cole" label is real, not assumed
 #todo: Add voice feedback for vision results on user request ("what do you see?")
 #todo: Add multi-room audio routing — TTS output goes to the right room's node
 #todo: Add calendar integration — pull upcoming events, proactively brief Cole
@@ -77,6 +79,7 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
+import numpy as np
 from loguru import logger
 
 from core.event_bus import EventBus
@@ -145,6 +148,8 @@ class Orchestrator:
         self.nodes: Optional[NodeManager] = None
 
         self._current_state: ActivityState = UNKNOWN_STATE
+        self._wake_lock = asyncio.Lock()
+        self._audio_io_active: bool = False
         self.dashboard: Optional[DashboardServer]
 
         # Dashboard
@@ -257,7 +262,7 @@ class Orchestrator:
         # The wake pipeline would have silently never fired.
         self.bus.subscribe("voice.wake_detected", self._on_wake_detected)
         self.bus.subscribe("appliance.state_changed", self._on_appliance_changed)
-        self.bus.subscribe("node.status_changed", self._on_node_status)
+        self.bus.subscribe("node.status", self._on_node_status)
 
     # ── Wake Word + Conversation Pipeline ─────────────────────────────────
 
@@ -273,6 +278,10 @@ class Orchestrator:
         7. Log everything
         """
         room = event.get("room", "office")
+        if self._wake_lock.locked():
+            logger.info(f"[Wake] Ignoring duplicate wake in {room} while capture is active")
+            return
+
         logger.info(f"[Wake] Detected in {room}")
 
         # Check interruptibility before responding
@@ -283,95 +292,125 @@ class Orchestrator:
             logger.debug("[Wake] Blocked by interruptibility gate")
             return
 
-        try:
-            # Record user speech
-            from modules.voice.audio_utils import record_until_silence
-            recording_cfg = self.config["voice"]["recording"]
-            # BUG FIX: record_until_silence() has no sample_rate parameter.
-            # Actual signature: (silence_threshold_db, silence_duration_ms,
-            #                    max_duration_seconds, device=None)
-            audio_data = await asyncio.to_thread(
-                record_until_silence,
-                silence_threshold_db=recording_cfg["silence_threshold_db"],
-                silence_duration_ms=recording_cfg["silence_duration_ms"],
-                max_duration_seconds=recording_cfg["max_duration_seconds"],
-            )
-
-            if audio_data is None or len(audio_data) == 0:
-                logger.debug("[Wake] No audio recorded")
-                return
-
-            # Transcribe
-            stt = self.stt
-            if stt is None:
-                logger.warning("[Wake] STT module not initialized — skipping transcript")
-                return
-            transcript = await asyncio.to_thread(stt.transcribe, audio_data)
-            if not transcript or not transcript.strip():
-                logger.debug("[Wake] Empty transcript")
-                return
-
-            logger.info(f"[STT] Transcript: {transcript!r}")
-
-            # Log and broadcast user speech
-            await self._broadcast({
-                "type": "user_speech",
-                "text": transcript,
-                "room": room,
-            })
-            if self.event_log:
-                # BUG FIX: method is log_event() not log()
-                await self.event_log.log_event(
-                    room=room,
-                    event_type="user_speech",
-                    content=transcript,
+        async with self._wake_lock:
+            self._audio_io_active = True
+            try:
+                from modules.voice.audio_utils import (
+                    SAMPLE_RATE,
+                    db_from_rms,
+                    play_chime_async,
+                    record_until_silence,
                 )
 
-            # Guard: ensure all brain modules are initialized before proceeding
-            if not self.sessions or not self.prompts or not self.llm:
-                logger.warning("[Wake] Brain modules not ready — skipping")
-                return
+                # Suspend wake word mic — prevents dual-InputStream conflict on Windows WASAPI
+                if self.wake:
+                    self.wake.suspend()
 
-            # BUG FIX (multiple): PromptBuilder.build() signature is:
-            #   build(user_text, state=None, session=None, room="office", extras=None)
-            # Old call passed: state=, room=, history=session.get_messages() — all wrong.
-            #   • "history" is not a valid parameter
-            #   • session must be the ConversationSession object, not the messages list
-            #   • build() appends user_text itself at the end — don't pre-add it to session
-            # Correct pattern: build the prompt with current history, then record both
-            # turns AFTER the LLM responds so the session stays consistent.
-            session = self.sessions.get_session(room)
+                try:
+                    await play_chime_async()
+                    await asyncio.sleep(0.3)
 
-            prompt_context = self.prompts.build(
-                user_text=transcript,
-                state=self._current_state,
-                session=session,   # ConversationSession object (history before this turn)
-                room=room,
-            )
+                    recording_cfg = self.config["voice"]["recording"]
+                    record_device = (
+                        self.wake.device if self.wake else recording_cfg.get("device")
+                    )
+                    audio_data = await asyncio.to_thread(
+                        record_until_silence,
+                        silence_threshold_db=recording_cfg["silence_threshold_db"],
+                        silence_duration_ms=recording_cfg["silence_duration_ms"],
+                        max_duration_seconds=recording_cfg["max_duration_seconds"],
+                        speech_start_timeout_seconds=recording_cfg.get(
+                            "speech_start_timeout_seconds",
+                            5.0,
+                        ),
+                        device=record_device,
+                    )
+                finally:
+                    # Always release the mic, even on exception
+                    if self.wake:
+                        self.wake.wakeup()
 
-            # LLM response — chat() is already async, no _async suffix needed
-            response = await self.llm.chat(
-                messages=prompt_context,
-            )
-            if not response:
-                logger.warning("[LLM] Empty response")
-                return
+                if audio_data is None or len(audio_data) == 0:
+                    logger.debug("[Wake] No audio recorded")
+                    return
 
-            # Record both turns after exchange completes (avoids double-adding user msg)
-            session.add_turn("user", transcript)
-            session.add_turn("assistant", response)
-            logger.info(f"[LLM] Response: {response!r}")
+                duration_s = len(audio_data) / SAMPLE_RATE
+                rms = float(np.sqrt(np.mean(audio_data ** 2))) if len(audio_data) else 0.0
+                logger.info(
+                    f"[Wake] Captured {duration_s:.2f}s of audio "
+                    f"(rms={db_from_rms(rms):.1f} dBFS)"
+                )
 
-            # Record interruption for cooldown tracking
-            interruptibility = self.interruptibility
-            if interruptibility is not None:
-                interruptibility.record_interruption()
+                stt = self.stt
+                if stt is None:
+                    logger.warning("[Wake] STT module not initialized — skipping transcript")
+                    return
+                transcript = await asyncio.to_thread(stt.transcribe, audio_data)
+                if not transcript or not transcript.strip():
+                    logger.info("[Wake] Empty transcript — nothing heard after chime")
+                    return
 
-            # Speak the response
-            await self._speak(response, room=room, priority="conversation")
+                logger.info(f"[STT] Transcript: {transcript!r}")
+                await self._process_user_text(transcript, room)
 
+            except Exception as e:
+                logger.error(f"[Wake] Pipeline error: {e}")
+            finally:
+                self._audio_io_active = False
+
+    async def _process_user_text(self, text: str, room: str) -> None:
+        """
+        Core LLM pipeline shared by voice (wake word) and text chat.
+        Broadcasts user speech, calls LLM, speaks the response.
+        """
+        await self._broadcast({"type": "user_speech", "text": text, "room": room})
+        if self.event_log:
+            await self.event_log.log_event(room=room, event_type="user_speech", content=text)
+
+        if not self.sessions or not self.prompts or not self.llm:
+            logger.warning("[LLM] Brain modules not ready — skipping")
+            return
+
+        session = self.sessions.get_session(room)
+        prompt_context = self.prompts.build(
+            user_text=text,
+            state=self._current_state,
+            session=session,
+            room=room,
+        )
+
+        response = await self.llm.chat(messages=prompt_context)
+        if not response:
+            logger.warning("[LLM] Empty response")
+            return
+
+        session.add_turn("user", text)
+        session.add_turn("assistant", response)
+        logger.info(f"[LLM] Response: {response!r}")
+
+        if self.interruptibility is not None:
+            self.interruptibility.record_interruption()
+
+        await self._speak(response, room=room, priority="conversation")
+
+    async def _on_text_chat(self, text: str, room: str = "office") -> None:
+        """Handle typed messages sent from the dashboard chat input."""
+        text = text.strip()
+        if not text:
+            return
+        logger.info(f"[Chat] Dashboard input: {text!r}")
+        try:
+            await self._process_user_text(text, room)
         except Exception as e:
-            logger.error(f"[Wake] Pipeline error: {e}")
+            logger.error(f"[Chat] Pipeline error: {e}")
+
+    async def _on_voice_change(self, voice_name: str) -> None:
+        """Switch TTS voice at runtime from the dashboard dev panel."""
+        if not self.tts:
+            return
+        success = self.tts.set_voice(voice_name)
+        if success:
+            await self._speak(f"Switching to {voice_name}.", room="office", priority="ambient")
 
     # ── Background Loops ───────────────────────────────────────────────────
 
@@ -393,7 +432,7 @@ class Orchestrator:
                     if pc_signal:
                         signals["pc"] = pc_signal
 
-                if self.audio_classifier:
+                if self.audio_classifier and not self._audio_io_active:
                     # BUG FIX: classify_async() returns list[dict] (not a single dict).
                     # Each dict has keys "label", "yamnet_class", "score".
                     # Calling .get("classifications", []) on a list crashes at runtime.
@@ -423,7 +462,11 @@ class Orchestrator:
                             # Update sleep tracker
                             sleep_tracker = self.sleep_tracker
                             if sleep_tracker is not None:
-                                lights_on = True  # Will be updated by vision loop
+                                lights_on = (
+                                    self.light_detector.last_state("office")
+                                    if self.light_detector
+                                    else None
+                                )
                                 sleep_tracker.update(
                                     posture=posture_result,
                                     lights_on=lights_on,
@@ -481,7 +524,7 @@ class Orchestrator:
                         light_detector = self.light_detector
                         lights_on: Optional[bool] = None
                         if light_detector is not None:
-                            lights_on = await light_detector.analyze_async(frame)
+                            lights_on = await light_detector.analyze_async(frame, room=room_id)
 
                         # Object detection
                         if not self.object_detector:
@@ -499,7 +542,8 @@ class Orchestrator:
                         if not self.scene_analyzer:
                             continue
                         last_desc = self.scene_analyzer.last_description(room_id)
-                        if detections:
+                        should_describe = bool(detections) or last_desc is None
+                        if should_describe:
                             description = await self.scene_analyzer.describe_async(
                                 frame, room=room_id, objects=detections
                             )
@@ -657,7 +701,17 @@ class Orchestrator:
     async def _on_node_status(self, event: dict) -> None:
         """Handle ESP32 node coming online or going offline."""
         room = event.get("room")
-        online = event.get("online", False)
+        data = event.get("data")
+        if isinstance(data, str):
+            online = data.strip().lower() == "online"
+            ip = event.get("ip")
+        elif isinstance(data, dict):
+            status = str(data.get("status", "")).strip().lower()
+            online = bool(data.get("online", status == "online"))
+            ip = data.get("ip", event.get("ip"))
+        else:
+            online = bool(event.get("online", False))
+            ip = event.get("ip")
 
         logger.info(f"[Node] {room} → {'online' if online else 'offline'}")
 
@@ -669,7 +723,7 @@ class Orchestrator:
             "type": "node_status",
             "room": room,
             "online": online,
-            "ip": event.get("ip"),
+            "ip": ip,
         })
 
     # ── TTS Helper ─────────────────────────────────────────────────────────
@@ -688,7 +742,12 @@ class Orchestrator:
                 return
 
             # Local playback (always available)
-            await asyncio.to_thread(self.tts.speak, text)
+            was_audio_io_active = self._audio_io_active
+            self._audio_io_active = True
+            try:
+                await asyncio.to_thread(self.tts.speak, text)
+            finally:
+                self._audio_io_active = was_audio_io_active
 
             # Log to DB
             if self.event_log:
@@ -698,11 +757,6 @@ class Orchestrator:
                     event_type="jarvis_speech",
                     content=text,
                 )
-
-            # Log to conversation session
-            if self.sessions:
-                session = self.sessions.get_session(room)
-                session.add_turn("assistant", text)
 
             # Broadcast to dashboard
             await self._broadcast({
@@ -724,6 +778,29 @@ class Orchestrator:
                 await self.dashboard.broadcast(event)
             except Exception as e:
                 logger.debug(f"[Dashboard] Broadcast error: {e}")
+
+    async def _shutdown(self) -> None:
+        """Release long-lived resources cleanly during shutdown."""
+        if self.wake:
+            self.wake.stop()
+
+        if self.mqtt:
+            try:
+                await self.mqtt.disconnect()
+            except Exception as e:
+                logger.debug(f"[Shutdown] MQTT disconnect failed: {e}")
+
+        if self.cameras:
+            try:
+                await self.cameras.close()
+            except Exception as e:
+                logger.debug(f"[Shutdown] Camera close failed: {e}")
+
+        if self.db:
+            try:
+                await self.db.close()
+            except Exception as e:
+                logger.debug(f"[Shutdown] DB close failed: {e}")
 
     # ── Main Entry Point ───────────────────────────────────────────────────
 
@@ -749,6 +826,18 @@ class Orchestrator:
             await self._init_network()
         except Exception as e:
             logger.warning(f"[Init] Network init failed (continuing without): {e}")
+
+        # Wire dashboard to config + handlers
+        if self.dashboard:
+            room_ids = [r["id"] for r in self.config.get("rooms", [])]
+            self.dashboard.set_room_ids(room_ids)
+            self.dashboard.register_chat_handler(self._on_text_chat)
+            if self.tts:
+                self.dashboard.register_voice_handler(
+                    self._on_voice_change,
+                    voices=self.tts.available_voices(),
+                    active=self.tts._active_voice,
+                )
 
         # Register event handlers
         self._register_event_handlers()
@@ -801,4 +890,5 @@ class Orchestrator:
                 t.cancel()
             if running:
                 await asyncio.gather(*running, return_exceptions=True)
+            await self._shutdown()
             logger.info("[Orchestrator] All tasks cancelled. Goodbye.")
