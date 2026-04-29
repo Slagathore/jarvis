@@ -34,8 +34,7 @@ Variables:
 """
 
 import asyncio
-import io
-from typing import Any, Optional, Protocol
+from typing import Any, Optional
 
 import numpy as np
 from loguru import logger
@@ -47,22 +46,7 @@ try:
     _CV2_AVAILABLE = True
 except ImportError:
     _CV2_AVAILABLE = False
-    logger.warning("[CameraManager] OpenCV not available — local cameras disabled")
-
-aiohttp = None
-
-try:
-    import aiohttp
-    _AIOHTTP_AVAILABLE = True
-except ImportError:
-    _AIOHTTP_AVAILABLE = False
-    logger.warning("[CameraManager] aiohttp not available — MJPEG streams disabled")
-
-
-class VideoCaptureLike(Protocol):
-    def isOpened(self) -> bool: ...
-    def read(self) -> tuple[bool, np.ndarray]: ...
-    def release(self) -> None: ...
+    logger.warning("[CameraManager] OpenCV not available — cameras disabled")
 
 
 class CameraManager:
@@ -71,21 +55,17 @@ class CameraManager:
 
     Each room can have at most one camera source. Rooms with no camera
     return None from capture_frame and are excluded from get_available_rooms().
+
+    Both local (int device index) and remote (HTTP MJPEG URL) cameras are
+    opened via cv2.VideoCapture, which handles MJPEG streams natively.
     """
 
     def __init__(self, config: dict) -> None:
         self._rooms_config: list[dict] = config.get("rooms", [])
-        self._local_caps: dict[str, VideoCaptureLike] = {}
-        self._mjpeg_urls: dict[str, str] = {}      # room_id → URL string
-        self._aiohttp_session: Optional[Any] = None
+        self._caps: dict[str, Any] = {}   # room_id → cv2.VideoCapture
 
     async def load(self) -> None:
         """Open all camera sources defined in config."""
-        if _AIOHTTP_AVAILABLE and aiohttp is not None:
-            self._aiohttp_session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=5)
-            )
-
         for room_cfg in self._rooms_config:
             room_id = room_cfg.get("id", "unknown")
             source = room_cfg.get("camera_source")
@@ -93,6 +73,7 @@ class CameraManager:
             if source is None and room_cfg.get("has_node", False):
                 node_ip = room_cfg.get("node_ip")
                 if isinstance(node_ip, str) and node_ip.strip():
+                    # OpenCV reads MJPEG streams directly via VideoCapture URL
                     source = f"http://{node_ip}:8080/"
                 else:
                     logger.warning(
@@ -102,105 +83,63 @@ class CameraManager:
             if source is None:
                 continue
 
-            if isinstance(source, int):
-                # Local USB webcam
-                if _CV2_AVAILABLE and cv2 is not None:
-                    cap = cv2.VideoCapture(source)
-                    if cap.isOpened():
-                        self._local_caps[room_id] = cap
-                        logger.info(
-                            f"[CameraManager] Opened local camera {source} for '{room_id}'"
-                        )
-                    else:
-                        logger.warning(
-                            f"[CameraManager] Could not open camera {source} for '{room_id}'"
-                        )
+            if not _CV2_AVAILABLE or cv2 is None:
+                logger.warning("[CameraManager] OpenCV not available — cannot open cameras")
+                break
 
-            elif isinstance(source, str) and source.startswith("http"):
-                # Remote MJPEG stream (ESP32-CAM)
-                self._mjpeg_urls[room_id] = source
-                logger.info(
-                    f"[CameraManager] Registered MJPEG stream for '{room_id}': {source}"
-                )
+            cap = cv2.VideoCapture(source)
+            if cap.isOpened():
+                self._caps[room_id] = cap
+                label = f"camera {source}" if isinstance(source, int) else source
+                logger.info(f"[CameraManager] Opened {label} for '{room_id}'")
+            else:
+                label = f"camera {source}" if isinstance(source, int) else source
+                logger.warning(f"[CameraManager] Could not open {label} for '{room_id}'")
 
-        if not self._local_caps and not self._mjpeg_urls:
+        if not self._caps:
             logger.warning("[CameraManager] No cameras available")
 
     def get_available_rooms(self) -> list[str]:
         """Return list of room IDs that have an open camera."""
-        return list(self._local_caps.keys()) + list(self._mjpeg_urls.keys())
+        return list(self._caps.keys())
 
     def capture_frame(self, room: str) -> Optional[np.ndarray]:
         """
         Blocking frame capture for a room.
         Returns numpy BGR array (H, W, 3) or None on failure.
         """
-        if room in self._local_caps:
-            return self._capture_local(room)
-        # MJPEG frames are async-only
-        return None
+        return self._read_cap(room)
 
     async def capture_frame_async(self, room: str) -> Optional[np.ndarray]:
         """
-        Async frame capture. Handles both local and remote cameras.
+        Async frame capture. Runs the blocking cv2.read() in a thread.
         Returns numpy BGR array (H, W, 3) or None on failure.
         """
-        if room in self._local_caps:
-            return await asyncio.to_thread(self._capture_local, room)
-        elif room in self._mjpeg_urls:
-            return await self._capture_mjpeg(self._mjpeg_urls[room])
-        return None
+        if room not in self._caps:
+            return None
+        return await asyncio.to_thread(self._read_cap, room)
 
-    def _capture_local(self, room: str) -> Optional[np.ndarray]:
-        """Read one frame from a local OpenCV VideoCapture."""
-        cap = self._local_caps.get(room)
+    def _read_cap(self, room: str) -> Optional[np.ndarray]:
+        """Read one frame from the VideoCapture for this room."""
+        cap = self._caps.get(room)
         if cap is None:
             return None
         try:
             ret, frame = cap.read()
             if ret:
                 return frame
-            logger.debug(f"[CameraManager] Empty frame from local camera '{room}'")
+            logger.debug(f"[CameraManager] Empty frame from '{room}'")
             return None
         except Exception as e:
-            logger.warning(f"[CameraManager] Local capture error for '{room}': {e}")
-            return None
-
-    async def _capture_mjpeg(self, url: str) -> Optional[np.ndarray]:
-        """
-        Fetch a single JPEG frame from an MJPEG stream endpoint.
-        Expects the URL to return a single JPEG image on GET.
-        """
-        session = self._aiohttp_session
-        if not _AIOHTTP_AVAILABLE or session is None:
-            return None
-        try:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.read()
-            # Decode JPEG bytes to numpy array via OpenCV
-            if _CV2_AVAILABLE and cv2 is not None:
-                arr = np.frombuffer(data, dtype=np.uint8)
-                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                return frame
-            return None
-        except Exception as e:
-            logger.debug(f"[CameraManager] MJPEG fetch error ({url}): {e}")
+            logger.warning(f"[CameraManager] Capture error for '{room}': {e}")
             return None
 
     async def close(self) -> None:
         """Release all camera resources."""
-        for room, cap in self._local_caps.items():
+        for room, cap in self._caps.items():
             try:
                 cap.release()
             except Exception:
                 pass
             logger.debug(f"[CameraManager] Released camera for '{room}'")
-
-        self._local_caps.clear()
-
-        session = self._aiohttp_session
-        if session is not None:
-            await session.close()
-            self._aiohttp_session = None
+        self._caps.clear()
