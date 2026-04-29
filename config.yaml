@@ -35,19 +35,21 @@ voice:
     language: "en"
     beam_size: 1              # 1 = fastest, 5 = most accurate
   tts:
-    engine: "piper"           # piper | sapi
-    voice: "en_US-ryan-high"  # Piper voice model name
-    piper_binary: "piper"     # Path to piper binary or just "piper" if in PATH
-    voices_dir: "data/voices" # Directory where .onnx voice model files live
+    engine: "piper"
+    active_voice: "glados"
+    piper_binary: "C:/Users/Cole/CodeStuff/Misc/piper/piper.exe"
+    voices:
+      glados:   "C:/Users/Cole/CodeStuff/Misc/piper/voices/vits-piper-en_US-glados-high/en_US-glados-high.onnx"
+      wheatley: "C:/Users/Cole/CodeStuff/Misc/piper/voices/wheatley1/wheatley1.onnx"
     speed: 1.0
-    sample_rate: 22050        # Piper outputs 22050Hz by default
+    sample_rate: 22050
   wake_word:
     model: "hey_jarvis"       # openWakeWord model name
     sensitivity: 0.5          # 0.0-1.0, higher = more sensitive (more false positives)
     cooldown_seconds: 2
   recording:
     sample_rate: 16000
-    silence_threshold_db: -40
+    silence_threshold_db: -50
     silence_duration_ms: 800   # Stop recording after this much silence
     max_duration_seconds: 30
 
@@ -70,6 +72,11 @@ mqtt:
 rooms:
   - id: "office"
     display_name: "Office"
+    camera_source: 0          # USB webcam (device index 0)
+    has_node: false
+    node_ip: null
+  - id: "office_node"         # rename to whichever room the ESP32 actually lives in
+    display_name: "Office Node"
     camera_source: null
     has_node: true
     node_ip: "192.168.1.101"

@@ -72,11 +72,17 @@ class WakeWordDetector:
         device: Optional[int] = None,
     ) -> None:
         self._cfg = config["voice"]["wake_word"]
+        voice_cfg = config.get("voice", {})
         self._bus = bus
         self._room = room
-        self._device = device
+        self._device = (
+            device
+            if device is not None
+            else self._cfg.get("device", voice_cfg.get("input_device"))
+        )
         self.loaded: bool = False
         self._running: bool = False
+        self._suspended: bool = False  # True while recording has the mic
         self._model: Optional[Any] = None
         self._last_detection: float = 0.0
 
@@ -128,6 +134,10 @@ class WakeWordDetector:
                 logger.error(f"[WakeWord] Stream error: {e} — restarting in 3s")
                 await asyncio.sleep(3)
 
+            # Stream exited cleanly due to suspend — wait until recording is done
+            while self._running and self._suspended:
+                await asyncio.sleep(0.05)
+
     def _stream_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """
         Blocking audio stream loop. Runs in a thread pool via asyncio.to_thread.
@@ -149,7 +159,7 @@ class WakeWordDetector:
             ) as stream:
                 logger.debug("[WakeWord] Audio stream open")
 
-                while self._running:
+                while self._running and not self._suspended:
                     block, overflowed = stream.read(OWW_CHUNK_SIZE)
                     if overflowed:
                         # Overflow is non-fatal — we just lose a chunk
@@ -201,7 +211,25 @@ class WakeWordDetector:
         except sd.PortAudioError as e:
             raise WakeWordError(f"Audio stream failed: {e}") from e
 
+    def suspend(self) -> None:
+        """
+        Release the microphone so record_until_silence can open it.
+        The listen_forever loop will reopen the stream after wakeup() is called.
+        """
+        self._suspended = True
+        logger.debug("[WakeWord] Mic suspended for recording")
+
+    def wakeup(self) -> None:
+        """Re-enable microphone after recording is complete."""
+        self._suspended = False
+        logger.debug("[WakeWord] Mic resumed")
+
     def stop(self) -> None:
         """Signal the stream loop to stop. Non-blocking."""
         self._running = False
         logger.debug("[WakeWord] Stop requested")
+
+    @property
+    def device(self) -> Optional[int | str]:
+        """Configured input device for wake-listening and follow-up recording."""
+        return self._device

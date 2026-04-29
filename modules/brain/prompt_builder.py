@@ -98,7 +98,7 @@ class PromptBuilder:
         """
         now = datetime.now()
         time_str = now.strftime("%I:%M %p")
-        day_str = now.strftime("%A, %B %-d")  # e.g., "Saturday, April 19"
+        day_str = f"{now.strftime('%A, %B')} {now.day}"  # %-d is Linux-only
 
         lines = [self._base_system, ""]
         lines.append(f"Current time: {time_str} on {day_str}.")

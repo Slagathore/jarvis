@@ -107,6 +107,17 @@
             </div>
           </div>
         </div>
+        <!-- Dev Controls Card -->
+        <div class="card" id="dev-card">
+          <div class="card-label">DEV CONTROLS</div>
+          <div class="dev-row">
+            <span class="dev-label">VOICE</span>
+            <select class="dev-select" id="voice-select">
+              <option value="">loading...</option>
+            </select>
+            <button class="dev-btn" id="voice-apply">SET</button>
+          </div>
+        </div>
       </div>
 
       <!-- CENTER COLUMN -->
@@ -139,10 +150,20 @@
           <div class="conv-log" id="conv-log">
             <div class="conv-empty">Waiting for first interaction...</div>
           </div>
+          <div class="chat-input-wrap">
+            <input
+              type="text"
+              id="chat-input"
+              class="chat-input"
+              placeholder="Message Jarvis..."
+              autocomplete="off"
+            />
+            <button class="chat-send" id="chat-send">SEND</button>
+          </div>
         </div>
       </div>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=4"></script>
   </body>
 </html>

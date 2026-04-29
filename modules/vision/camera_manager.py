@@ -63,6 +63,7 @@ class CameraManager:
     def __init__(self, config: dict) -> None:
         self._rooms_config: list[dict] = config.get("rooms", [])
         self._caps: dict[str, Any] = {}   # room_id → cv2.VideoCapture
+        self._last_frames: dict[str, np.ndarray] = {}
 
     async def load(self) -> None:
         """Open all camera sources defined in config."""
@@ -91,14 +92,34 @@ class CameraManager:
             try:
                 # cv2.VideoCapture blocks (network connection for URLs) — run in thread
                 # with a timeout so an offline node doesn't stall the whole startup.
+                # Local cameras (int index) need more time on Windows DirectShow
+                open_timeout = 20.0 if isinstance(source, int) else 8.0
                 cap = await asyncio.wait_for(
                     asyncio.to_thread(cv2.VideoCapture, source),
-                    timeout=8.0,
+                    timeout=open_timeout,
                 )
                 if cap.isOpened():
+                    ok, frame = await asyncio.wait_for(
+                        asyncio.to_thread(cap.read),
+                        timeout=5.0,
+                    )
+                    if not ok or frame is None:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        logger.warning(
+                            f"[CameraManager] Opened {label} for '{room_id}' but could not read a frame"
+                        )
+                        continue
                     self._caps[room_id] = cap
+                    self._last_frames[room_id] = frame
                     logger.info(f"[CameraManager] Opened {label} for '{room_id}'")
                 else:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
                     logger.warning(f"[CameraManager] Could not open {label} for '{room_id}'")
             except asyncio.TimeoutError:
                 logger.warning(
@@ -136,11 +157,14 @@ class CameraManager:
         cap = self._caps.get(room)
         if cap is None:
             return None
+        cached = self._last_frames.pop(room, None)
+        if cached is not None:
+            return cached
         try:
             ret, frame = cap.read()
             if ret:
                 return frame
-            logger.debug(f"[CameraManager] Empty frame from '{room}'")
+            logger.warning(f"[CameraManager] Empty frame from '{room}' — stream may have dropped")
             return None
         except Exception as e:
             logger.warning(f"[CameraManager] Capture error for '{room}': {e}")
@@ -155,3 +179,4 @@ class CameraManager:
                 pass
             logger.debug(f"[CameraManager] Released camera for '{room}'")
         self._caps.clear()
+        self._last_frames.clear()

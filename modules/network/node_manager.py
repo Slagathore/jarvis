@@ -154,7 +154,10 @@ class NodeManager:
         if room not in self._nodes:
             # Auto-register unknown rooms that start reporting
             self._nodes[room] = NodeInfo(room=room)
-            logger.info(f"[NodeManager] Auto-registered new node: '{room}'")
+            logger.warning(
+                f"[NodeManager] Auto-registered unexpected node '{room}'. "
+                "Check that the firmware room_id matches config.yaml."
+            )
 
         node = self._nodes[room]
         was_online = node.online
