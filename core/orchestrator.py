@@ -894,32 +894,32 @@ class Orchestrator:
                     if pc_signal:
                         signals["pc"] = pc_signal
 
-                if self.audio_classifier and not self._audio_io_active:
-                    # YAMNet records its own audio window via sd.rec(), which
-                    # collides with the wake_word InputStream on the same mic.
-                    # On Windows WASAPI, two concurrent InputStreams on one
-                    # device returns silence for one of them — leaving us with
-                    # no audio classification (and a stuck "unknown" state).
-                    # Suspend wake briefly to give YAMNet exclusive access.
-                    if self.wake:
-                        self.wake.suspend()
-                    try:
-                        # BUG FIX: classify_async() returns list[dict] (not a
-                        # single dict). state_fusion expects:
-                        # signals["audio"] = {"activity": str, "confidence": float}
-                        classifications = await self.audio_classifier.classify_async()
-                    finally:
-                        if self.wake:
-                            self.wake.wakeup()
-
-                    if classifications:
-                        # Feed raw list to appliance tracker (expects list[dict])
-                        if self.appliance_tracker:
-                            self.appliance_tracker.update(classifications)
-                        signals["audio"] = {
-                            "activity":   classifications[0]["label"],
-                            "confidence": classifications[0]["score"],
-                        }
+                if (
+                    self.audio_classifier
+                    and not self._audio_io_active
+                    and self.wake is not None
+                ):
+                    # Read the last N seconds of audio from wake_word's shared
+                    # buffer instead of opening a second InputStream. The old
+                    # suspend/wakeup approach killed wake responsiveness — wake
+                    # was unavailable ~50% of the time and openWakeWord lost
+                    # its prediction context every cycle. Now wake_word holds
+                    # the mic continuously and YAMNet just snapshots its buffer.
+                    window_s = float(
+                        self.config["context"].get("audio_classify_window_seconds", 3)
+                    )
+                    waveform = self.wake.get_recent_audio(window_s)
+                    if waveform is not None and len(waveform) > 0:
+                        classifications = await asyncio.to_thread(
+                            self.audio_classifier.classify, waveform
+                        )
+                        if classifications:
+                            if self.appliance_tracker:
+                                self.appliance_tracker.update(classifications)
+                            signals["audio"] = {
+                                "activity":   classifications[0]["label"],
+                                "confidence": classifications[0]["score"],
+                            }
 
                 if self.posture and self.cameras:
                     rooms = self.cameras.get_available_rooms()

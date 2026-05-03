@@ -32,7 +32,9 @@ Variables:
 """
 
 import asyncio
+import threading
 import time
+from collections import deque
 from typing import Any, Optional
 
 import numpy as np
@@ -85,6 +87,13 @@ class WakeWordDetector:
         self._suspended: bool = False  # True while recording has the mic
         self._model: Optional[Any] = None
         self._last_detection: float = 0.0
+        # Rolling buffer of the last few seconds of int16 audio chunks. Other
+        # consumers (e.g. AudioClassifier) read from this instead of opening
+        # their own InputStream — Windows WASAPI hates dual streams on the
+        # same device and constantly suspending wake_word destroys responsiveness.
+        # 5 seconds at 16kHz / 1280 samples per chunk = ~62 chunks.
+        self._audio_buffer: deque = deque(maxlen=80)
+        self._audio_buffer_lock = threading.Lock()
 
     def load(self) -> None:
         """
@@ -212,6 +221,13 @@ class WakeWordDetector:
                     # openWakeWord expects shape (N,) int16
                     audio_chunk = block.flatten()
 
+                    # Stash a copy in the shared buffer for downstream consumers
+                    # (audio classifier, sleep tracker, etc.). Lock-protected
+                    # because the deque is read from the asyncio event loop
+                    # thread while we're appending from the audio thread.
+                    with self._audio_buffer_lock:
+                        self._audio_buffer.append(audio_chunk.copy())
+
                     # Audio level meter — track normalized RMS for dashboard
                     chunk_norm = audio_chunk.astype(np.float32) / 32768.0
                     level_buffer.append(float(np.sqrt(np.mean(chunk_norm ** 2))))
@@ -293,6 +309,26 @@ class WakeWordDetector:
         """Signal the stream loop to stop. Non-blocking."""
         self._running = False
         logger.debug("[WakeWord] Stop requested")
+
+    def get_recent_audio(self, seconds: float) -> Optional[np.ndarray]:
+        """
+        Return the last `seconds` of buffered audio as a float32 [-1, 1] mono
+        waveform at 16 kHz. None if nothing has been buffered yet.
+
+        Used by AudioClassifier (YAMNet) and other modules that need a recent
+        audio snapshot without opening their own InputStream — this avoids
+        the WASAPI dual-stream conflict that previously forced a destructive
+        suspend/wakeup cycle on the wake word detector.
+        """
+        n_chunks = max(1, int(seconds * OWW_SAMPLE_RATE / OWW_CHUNK_SIZE))
+        with self._audio_buffer_lock:
+            if not self._audio_buffer:
+                return None
+            chunks = list(self._audio_buffer)[-n_chunks:]
+        if not chunks:
+            return None
+        pcm_int16 = np.concatenate(chunks)
+        return pcm_int16.astype(np.float32) / 32768.0
 
     @property
     def device(self) -> Optional[int | str]:
