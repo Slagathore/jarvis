@@ -104,6 +104,7 @@ from modules.agenda import GoogleCalendar
 from modules.network.mqtt_client import MQTTClient
 from modules.network.node_manager import NodeManager
 from modules.reminders import ReminderScheduler, RemindersStore, parse_reminder
+from modules.vision.anomaly_detector import AnomalyDetector
 from modules.vision.camera_manager import CameraManager
 from modules.vision.face_recognizer import FaceRecognizer
 from modules.vision.light_detector import LightDetector
@@ -157,6 +158,7 @@ class Orchestrator:
         self.object_detector: Optional[ObjectDetector] = None
         self.scene_analyzer: Optional[SceneAnalyzer] = None
         self.face_recognizer: Optional[FaceRecognizer] = None
+        self.anomaly_detector: Optional[AnomalyDetector] = None
 
         self.mqtt: Optional[MQTTClient] = None
         self.nodes: Optional[NodeManager] = None
@@ -291,6 +293,7 @@ class Orchestrator:
         self.object_detector = ObjectDetector(self.config)
         await self.object_detector.load_async()
         self.scene_analyzer = SceneAnalyzer(config=self.config, llm=self.llm)
+        self.anomaly_detector = AnomalyDetector(config=self.config, llm=self.llm)
 
         # Face recognition — best-effort, fine if it can't load
         if self.db is not None:
@@ -1195,6 +1198,34 @@ class Orchestrator:
                         if self.room_baselines and last_desc:
                             if await self.room_baselines.needs_update(room_id):
                                 await self.room_baselines.update(room_id, last_desc)
+
+                            # Anomaly scoring — only if we have a baseline + cooldown allows.
+                            # Compares current scene to baseline via LLM, fires room_anomaly
+                            # event when score exceeds threshold.
+                            if (
+                                self.anomaly_detector is not None
+                                and self.anomaly_detector.should_check(room_id)
+                            ):
+                                baseline = await self.room_baselines.get(room_id)
+                                if baseline and baseline != last_desc:
+                                    result = await self.anomaly_detector.score(
+                                        room_id, baseline, last_desc
+                                    )
+                                    if result is not None:
+                                        score, reason = result
+                                        logger.debug(
+                                            f"[Anomaly] '{room_id}' score={score:.1f} reason={reason!r}"
+                                        )
+                                        if score >= self.anomaly_detector.threshold:
+                                            await self._broadcast({
+                                                "type":   "room_anomaly",
+                                                "room":   room_id,
+                                                "score":  score,
+                                                "reason": reason,
+                                            })
+                                            logger.info(
+                                                f"[Anomaly] '{room_id}' {score:.1f}/10: {reason}"
+                                            )
 
                         # Broadcast vision state — use lights_on bool directly
                         await self._broadcast({

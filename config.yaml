@@ -137,6 +137,13 @@ vision:
   scene_change_threshold_per_room:
     office: 25.0   # ESP32-CAM, noisy sensor
 
+anomaly:
+  # When a current scene description's similarity score vs its baseline (0=same,
+  # 10=radically different) is at or above this number, fire a room_anomaly event.
+  alert_threshold: 6.0
+  # Min seconds between scoring a given room. Stops the LLM getting hammered.
+  cooldown_seconds: 600
+
 interruptibility:
   quiet_hours_start: "22:00"
   quiet_hours_end: "08:00"
