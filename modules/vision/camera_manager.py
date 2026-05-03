@@ -64,6 +64,11 @@ class CameraManager:
         self._rooms_config: list[dict] = config.get("rooms", [])
         self._caps: dict[str, Any] = {}   # room_id → cv2.VideoCapture
         self._last_frames: dict[str, np.ndarray] = {}
+        # Source per room so we can reopen on stream failure (ESP32-CAM web server
+        # routinely terminates MJPEG sessions; OpenCV does not retry on its own).
+        self._sources: dict[str, Any] = {}
+        self._fail_counts: dict[str, int] = {}
+        self._reopen_threshold: int = 3
 
     async def load(self) -> None:
         """Open all camera sources defined in config."""
@@ -113,6 +118,8 @@ class CameraManager:
                         )
                         continue
                     self._caps[room_id] = cap
+                    self._sources[room_id] = source
+                    self._fail_counts[room_id] = 0
                     self._last_frames[room_id] = frame
                     logger.info(f"[CameraManager] Opened {label} for '{room_id}'")
                 else:
@@ -162,13 +169,50 @@ class CameraManager:
             return cached
         try:
             ret, frame = cap.read()
-            if ret:
+            if ret and frame is not None:
+                self._fail_counts[room] = 0
                 return frame
-            logger.warning(f"[CameraManager] Empty frame from '{room}' — stream may have dropped")
-            return None
         except Exception as e:
             logger.warning(f"[CameraManager] Capture error for '{room}': {e}")
-            return None
+
+        # Read failed — count consecutive failures and reopen the stream after a
+        # few. ESP32-CAM HTTP streams routinely terminate; we have to reconnect.
+        self._fail_counts[room] = self._fail_counts.get(room, 0) + 1
+        logger.warning(
+            f"[CameraManager] Empty frame from '{room}' "
+            f"({self._fail_counts[room]}/{self._reopen_threshold})"
+        )
+        if self._fail_counts[room] >= self._reopen_threshold:
+            self._reopen(room)
+        return None
+
+    def _reopen(self, room: str) -> None:
+        """Close and reopen the VideoCapture for a room. Best-effort, may fail."""
+        if cv2 is None:
+            return
+        source = self._sources.get(room)
+        if source is None:
+            return
+        old = self._caps.pop(room, None)
+        if old is not None:
+            try:
+                old.release()
+            except Exception:
+                pass
+        try:
+            cap = cv2.VideoCapture(source)
+            if cap.isOpened():
+                self._caps[room] = cap
+                self._fail_counts[room] = 0
+                logger.info(f"[CameraManager] Reopened '{room}' ({source})")
+            else:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                logger.warning(f"[CameraManager] Reopen failed for '{room}' — will retry")
+        except Exception as e:
+            logger.warning(f"[CameraManager] Reopen error for '{room}': {e}")
 
     async def close(self) -> None:
         """Release all camera resources."""

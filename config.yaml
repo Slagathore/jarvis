@@ -70,13 +70,13 @@ mqtt:
     state:     "jarvis/system/state"         # Broadcast current activity state
 
 rooms:
-  - id: "office"
-    display_name: "Office"
+  - id: "office_cam"
+    display_name: "Office Cam"
     camera_source: 0          # USB webcam (device index 0)
     has_node: false
     node_ip: null
-  - id: "office_node"         # rename to whichever room the ESP32 actually lives in
-    display_name: "Office Node"
+  - id: "office"              # ESP32-CAM node — firmware publishes as room_id "office"
+    display_name: "Office"
     camera_source: null
     has_node: true
     node_ip: "192.168.1.101"
@@ -97,7 +97,7 @@ rooms:
     node_ip: null
 
 context:
-  vision_scan_interval_minutes: 5
+  vision_scan_interval_minutes: 1
   pc_poll_interval_seconds: 10
   audio_classify_window_seconds: 3
   posture_analysis_fps: 1

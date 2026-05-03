@@ -84,6 +84,17 @@ mqtt:
         - lambda: |-
             id(node_camera).set_contrast(atoi(x.c_str()));
 
+# Periodic status republish so NodeManager's heartbeat watchdog doesn't
+# false-positive when nothing else is happening on the bus. Pairs with
+# birth/will messages: birth on connect, this every 15s, will on disconnect.
+interval:
+  - interval: 15s
+    then:
+      - mqtt.publish:
+          topic: jarvis/nodes/${room_id}/status
+          payload: "online"
+          retain: true
+
 # ── I2S Audio Bus ──────────────────────────────────────────────────────────
 # Shared clock bus for both INMP441 microphone and MAX98357A speaker amp.
 # NOTE: The current Python repo definitely uses node status + camera stream.
