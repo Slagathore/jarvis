@@ -2,29 +2,26 @@
 JARVIS — Ambient Home AI
 ========================
 Mission: Entry point for the JARVIS system. Loads environment variables and YAML
-         config, configures structured logging via Loguru, instantiates the
-         Orchestrator, and launches the async event loop.
+         config, configures structured logging via Loguru, parses CLI flags,
+         enforces a single-instance process lock, installs SIGINT/SIGTERM
+         shutdown handlers, instantiates the Orchestrator, and launches the
+         async event loop.
 
-         This file deliberately contains almost no logic — that all lives in
-         core/orchestrator.py. This file's only job is to boot cleanly.
+         This file is the boot harness; all real logic lives in
+         core/orchestrator.py.
 
 Modules: main.py
-Classes: (none)
 Functions:
-    main()   — Load config, setup logging, instantiate Orchestrator, run.
-
-Variables:
-    CONFIG_PATH  — Path to config.yaml relative to this file
-    LOG_DIR      — Directory for log file rotation
-
-#todo: Add --config CLI flag to point at alternate config file
-#todo: Add --dry-run flag that loads modules but doesn't start microphone
-#todo: Add --log-level CLI override for debugging without editing config.yaml
-#todo: Add process lock file so you can't accidentally launch two instances
+    parse_args()                — argparse for --config / --dry-run / --log-level
+    main(args)                  — Boot sequence
+    _acquire_lock()             — Refuse to start if another live instance exists
+    _install_signal_handlers()  — Convert SIGINT/SIGTERM into orchestrator cancel
 """
 
+import argparse
 import asyncio
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -34,9 +31,9 @@ from loguru import logger
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
-CONFIG_PATH = Path(__file__).parent / "config.yaml"
-LOG_DIR     = Path(__file__).parent / "data"
-PID_FILE    = Path(__file__).parent / "data" / "jarvis.pid"
+DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
+LOG_DIR             = Path(__file__).parent / "data"
+PID_FILE            = Path(__file__).parent / "data" / "jarvis.pid"
 
 
 def _configure_event_loop_policy() -> None:
@@ -80,19 +77,19 @@ def _setup_logging(log_level: str) -> None:
     )
 
 
-def _load_config() -> dict:
+def _load_config(path: Path) -> dict:
     """Load and return the YAML config. Raises on missing file or parse error."""
-    if not CONFIG_PATH.exists():
+    if not path.exists():
         raise FileNotFoundError(
-            f"config.yaml not found at {CONFIG_PATH}. "
+            f"config.yaml not found at {path}. "
             "Run python scripts/setup.py to validate your environment."
         )
 
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     if not config:
-        raise ValueError("config.yaml is empty or invalid.")
+        raise ValueError(f"{path} is empty or invalid.")
 
     # Overlay any MQTT credentials from .env
     if os.getenv("MQTT_USERNAME"):
@@ -103,22 +100,123 @@ def _load_config() -> dict:
     return config
 
 
-async def main() -> None:
+def parse_args() -> argparse.Namespace:
+    """CLI flags. All optional — defaults match historical behavior."""
+    parser = argparse.ArgumentParser(
+        prog="jarvis",
+        description="Ambient home AI — local Python orchestrator.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help="Path to config.yaml (default: ./config.yaml).",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default=None,
+        help="Override system.log_level from config.yaml.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Load config + import modules but exit before starting the event loop.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip the process-lock check (use only if you know no other instance is running).",
+    )
+    return parser.parse_args()
+
+
+def _process_alive(pid: int) -> bool:
+    """Return True if a process with the given PID is currently running."""
+    if pid <= 0:
+        return False
+    try:
+        import psutil  # type: ignore[import-not-found]
+        return psutil.pid_exists(pid)
+    except Exception:
+        # Fallback: signal 0 doesn't kill, just probes
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+        except OSError:
+            return False
+
+
+def _acquire_lock(force: bool) -> None:
+    """
+    Refuse to start if another Jarvis instance is already running. Two mics
+    on the same device + two MQTT clients with the same client ID + two
+    Whisper models loaded into the same GPU = mayhem.
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if PID_FILE.exists() and not force:
+        try:
+            existing_pid = int(PID_FILE.read_text().strip() or 0)
+        except ValueError:
+            existing_pid = 0
+        if existing_pid > 0 and existing_pid != os.getpid() and _process_alive(existing_pid):
+            print(
+                f"[Main] Another Jarvis instance is already running (pid={existing_pid}).\n"
+                f"       If you're sure it isn't, delete {PID_FILE} or use --force.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        # Stale lock — overwrite it
+    PID_FILE.write_text(str(os.getpid()))
+
+
+def _install_signal_handlers(stop_event: asyncio.Event) -> None:
+    """
+    Convert SIGINT (Ctrl+C) and SIGTERM into a graceful shutdown by setting
+    a stop event the orchestrator's run() respects via task cancellation.
+    On Windows, only SIGINT is reliably delivered; SIGTERM is best-effort.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _handler(signum):
+        logger.info(f"[Main] Received signal {signum} — initiating graceful shutdown")
+        stop_event.set()
+
+    if sys.platform == "win32":
+        # Windows asyncio doesn't support add_signal_handler; rely on KeyboardInterrupt
+        # for SIGINT and the WinAPI signal module for SIGTERM (best-effort).
+        try:
+            signal.signal(signal.SIGINT, lambda s, f: _handler(s))
+            signal.signal(signal.SIGTERM, lambda s, f: _handler(s))
+        except Exception as e:
+            logger.debug(f"[Main] Couldn't install Windows signal handlers: {e}")
+    else:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _handler, sig)
+            except (NotImplementedError, RuntimeError) as e:
+                logger.debug(f"[Main] Couldn't install handler for {sig}: {e}")
+
+
+async def main(args: argparse.Namespace) -> None:
     """
     JARVIS boot sequence:
       1. Load .env
-      2. Load config.yaml
-      3. Configure Loguru
-      4. Create and run the Orchestrator
+      2. Load config.yaml from --config
+      3. Configure Loguru (CLI --log-level overrides config)
+      4. If --dry-run, exit before launching the orchestrator
+      5. Install SIGINT/SIGTERM graceful shutdown handlers
+      6. Run the orchestrator until shutdown signal
     """
-    # Load .env (silently OK if missing — production envs may inject directly)
     load_dotenv()
+    config = _load_config(args.config)
 
-    # Load config
-    config = _load_config()
-
-    # Setup logging (use level from config, fallback to INFO)
-    log_level = config.get("system", {}).get("log_level", "INFO").upper()
+    log_level = (
+        args.log_level
+        or config.get("system", {}).get("log_level", "INFO")
+    ).upper()
     _setup_logging(log_level)
 
     logger.info("=" * 60)
@@ -127,29 +225,50 @@ async def main() -> None:
     )
     logger.info("=" * 60)
 
-    # Import here so Loguru is configured before any module-level loggers fire
-    from core.orchestrator import Orchestrator
+    if args.dry_run:
+        logger.info("[Main] --dry-run: importing modules then exiting.")
+        # Import every major module so missing deps surface here
+        from core.orchestrator import Orchestrator  # noqa: F401
+        logger.info("[Main] Dry-run successful — all modules importable.")
+        return
 
+    from core.orchestrator import Orchestrator
     orchestrator = Orchestrator(config)
 
+    stop_event = asyncio.Event()
+    _install_signal_handlers(stop_event)
+
+    run_task = asyncio.create_task(orchestrator.run(), name="orchestrator-run")
+    stop_task = asyncio.create_task(stop_event.wait(), name="shutdown-wait")
+
     try:
-        await orchestrator.run()
+        # Whichever finishes first wins — a stop signal cancels the orchestrator.
+        await asyncio.wait({run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
     except KeyboardInterrupt:
         logger.info("[Main] Keyboard interrupt — shutting down.")
+        stop_event.set()
     except Exception as e:
         logger.critical(f"[Main] Fatal error: {e}")
         raise
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+            try:
+                await run_task
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
+            except Exception as e:
+                logger.warning(f"[Main] Orchestrator shutdown error: {e}")
+        stop_task.cancel()
 
 
 if __name__ == "__main__":
     _configure_event_loop_policy()
-
-    # Write PID file so stop.ps1 can find this process
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))
+    cli_args = parse_args()
+    _acquire_lock(force=cli_args.force)
 
     try:
-        asyncio.run(main())
+        asyncio.run(main(cli_args))
     except KeyboardInterrupt:
         pass
     finally:
