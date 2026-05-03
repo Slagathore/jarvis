@@ -194,6 +194,8 @@ calendar:
   token_path: "data/google_token.json"              # cached refresh token (auto-created on first auth)
   calendar_id: "primary"                            # "primary" = your default calendar
   timezone: "America/Chicago"                       # IANA tz for new events
+  alert_lead_minutes: 10                            # proactive announcement lead time before an event starts
+  alert_poll_seconds: 60                            # how often the alert loop checks the calendar
 
 # ── Process → Activity mapping for PC monitor ──────────────────────────────
 # Key is the process .exe name (case-insensitive), value is the activity label.

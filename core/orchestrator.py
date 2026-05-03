@@ -153,6 +153,9 @@ class Orchestrator:
         self.reminder_scheduler: Optional[ReminderScheduler] = None
 
         self.calendar: Optional[GoogleCalendar] = None
+        # Event IDs we've already announced so the proactive alert loop doesn't
+        # double-fire as a meeting approaches.
+        self._calendar_alerted: set[str] = set()
 
         self._current_state: ActivityState = UNKNOWN_STATE
         self._wake_lock = asyncio.Lock()
@@ -599,6 +602,30 @@ class Orchestrator:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "calendar_update_event",
+                "description": (
+                    "Patch an existing event by its ID. Only fields you pass "
+                    "get changed (use this to reschedule, rename, or relocate "
+                    "an event). ALWAYS call calendar_list_events first to "
+                    "find the right event ID."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["event_id"],
+                    "properties": {
+                        "event_id":    {"type": "string", "description": "Event ID to patch."},
+                        "title":       {"type": "string", "description": "New title (omit to leave unchanged)."},
+                        "start_iso":   {"type": "string", "description": "New start time, ISO 8601."},
+                        "end_iso":     {"type": "string", "description": "New end time, ISO 8601."},
+                        "description": {"type": "string"},
+                        "location":    {"type": "string"},
+                    },
+                },
+            },
+        },
     ]
 
     async def _tool_calendar_list_events(
@@ -695,12 +722,45 @@ class Orchestrator:
             await self._broadcast({"type": "calendar_deleted", "id": event_id})
         return {"ok": ok, "event_id": event_id}
 
+    async def _tool_calendar_update_event(
+        self,
+        event_id: str,
+        title: Optional[str] = None,
+        start_iso: Optional[str] = None,
+        end_iso: Optional[str] = None,
+        description: Optional[str] = None,
+        location: Optional[str] = None,
+    ) -> dict:
+        """Tool handler: patch an existing event."""
+        if self.calendar is None or not self.calendar.is_authenticated:
+            return {"error": "calendar not available"}
+        start = end = None
+        if start_iso:
+            try:
+                start = datetime.fromisoformat(start_iso)
+            except ValueError:
+                return {"error": f"start_iso not parseable: {start_iso!r}"}
+        if end_iso:
+            try:
+                end = datetime.fromisoformat(end_iso)
+            except ValueError:
+                return {"error": f"end_iso not parseable: {end_iso!r}"}
+        event = await self.calendar.update_event(
+            event_id=event_id, title=title, start=start, end=end,
+            description=description, location=location,
+        )
+        if event is None:
+            return {"error": "calendar API rejected update"}
+        await self._broadcast({"type": "calendar_updated", "event": event})
+        return event
+
     def _calendar_tool_handlers(self) -> dict:
         """Map tool names to bound async handlers."""
         return {
             "calendar_list_events":   self._tool_calendar_list_events,
             "calendar_create_event":  self._tool_calendar_create_event,
             "calendar_delete_event":  self._tool_calendar_delete_event,
+            "calendar_update_event":  self._tool_calendar_update_event,
         }
 
     async def _try_create_reminder(self, text: str, room: str) -> bool:
@@ -988,6 +1048,67 @@ class Orchestrator:
 
             except Exception as e:
                 logger.error(f"[Curiosity] Loop error: {e}")
+
+    async def _calendar_alert_loop(self) -> None:
+        """
+        Poll the calendar every minute and proactively announce meetings
+        starting within the next N minutes. Each event is alerted at most once.
+        Skips entirely if calendar isn't authenticated.
+        """
+        cal_cfg = self.config.get("calendar", {}) if isinstance(self.config.get("calendar"), dict) else {}
+        lead_minutes = int(cal_cfg.get("alert_lead_minutes", 10))
+        poll_seconds = int(cal_cfg.get("alert_poll_seconds", 60))
+        logger.info(
+            f"[Calendar] Alert loop started (lead={lead_minutes}m, poll={poll_seconds}s)"
+        )
+        while True:
+            try:
+                await asyncio.sleep(poll_seconds)
+                if self.calendar is None or not self.calendar.is_authenticated:
+                    continue
+                events = await self.calendar.upcoming_events(hours=1)
+                from datetime import datetime as _dt, timedelta as _td
+                now = _dt.now().astimezone()
+                threshold = now + _td(minutes=lead_minutes)
+                for e in events:
+                    eid = e.get("id")
+                    start_str = e.get("start") or ""
+                    if not eid or not start_str or eid in self._calendar_alerted:
+                        continue
+                    try:
+                        start_dt = _dt.fromisoformat(start_str.replace("Z", "+00:00"))
+                        if start_dt.tzinfo is None:
+                            start_dt = start_dt.astimezone()
+                    except ValueError:
+                        continue
+                    if not (now < start_dt <= threshold):
+                        continue
+                    # Within the lead window — announce
+                    self._calendar_alerted.add(eid)
+                    title = e.get("title") or "an event"
+                    minutes_away = max(1, int((start_dt - now).total_seconds() // 60))
+                    line = await self._compose_in_character(
+                        prompt=(
+                            f"Cole has a calendar event starting in about "
+                            f"{minutes_away} minute{'s' if minutes_away != 1 else ''}: "
+                            f"\"{title}\". Give him a single short heads-up in your "
+                            f"usual voice. No preamble, no quotes."
+                        ),
+                        fallback=f"Heads up — {title} in {minutes_away} minutes.",
+                    )
+                    await self._speak(line, room="office", priority="notification")
+                    logger.info(f"[Calendar] Alerted on '{title}' (id={eid})")
+
+                # Garbage-collect alerted IDs that have already started so the
+                # set doesn't grow unbounded.
+                self._calendar_alerted = {
+                    eid for eid in self._calendar_alerted
+                    if eid in {e.get("id") for e in events}
+                }
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[Calendar] Alert loop error: {e}")
 
     async def _eod_summary_loop(self) -> None:
         """
@@ -1353,6 +1474,7 @@ class Orchestrator:
             self._curiosity_loop(),
             self._health_broadcast_loop(),
             self._eod_summary_loop(),
+            self._calendar_alert_loop(),
         ]
 
         # MQTT monitoring
