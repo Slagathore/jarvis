@@ -172,32 +172,30 @@ def _acquire_lock(force: bool) -> None:
     PID_FILE.write_text(str(os.getpid()))
 
 
-def _install_signal_handlers(stop_event: asyncio.Event) -> None:
+def _install_unix_signal_handlers() -> None:
     """
-    Convert SIGINT (Ctrl+C) and SIGTERM into a graceful shutdown by setting
-    a stop event the orchestrator's run() respects via task cancellation.
-    On Windows, only SIGINT is reliably delivered; SIGTERM is best-effort.
+    On Unix, install SIGTERM as a graceful shutdown that triggers KeyboardInterrupt
+    (which the orchestrator's existing run()/finally already handles cleanly).
+    On Windows, this is a no-op — Python's default SIGINT handler already raises
+    KeyboardInterrupt; installing a custom handler creates duplicate cancellation
+    paths that race inside the orchestrator's gather cleanup and recurse.
     """
-    loop = asyncio.get_running_loop()
-
-    def _handler(signum):
-        logger.info(f"[Main] Received signal {signum} — initiating graceful shutdown")
-        stop_event.set()
-
     if sys.platform == "win32":
-        # Windows asyncio doesn't support add_signal_handler; rely on KeyboardInterrupt
-        # for SIGINT and the WinAPI signal module for SIGTERM (best-effort).
+        return
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM,):
         try:
-            signal.signal(signal.SIGINT, lambda s, f: _handler(s))
-            signal.signal(signal.SIGTERM, lambda s, f: _handler(s))
-        except Exception as e:
-            logger.debug(f"[Main] Couldn't install Windows signal handlers: {e}")
-    else:
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, _handler, sig)
-            except (NotImplementedError, RuntimeError) as e:
-                logger.debug(f"[Main] Couldn't install handler for {sig}: {e}")
+            loop.add_signal_handler(
+                sig,
+                lambda: asyncio.create_task(_raise_kb_interrupt()),
+            )
+        except (NotImplementedError, RuntimeError) as e:
+            logger.debug(f"[Main] Couldn't install handler for {sig}: {e}")
+
+
+async def _raise_kb_interrupt() -> None:
+    """Helper to convert a SIGTERM into the same KeyboardInterrupt path Ctrl+C uses."""
+    raise KeyboardInterrupt("SIGTERM")
 
 
 async def main(args: argparse.Namespace) -> None:
@@ -207,8 +205,8 @@ async def main(args: argparse.Namespace) -> None:
       2. Load config.yaml from --config
       3. Configure Loguru (CLI --log-level overrides config)
       4. If --dry-run, exit before launching the orchestrator
-      5. Install SIGINT/SIGTERM graceful shutdown handlers
-      6. Run the orchestrator until shutdown signal
+      5. Run the orchestrator (Ctrl+C / SIGTERM trigger graceful shutdown via
+         the orchestrator's existing run()/finally cleanup).
     """
     load_dotenv()
     config = _load_config(args.config)
@@ -227,7 +225,6 @@ async def main(args: argparse.Namespace) -> None:
 
     if args.dry_run:
         logger.info("[Main] --dry-run: importing modules then exiting.")
-        # Import every major module so missing deps surface here
         from core.orchestrator import Orchestrator  # noqa: F401
         logger.info("[Main] Dry-run successful — all modules importable.")
         return
@@ -235,31 +232,15 @@ async def main(args: argparse.Namespace) -> None:
     from core.orchestrator import Orchestrator
     orchestrator = Orchestrator(config)
 
-    stop_event = asyncio.Event()
-    _install_signal_handlers(stop_event)
-
-    run_task = asyncio.create_task(orchestrator.run(), name="orchestrator-run")
-    stop_task = asyncio.create_task(stop_event.wait(), name="shutdown-wait")
+    _install_unix_signal_handlers()
 
     try:
-        # Whichever finishes first wins — a stop signal cancels the orchestrator.
-        await asyncio.wait({run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        await orchestrator.run()
     except KeyboardInterrupt:
-        logger.info("[Main] Keyboard interrupt — shutting down.")
-        stop_event.set()
+        logger.info("[Main] Keyboard interrupt — orchestrator shutting down.")
     except Exception as e:
         logger.critical(f"[Main] Fatal error: {e}")
         raise
-    finally:
-        if not run_task.done():
-            run_task.cancel()
-            try:
-                await run_task
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                pass
-            except Exception as e:
-                logger.warning(f"[Main] Orchestrator shutdown error: {e}")
-        stop_task.cancel()
 
 
 if __name__ == "__main__":
