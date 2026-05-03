@@ -64,13 +64,26 @@ class StateFusion:
     5. Confidence reflects how unanimous the vote was.
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, activity_history=None) -> None:
         self._config = config
         self._activity_scores: dict[str, float] = (
             config.get("interruptibility", {}).get("activity_scores", {})
         )
         self._current_room: str = "office"
         self._pending_vision: dict[str, dict[str, Any]] = {}
+        # Optional ActivityHistory — when provided, time-of-day priors derived
+        # from past activity_log rows get blended into the vote scores. With
+        # zero history this contributes nothing; as the table fills, the prior
+        # gradually pulls votes toward whatever Cole typically does at this
+        # time slot. Effectively a "Bayesian-lite" fusion: posterior ∝ prior × likelihood.
+        self._activity_history = activity_history
+        # Strength of the time-of-day prior. 0.0 = pure weighted vote (legacy).
+        # 0.5 = a 5-prior-occurrences bump multiplies the vote by 1.5×. Tuned
+        # conservatively so signals still drive the call.
+        fusion_cfg = (
+            config.get("fusion", {}) if isinstance(config.get("fusion"), dict) else {}
+        )
+        self._prior_weight: float = float(fusion_cfg.get("prior_weight", 0.1))
 
     async def fuse(
         self,
@@ -130,6 +143,24 @@ class StateFusion:
                 context={},
                 updated_at=datetime.now(),
             )
+
+        # Bayesian-lite: if we have ActivityHistory, look up typical activities
+        # for the current day-of-week / hour and bump the matching vote scores.
+        # vote × (1 + prior_weight × occurrences). Activities with no history
+        # entry pass through unchanged. With prior_weight=0 this is a no-op.
+        if self._activity_history is not None and self._prior_weight > 0:
+            try:
+                now = datetime.now()
+                priors = await self._activity_history.typical_activity(
+                    day_of_week=int(now.strftime("%w")),
+                    hour=now.hour,
+                    top_n=10,
+                )
+                for activity, count in priors:
+                    if activity in vote_scores:
+                        vote_scores[activity] *= (1.0 + self._prior_weight * count)
+            except Exception as e:
+                logger.debug(f"[StateFusion] prior lookup failed: {e}")
 
         # Winner = highest weighted vote score
         winner_activity = max(vote_scores, key=lambda a: vote_scores[a])

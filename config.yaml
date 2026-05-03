@@ -151,6 +151,13 @@ mess:
   # 30 minutes between scores per room — tidiness changes slowly.
   cooldown_seconds: 1800
 
+fusion:
+  # State fusion uses weighted-vote on signals, optionally blended with a
+  # time-of-day prior learned from activity_log. 0.0 = pure weighted vote
+  # (legacy). 0.1 = each prior occurrence bumps the matching vote by 10%.
+  # Higher values let the routine override sparse / noisy signals more.
+  prior_weight: 0.1
+
 webhooks:
   # Inbound: POST /api/webhook/<name> with X-Webhook-Token header → emits a
   # 'webhook.<name>' event onto the internal bus that other modules can subscribe to.

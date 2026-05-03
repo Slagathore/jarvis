@@ -273,7 +273,14 @@ class Orchestrator:
         # SleepTracker was getting no args — takes config: dict
         # CuriosityEngine arg order: (config, llm) not (llm, config) — kwargs so OK but fixed for clarity
 
-        self.state_fusion = StateFusion(config=self.config)
+        # ActivityHistory feeds StateFusion with time-of-day priors so the
+        # fusion gradually becomes informed by Cole's actual routine.
+        if self.db is not None:
+            self.activity_history = ActivityHistory(self.db)
+        self.state_fusion = StateFusion(
+            config=self.config,
+            activity_history=self.activity_history,
+        )
         self.interruptibility = InterruptibilityManager(self.config)
         self.curiosity = CuriosityEngine(config=self.config, llm=self.llm)
         self.sleep_tracker = SleepTracker(self.config)
@@ -284,8 +291,6 @@ class Orchestrator:
         # no event loop exists — it never actually runs.
         await self.audio_classifier.load()
         self.appliance_tracker = ApplianceTracker(config=self.config, event_bus=self.bus)
-        if self.db is not None:
-            self.activity_history = ActivityHistory(self.db)
         logger.info("[Init] Context modules ready")
 
     async def _init_vision(self) -> None:
