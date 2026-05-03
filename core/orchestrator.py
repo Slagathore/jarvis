@@ -109,6 +109,7 @@ from modules.vision.light_detector import LightDetector
 from modules.vision.object_detector import ObjectDetector
 from modules.vision.posture_analyzer import PostureAnalyzer
 from modules.vision.scene_analyzer import SceneAnalyzer
+from modules.voice.audio_focus import AudioFocus
 from modules.voice.intents import parse_dnd
 from modules.voice.speaker_id import SpeakerIdentifier
 from modules.voice.stt import WhisperSTT
@@ -133,6 +134,7 @@ class Orchestrator:
         # When set, the next wake-recording captured audio is enrolled as this
         # name instead of being run through STT/LLM. Cleared after enrollment.
         self._pending_speaker_enrollment: Optional[str] = None
+        self.audio_focus: Optional[AudioFocus] = None
 
         self.llm: Optional[OllamaLLM] = None
         self.sessions: Optional[SessionManager] = None
@@ -228,6 +230,18 @@ class Orchestrator:
                 await self.speaker_id.load()
             except Exception as e:
                 logger.warning(f"[Init] Speaker ID failed to load: {e}")
+
+        # Audio focus / volume duck — Windows only, no-op elsewhere
+        voice_cfg = self.config.get("voice", {})
+        focus_cfg = voice_cfg.get("audio_focus", {}) if isinstance(voice_cfg.get("audio_focus"), dict) else {}
+        if focus_cfg.get("enabled", True):
+            self.audio_focus = AudioFocus(
+                duck_factor=float(focus_cfg.get("duck_factor", 0.2)),
+            )
+            if self.audio_focus.available:
+                logger.info("[Init] Audio focus ready (duck other apps while speaking)")
+            else:
+                logger.debug("[Init] Audio focus unavailable on this platform")
 
     async def _init_brain(self) -> None:
         """Initialize LLM, session manager, and prompt builder."""
@@ -1547,13 +1561,18 @@ class Orchestrator:
             if not routed_to_node:
                 # Local playback. Streaming for multi-sentence; quick path for
                 # one-liners. _audio_io_active blocks the audio classifier from
-                # reading wake_word's buffer during our own playback.
+                # reading wake_word's buffer during our own playback. Audio focus
+                # ducks other apps' volume so Jarvis isn't drowned out by music.
                 was_audio_io_active = self._audio_io_active
                 self._audio_io_active = True
+                if self.audio_focus is not None and self.audio_focus.available:
+                    await self.audio_focus.duck_async()
                 try:
                     await self.tts.speak_async(text)
                 finally:
                     self._audio_io_active = was_audio_io_active
+                    if self.audio_focus is not None and self.audio_focus.available:
+                        await self.audio_focus.restore_async()
 
             # Log to DB
             if self.event_log:

@@ -60,6 +60,10 @@ voice:
     # Optional: substring of mic device name (case-insensitive) or integer index.
     # Leave blank/null to use the system default. Run `python -c "import sounddevice; print(sounddevice.query_devices())"` to list devices.
     device: null
+  audio_focus:
+    enabled: true       # Duck other apps' volume while Jarvis speaks (Windows only)
+    duck_factor: 0.2    # Duck to 20% during TTS, restore after
+
   recording:
     sample_rate: 16000
     # mode: "fixed" → record exactly fixed_duration_seconds, ignoring volume.

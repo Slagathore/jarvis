@@ -14,6 +14,9 @@ openwakeword==0.6.0
 # Speaker identification — install resemblyzer with --no-deps on Windows because
 # webrtcvad lacks a prebuilt wheel; we shim the import in modules/voice/speaker_id.py.
 resemblyzer==0.1.4
+# Per-app audio volume control on Windows (used to duck other apps during TTS)
+pycaw==20240210
+comtypes==1.4.5
 
 # ── LLM / Brain ────────────────────────────────────────────────────────────
 ollama==0.3.3
