@@ -29,11 +29,21 @@ ollama:
 
 voice:
   whisper:
-    model_size: "base"        # tiny | base | small | medium | large-v3
+    model_size: "medium"      # tiny | base | small | medium | large-v3
     device: "cuda"            # cuda | cpu
     compute_type: "float16"   # float16 (GPU) | int8 (CPU)
     language: "en"
-    beam_size: 1              # 1 = fastest, 5 = most accurate
+    beam_size: 3              # 1 = fastest greedy, 5 = best on long-form. 3 = sweet spot for short commands without over-decoding.
+    no_speech_threshold: 0.7  # drops more "I'm guessing" segments to suppress hallucination on marginal audio
+    vad_filter: true          # filter silence/breath/noise before decode — without this, medium hallucinates plausible-sounding nonsense from quiet input
+    vad_parameters:
+      # faster-whisper 1.x VadOptions fields: onset, offset, min_speech_duration_ms,
+      # max_speech_duration_s, min_silence_duration_ms, speech_pad_ms.
+      # 'onset' was named 'threshold' in older versions — keep this in sync if you upgrade.
+      onset: 0.5                    # speech probability cutoff to enter speech
+      min_speech_duration_ms: 100   # default 250 — keep brief one-word commands
+      min_silence_duration_ms: 300  # default 2000 — allow short pauses inside an utterance
+    debug_save_empty: true    # dump captured audio to data/debug/ when transcript is empty
   tts:
     engine: "piper"
     active_voice: "glados"
@@ -46,11 +56,20 @@ voice:
   wake_word:
     model: "hey_jarvis"       # openWakeWord model name
     sensitivity: 0.5          # 0.0-1.0, higher = more sensitive (more false positives)
-    cooldown_seconds: 2
+    cooldown_seconds: 3
+    # Optional: substring of mic device name (case-insensitive) or integer index.
+    # Leave blank/null to use the system default. Run `python -c "import sounddevice; print(sounddevice.query_devices())"` to list devices.
+    device: null
   recording:
     sample_rate: 16000
-    silence_threshold_db: -50
-    silence_duration_ms: 800   # Stop recording after this much silence
+    # mode: "fixed" → record exactly fixed_duration_seconds, ignoring volume.
+    #       "silence" → wait for speech, stop after silence_duration_ms of silence.
+    # Use "fixed" when your mic/voice combo doesn't reliably exceed the silence
+    # threshold (so silence-mode never starts recording).
+    mode: "silence"
+    fixed_duration_seconds: 7
+    silence_threshold_db: -60  # only used when mode="silence"
+    silence_duration_ms: 1500  # only used when mode="silence"
     max_duration_seconds: 30
 
 mqtt:
@@ -98,6 +117,17 @@ rooms:
 
 context:
   vision_scan_interval_minutes: 1
+
+vision:
+  # Mean absolute pixel difference (0-255 grayscale, blurred + downscaled) above
+  # which the scene is considered changed enough to re-describe via the LLM.
+  # Static room (good camera): ~1-4. Person moving: ~10-20. Big scene change: 25+.
+  # Lower = more sensitive (more LLM calls). Higher = quieter (more cached descs).
+  scene_change_threshold: 12.0
+  # Per-room overrides for noisy cameras. ESP32-CAM in low light has high
+  # frame-to-frame sensor noise that masquerades as "change" — bump it higher.
+  scene_change_threshold_per_room:
+    office: 25.0   # ESP32-CAM, noisy sensor
   pc_poll_interval_seconds: 10
   audio_classify_window_seconds: 3
   posture_analysis_fps: 1

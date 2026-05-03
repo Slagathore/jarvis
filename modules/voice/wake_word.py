@@ -111,6 +111,45 @@ class WakeWordDetector:
         except Exception as e:
             raise WakeWordError(f"Failed to load wake word model '{model_name}': {e}") from e
 
+        # Resolve and log the input device that wake-listening AND the follow-up
+        # recording will both use — Cole needs to know if the system grabbed the
+        # wrong mic (USB headset vs onboard vs webcam). If the configured device
+        # is a string, resolve by substring match against device names.
+        self._device = self._resolve_device(self._device)
+        try:
+            info = sd.query_devices(self._device, kind="input") if self._device is not None else sd.query_devices(kind="input")
+            name = info.get("name", "unknown") if isinstance(info, dict) else "unknown"
+            logger.info(f"[WakeWord] Using input device #{self._device}: {name!r}")
+        except Exception as e:
+            logger.warning(f"[WakeWord] Could not query input device {self._device!r}: {e}")
+
+    def _resolve_device(self, device: Optional[int | str]) -> Optional[int]:
+        """
+        Resolve a configured device (None | int | str) to a sounddevice index.
+        String inputs are matched as case-insensitive substring against device names.
+        Returns None to mean "system default."
+        """
+        if device is None:
+            return None
+        if isinstance(device, int):
+            return device
+        if not isinstance(device, str) or not device.strip():
+            return None
+        needle = device.strip().lower()
+        try:
+            devices = sd.query_devices()
+        except Exception as e:
+            logger.warning(f"[WakeWord] Cannot enumerate devices: {e}")
+            return None
+        for i, d in enumerate(devices):
+            d_dict = d if isinstance(d, dict) else {}
+            if int(d_dict.get("max_input_channels", 0)) <= 0:
+                continue
+            if needle in str(d_dict.get("name", "")).lower():
+                return i
+        logger.warning(f"[WakeWord] No input device matches {device!r} — using default")
+        return None
+
     async def listen_forever(self) -> None:
         """
         Main async entry point. Runs the blocking stream loop in a thread
@@ -149,6 +188,11 @@ class WakeWordDetector:
         sensitivity = self._cfg.get("sensitivity", 0.5)
         cooldown = self._cfg.get("cooldown_seconds", 2)
 
+        # Audio level meter — accumulate ~1s of chunks then emit averaged dBFS.
+        # 80ms per chunk × 12 = 960ms. int16 range so divide by 32768 for normalized RMS.
+        level_blocks_per_emit = 12
+        level_buffer: list[float] = []
+
         try:
             with sd.InputStream(
                 samplerate=OWW_SAMPLE_RATE,
@@ -167,6 +211,21 @@ class WakeWordDetector:
 
                     # openWakeWord expects shape (N,) int16
                     audio_chunk = block.flatten()
+
+                    # Audio level meter — track normalized RMS for dashboard
+                    chunk_norm = audio_chunk.astype(np.float32) / 32768.0
+                    level_buffer.append(float(np.sqrt(np.mean(chunk_norm ** 2))))
+                    if len(level_buffer) >= level_blocks_per_emit:
+                        avg_rms = sum(level_buffer) / len(level_buffer)
+                        level_buffer.clear()
+                        db = 20.0 * float(np.log10(avg_rms)) if avg_rms > 1e-10 else -100.0
+                        asyncio.run_coroutine_threadsafe(
+                            self._bus.publish(
+                                "audio.level",
+                                {"room": self._room, "db": db},
+                            ),
+                            loop,
+                        )
 
                     # Get prediction scores for all loaded models
                     model = self._model
@@ -220,9 +279,15 @@ class WakeWordDetector:
         logger.debug("[WakeWord] Mic suspended for recording")
 
     def wakeup(self) -> None:
-        """Re-enable microphone after recording is complete."""
+        """
+        Re-enable microphone after recording is complete.
+        Resets the cooldown timer so the freshly reopened stream cannot
+        immediately re-fire on residual chime echo or the tail of the spoken
+        request — without this, one wake utterance produces 2-3 detections.
+        """
+        self._last_detection = time.monotonic()
         self._suspended = False
-        logger.debug("[WakeWord] Mic resumed")
+        logger.debug("[WakeWord] Mic resumed (cooldown reset)")
 
     def stop(self) -> None:
         """Signal the stream loop to stop. Non-blocking."""

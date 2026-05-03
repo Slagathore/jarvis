@@ -23,7 +23,7 @@ No cloud subscriptions. No wake-word-to-server round trips. Everything runs on y
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────┐
 │                    Orchestrator                      │
 │  (core/orchestrator.py — async task coordinator)    │
@@ -140,7 +140,7 @@ Key sections:
 
 ## Project Structure
 
-```
+```text
 jarvis/
 ├── main.py                     # Entry point — boots orchestrator
 ├── config.yaml                 # Single source of truth for all config

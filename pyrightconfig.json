@@ -3,7 +3,14 @@
   "venv": ".venv",
   "pythonVersion": "3.11",
   "exclude": [
-    ".venv"
+    "**/node_modules",
+    "**/.*",
+    ".venv",
+    "**/__pycache__",
+    "**/.esphome",
+    "**/.pio",
+    "**/.pioenvs",
+    "**/.piolibdeps"
   ],
   "reportMissingModuleSource": "none"
 }

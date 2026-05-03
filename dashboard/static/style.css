@@ -455,6 +455,32 @@ main {
   border: 1px solid var(--border);
 }
 
+.room-meter {
+  position: relative;
+  height: 6px;
+  margin-top: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.room-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  background: linear-gradient(90deg, var(--green), var(--amber), var(--red));
+  transition: width 0.15s ease-out;
+}
+
+.room-meter-label {
+  position: absolute;
+  right: 4px;
+  top: -14px;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+}
+
 /* ── Last Speech Card ─────────────────────────────────────────────────────── */
 .card-speech {
   border-color: #00ff8822;

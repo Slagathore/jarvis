@@ -128,9 +128,10 @@ class WhisperSTT:
                 audio,
                 beam_size=self._cfg.get("beam_size", 1),
                 language=self._cfg.get("language") or None,
-                # Suppress hallucinations on silent audio
-                no_speech_threshold=0.6,
-                log_prob_threshold=-1.0,
+                # Suppress hallucinations on silent or marginal audio. Higher
+                # no_speech_threshold = drop more "I'm guessing" segments.
+                no_speech_threshold=float(self._cfg.get("no_speech_threshold", 0.6)),
+                log_prob_threshold=float(self._cfg.get("log_prob_threshold", -1.0)),
                 condition_on_previous_text=False,
                 vad_filter=bool(self._cfg.get("vad_filter", True)),
                 vad_parameters=self._cfg.get("vad_parameters") or None,

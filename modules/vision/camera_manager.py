@@ -39,13 +39,12 @@ from typing import Any, Optional
 import numpy as np
 from loguru import logger
 
-cv2 = None
-
 try:
     import cv2
-    _CV2_AVAILABLE = True
+    _HAS_CV2 = True
 except ImportError:
-    _CV2_AVAILABLE = False
+    cv2 = None  # type: ignore[assignment]
+    _HAS_CV2 = False
     logger.warning("[CameraManager] OpenCV not available — cameras disabled")
 
 
@@ -69,12 +68,18 @@ class CameraManager:
         self._sources: dict[str, Any] = {}
         self._fail_counts: dict[str, int] = {}
         self._reopen_threshold: int = 3
+        # Per-camera read lock — without this, the dashboard snapshot endpoint
+        # (every 2s) and the vision_loop scan (every 60s) race on cap.read(),
+        # which corrupts the MJPEG demuxer state and forces a reconnect each
+        # time the two paths overlap.
+        self._read_locks: dict[str, asyncio.Lock] = {}
 
     async def load(self) -> None:
         """Open all camera sources defined in config."""
-        if not _CV2_AVAILABLE or cv2 is None:
+        if not _HAS_CV2:
             logger.warning("[CameraManager] OpenCV not available — cameras disabled")
             return
+        assert cv2 is not None  # narrowing for pyright; guaranteed by _HAS_CV2
 
         for room_cfg in self._rooms_config:
             room_id = room_cfg.get("id", "unknown")
@@ -100,7 +105,7 @@ class CameraManager:
                 # Local cameras (int index) need more time on Windows DirectShow
                 open_timeout = 20.0 if isinstance(source, int) else 8.0
                 cap = await asyncio.wait_for(
-                    asyncio.to_thread(cv2.VideoCapture, source),
+                    asyncio.to_thread(cv2.VideoCapture, source),  # type: ignore[arg-type]
                     timeout=open_timeout,
                 )
                 if cap.isOpened():
@@ -121,6 +126,7 @@ class CameraManager:
                     self._sources[room_id] = source
                     self._fail_counts[room_id] = 0
                     self._last_frames[room_id] = frame
+                    self._read_locks[room_id] = asyncio.Lock()
                     logger.info(f"[CameraManager] Opened {label} for '{room_id}'")
                 else:
                     try:
@@ -154,10 +160,16 @@ class CameraManager:
         """
         Async frame capture. Runs the blocking cv2.read() in a thread.
         Returns numpy BGR array (H, W, 3) or None on failure.
+        Holds a per-room lock so concurrent callers (vision_loop + dashboard
+        snapshot endpoint) don't corrupt OpenCV's MJPEG demuxer state.
         """
         if room not in self._caps:
             return None
-        return await asyncio.to_thread(self._read_cap, room)
+        lock = self._read_locks.get(room)
+        if lock is None:
+            return await asyncio.to_thread(self._read_cap, room)
+        async with lock:
+            return await asyncio.to_thread(self._read_cap, room)
 
     def _read_cap(self, room: str) -> Optional[np.ndarray]:
         """Read one frame from the VideoCapture for this room."""
@@ -188,8 +200,9 @@ class CameraManager:
 
     def _reopen(self, room: str) -> None:
         """Close and reopen the VideoCapture for a room. Best-effort, may fail."""
-        if cv2 is None:
+        if not _HAS_CV2:
             return
+        assert cv2 is not None  # narrowing for pyright; guaranteed by _HAS_CV2
         source = self._sources.get(room)
         if source is None:
             return
