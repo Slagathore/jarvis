@@ -277,10 +277,68 @@ class PiperTTS:
         play_audio_array(audio, self._sample_rate)
 
     async def speak_async(self, text: str) -> None:
-        """Non-blocking wrapper for speak(). Runs in a thread pool."""
+        """
+        Non-blocking speak. Streams sentence-by-sentence: synthesizes ahead
+        while playing the previous sentence so the perceived latency for
+        multi-sentence replies is the time to synthesize ONE sentence, not all.
+        Single-sentence inputs fall through to the simple synthesize+play path.
+        """
         if not text.strip():
             return
-        await asyncio.to_thread(self.speak, text)
+        if not self.loaded or self._use_sapi:
+            await asyncio.to_thread(self.speak, text)
+            return
+
+        sentences = self._split_sentences(text)
+        if len(sentences) <= 1:
+            await asyncio.to_thread(self.speak, text)
+            return
+
+        await self._stream_sentences(sentences)
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        """
+        Naive sentence splitter — good enough for TTS. Splits on .!? followed
+        by whitespace, keeping the punctuation. Doesn't try to be smart about
+        abbreviations ("Dr. Smith" → 2 sentences) — Piper handles those mid-line
+        anyway and an extra split just produces a brief gap.
+        """
+        import re
+        parts = re.split(r"(?<=[.!?])\s+", text.strip())
+        return [p.strip() for p in parts if p.strip()]
+
+    async def _stream_sentences(self, sentences: list[str]) -> None:
+        """
+        Pipeline: producer synthesizes each sentence, consumer plays them in
+        order. Queue depth of 2 so we synthesize at most one sentence ahead
+        of playback (don't burn through the whole queue if user interrupts).
+        """
+        from modules.voice.audio_utils import play_audio_array_async
+
+        queue: asyncio.Queue = asyncio.Queue(maxsize=2)
+        sentinel = object()
+
+        async def producer() -> None:
+            try:
+                for sent in sentences:
+                    try:
+                        audio = await asyncio.to_thread(self.synthesize, sent)
+                    except TTSError as e:
+                        logger.warning(f"[TTS] Sentence synthesis failed, skipping: {e}")
+                        continue
+                    await queue.put(audio)
+            finally:
+                await queue.put(sentinel)
+
+        async def consumer() -> None:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                await play_audio_array_async(item, self._sample_rate)
+
+        await asyncio.gather(producer(), consumer())
 
     def synthesize(self, text: str) -> np.ndarray:
         """

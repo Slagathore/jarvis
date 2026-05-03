@@ -78,6 +78,9 @@ class DashboardServer:
         self._reminders_store = None  # Set by orchestrator via register_reminders_store()
         self._calendar = None         # Set by orchestrator via register_calendar()
         self._interruptibility = None # Set by orchestrator via register_interruptibility()
+        self._orchestrator = None     # Set by orchestrator via register_orchestrator()
+        self._speaker_id = None       # Set by orchestrator via register_speaker_id()
+        self._face_recognizer = None  # Set by orchestrator via register_face_recognizer()
 
         self._setup_routes()
 
@@ -141,6 +144,18 @@ class DashboardServer:
     def register_interruptibility(self, manager) -> None:
         """Wire InterruptibilityManager so /api/dnd endpoints can toggle DND."""
         self._interruptibility = manager
+
+    def register_orchestrator(self, orchestrator) -> None:
+        """Wire the orchestrator so endpoints can poke its state (enrollment flag)."""
+        self._orchestrator = orchestrator
+
+    def register_speaker_id(self, speaker_id) -> None:
+        """Wire SpeakerIdentifier so /api/speakers endpoints can list/delete enrollments."""
+        self._speaker_id = speaker_id
+
+    def register_face_recognizer(self, face_recognizer) -> None:
+        """Wire FaceRecognizer so /api/faces endpoints can list/delete enrollments."""
+        self._face_recognizer = face_recognizer
 
     def _setup_routes(self):
         app = self.app
@@ -323,6 +338,80 @@ class DashboardServer:
                 "active": mgr.is_dnd(),
                 "until":  until.isoformat() if until else None,
             })
+
+        @app.get("/api/speakers")
+        async def list_speakers():
+            sid = self._speaker_id
+            if sid is None:
+                return JSONResponse({"speakers": []})
+            return JSONResponse({"speakers": await sid.list_enrolled()})
+
+        @app.post("/api/speakers/enroll")
+        async def enroll_speaker(request: Request):
+            """
+            Arms the next wake-word capture to be enrolled as the given name.
+            User then says "Hey Jarvis" and a normal greeting; the audio gets
+            routed to enrollment instead of LLM processing.
+            """
+            orch = self._orchestrator
+            if orch is None:
+                raise HTTPException(status_code=503, detail="Orchestrator not registered")
+            body = await request.json()
+            name = str(body.get("name", "")).strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="name required")
+            orch._pending_speaker_enrollment = name
+            await self.broadcast({"type": "speaker_enrollment_armed", "name": name})
+            return JSONResponse({"armed": True, "name": name})
+
+        @app.delete("/api/speakers/{name}")
+        async def delete_speaker(name: str):
+            sid = self._speaker_id
+            if sid is None:
+                raise HTTPException(status_code=503, detail="Speaker ID not available")
+            ok = await sid.delete(name)
+            await self.broadcast({"type": "speaker_deleted", "name": name})
+            return JSONResponse({"ok": ok})
+
+        @app.get("/api/faces")
+        async def list_faces():
+            fr = self._face_recognizer
+            if fr is None:
+                return JSONResponse({"faces": []})
+            return JSONResponse({"faces": await fr.list_enrolled()})
+
+        @app.post("/api/faces/enroll")
+        async def enroll_face(request: Request):
+            """
+            Capture the current frame from the office_cam and enroll the
+            largest detected face as the given name.
+            """
+            fr = self._face_recognizer
+            cm = self._camera_manager
+            if fr is None or cm is None:
+                raise HTTPException(status_code=503, detail="Face recognition not available")
+            body = await request.json()
+            name = str(body.get("name", "")).strip()
+            room = str(body.get("room", "office_cam"))
+            if not name:
+                raise HTTPException(status_code=400, detail="name required")
+            frame = await cm.capture_frame_async(room)
+            if frame is None:
+                raise HTTPException(status_code=502, detail=f"Could not capture frame from '{room}'")
+            ok = await fr.enroll(name, frame)
+            if not ok:
+                raise HTTPException(status_code=422, detail="No face detected in frame or enrollment failed")
+            await self.broadcast({"type": "face_enrolled", "name": name})
+            return JSONResponse({"ok": True, "name": name})
+
+        @app.delete("/api/faces/{name}")
+        async def delete_face(name: str):
+            fr = self._face_recognizer
+            if fr is None:
+                raise HTTPException(status_code=503, detail="Face recognition not available")
+            ok = await fr.delete(name)
+            await self.broadcast({"type": "face_deleted", "name": name})
+            return JSONResponse({"ok": ok})
 
         @app.post("/api/dnd")
         async def dnd_set(request: Request):

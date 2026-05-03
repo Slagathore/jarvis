@@ -104,11 +104,13 @@ from modules.network.mqtt_client import MQTTClient
 from modules.network.node_manager import NodeManager
 from modules.reminders import ReminderScheduler, RemindersStore, parse_reminder
 from modules.vision.camera_manager import CameraManager
+from modules.vision.face_recognizer import FaceRecognizer
 from modules.vision.light_detector import LightDetector
 from modules.vision.object_detector import ObjectDetector
 from modules.vision.posture_analyzer import PostureAnalyzer
 from modules.vision.scene_analyzer import SceneAnalyzer
 from modules.voice.intents import parse_dnd
+from modules.voice.speaker_id import SpeakerIdentifier
 from modules.voice.stt import WhisperSTT
 from modules.voice.tts import PiperTTS
 from modules.voice.wake_word import WakeWordDetector
@@ -127,6 +129,10 @@ class Orchestrator:
         self.wake: Optional[WakeWordDetector] = None
         self.stt: Optional[WhisperSTT] = None
         self.tts: Optional[PiperTTS] = None
+        self.speaker_id: Optional[SpeakerIdentifier] = None
+        # When set, the next wake-recording captured audio is enrolled as this
+        # name instead of being run through STT/LLM. Cleared after enrollment.
+        self._pending_speaker_enrollment: Optional[str] = None
 
         self.llm: Optional[OllamaLLM] = None
         self.sessions: Optional[SessionManager] = None
@@ -146,6 +152,7 @@ class Orchestrator:
         self.posture: Optional[PostureAnalyzer] = None
         self.object_detector: Optional[ObjectDetector] = None
         self.scene_analyzer: Optional[SceneAnalyzer] = None
+        self.face_recognizer: Optional[FaceRecognizer] = None
 
         self.mqtt: Optional[MQTTClient] = None
         self.nodes: Optional[NodeManager] = None
@@ -214,6 +221,14 @@ class Orchestrator:
         await asyncio.to_thread(self.wake.load)
         logger.info("[Init] Wake word detector ready")
 
+        # Speaker identification — best-effort, fine if it fails to load
+        if self.db is not None:
+            self.speaker_id = SpeakerIdentifier(self.db)
+            try:
+                await self.speaker_id.load()
+            except Exception as e:
+                logger.warning(f"[Init] Speaker ID failed to load: {e}")
+
     async def _init_brain(self) -> None:
         """Initialize LLM, session manager, and prompt builder."""
         # BUG FIX: OllamaLLM and SessionManager both take config: dict.
@@ -258,6 +273,15 @@ class Orchestrator:
         self.object_detector = ObjectDetector(self.config)
         await self.object_detector.load_async()
         self.scene_analyzer = SceneAnalyzer(config=self.config, llm=self.llm)
+
+        # Face recognition — best-effort, fine if it can't load
+        if self.db is not None:
+            self.face_recognizer = FaceRecognizer(self.db)
+            try:
+                await self.face_recognizer.load()
+            except Exception as e:
+                logger.warning(f"[Init] Face recognizer failed to load: {e}")
+
         logger.info("[Init] Vision pipeline ready")
 
     async def _init_calendar(self) -> None:
@@ -436,6 +460,39 @@ class Orchestrator:
                     f"(rms={db_from_rms(rms):.1f} dBFS)"
                 )
 
+                # Speaker enrollment fast-path: if dashboard set a pending name,
+                # route this capture to enroll instead of transcribe+LLM. The
+                # 5+s of audio captured by wake_word's silence detector is
+                # plenty for resemblyzer's encoder.
+                if (
+                    self._pending_speaker_enrollment is not None
+                    and self.speaker_id is not None
+                ):
+                    name = self._pending_speaker_enrollment
+                    self._pending_speaker_enrollment = None
+                    ok = await self.speaker_id.enroll(name, audio_data)
+                    await self._broadcast({
+                        "type":          "speaker_enrolled",
+                        "name":          name,
+                        "ok":            ok,
+                        "sample_count":  await self.speaker_id._get_sample_count(name) if ok else 0,
+                    })
+                    confirmation = await self._compose_in_character(
+                        prompt=(
+                            f"You just successfully recorded a voice sample for '{name}'. "
+                            f"Speak a single short in-character acknowledgement that "
+                            f"you'll recognize them now. No preamble, no quotes."
+                        ) if ok else (
+                            f"You tried to enroll a voice sample for '{name}' but it "
+                            f"failed. Apologize briefly in your usual voice. No "
+                            f"preamble, no quotes."
+                        ),
+                        fallback=(f"Got it, I'll remember your voice as {name}." if ok
+                                  else f"Sorry, I couldn't save your voice sample."),
+                    )
+                    await self._speak(confirmation, room=room, priority="conversation")
+                    return
+
                 stt = self.stt
                 if stt is None:
                     logger.warning("[Wake] STT module not initialized — skipping transcript")
@@ -462,14 +519,34 @@ class Orchestrator:
                     return
 
                 logger.info(f"[STT] Transcript: {transcript!r}")
-                await self._process_user_text(transcript, room)
+
+                # Identify the speaker from the same audio buffer. Best-effort;
+                # if identification fails or no speaker is enrolled yet, just
+                # process the text without a speaker label.
+                speaker_name: Optional[str] = None
+                speaker_sim: float = 0.0
+                if self.speaker_id is not None and self.speaker_id.is_loaded:
+                    try:
+                        speaker_name, speaker_sim = await self.speaker_id.identify(audio_data)
+                        if speaker_name is not None:
+                            logger.info(
+                                f"[SpeakerID] Identified as '{speaker_name}' (sim={speaker_sim:.2f})"
+                            )
+                        else:
+                            logger.debug(
+                                f"[SpeakerID] No match (best similarity={speaker_sim:.2f})"
+                            )
+                    except Exception as e:
+                        logger.debug(f"[SpeakerID] identify failed: {e}")
+
+                await self._process_user_text(transcript, room, speaker=speaker_name)
 
             except Exception as e:
                 logger.error(f"[Wake] Pipeline error: {e}")
             finally:
                 self._audio_io_active = False
 
-    async def _process_user_text(self, text: str, room: str) -> None:
+    async def _process_user_text(self, text: str, room: str, speaker: Optional[str] = None) -> None:
         """
         Core LLM pipeline shared by voice (wake word) and text chat.
         Broadcasts user speech, calls LLM, speaks the response.
@@ -477,9 +554,15 @@ class Orchestrator:
         First tries to parse the text as a reminder intent — if it matches,
         creates the reminder and short-circuits the LLM call.
         """
-        await self._broadcast({"type": "user_speech", "text": text, "room": room})
+        await self._broadcast({
+            "type":    "user_speech",
+            "text":    text,
+            "room":    room,
+            "speaker": speaker,
+        })
         if self.event_log:
-            await self.event_log.log_event(room=room, event_type="user_speech", content=text)
+            log_content = f"[{speaker}] {text}" if speaker else text
+            await self.event_log.log_event(room=room, event_type="user_speech", content=log_content)
 
         # DND intent fast path: "shut up for 30 minutes" / "you can talk again"
         if await self._try_dnd(text, room):
@@ -1028,6 +1111,30 @@ class Orchestrator:
                         if self.posture:
                             posture_result = await self.posture.analyze_async(frame)
 
+                        # Face recognition — only bother if YOLO actually saw a person
+                        recognized_name: Optional[str] = None
+                        if (
+                            person_present
+                            and self.face_recognizer is not None
+                            and self.face_recognizer.is_loaded
+                            and self.face_recognizer.enrolled_count > 0
+                        ):
+                            try:
+                                name, sim = await self.face_recognizer.identify(frame)
+                                if name is not None:
+                                    recognized_name = name
+                                    logger.info(
+                                        f"[FaceRec] '{room_id}' → {name} (sim={sim:.2f})"
+                                    )
+                                    await self._broadcast({
+                                        "type":       "person_recognized",
+                                        "room":       room_id,
+                                        "name":       name,
+                                        "similarity": sim,
+                                    })
+                            except Exception as e:
+                                logger.debug(f"[FaceRec] identify failed: {e}")
+
                         # Scene description — SceneAnalyzer self-gates on local
                         # frame-change detection, so we always call it and let
                         # it decide whether to invoke the vision LLM.
@@ -1049,6 +1156,7 @@ class Orchestrator:
                             "room": room_id,
                             "lights_on": lights_on,
                             "person_present": person_present,
+                            "person_name":    recognized_name,
                             "objects": object_summary,
                             "description": last_desc,
                         })
@@ -1369,28 +1477,83 @@ class Orchestrator:
             "ip": ip,
         })
 
+    async def _speak_via_node(self, text: str, room: str) -> bool:
+        """
+        Synthesize text and send the audio bytes to the room's ESP32 node over
+        MQTT for playback on the node's speaker. Returns True if the audio was
+        published (the node is responsible for playing it). Returns False on
+        any failure so the caller falls back to local playback.
+
+        Note: the firmware-side handling of the audio_out topic is still pending
+        as of 2026-05-03 — the office node speaker has hardware static issues
+        being tracked separately. When it's ready, no Python-side change will
+        be needed; the node will just start producing sound.
+        """
+        if self.tts is None or self.nodes is None:
+            return False
+        try:
+            # Synthesize as float32, convert to 16-bit LE PCM bytes that the
+            # ESP I2S speaker can stream. Sentence-level streaming doesn't
+            # apply over MQTT (one publish per sentence would be inefficient);
+            # we send the whole utterance.
+            audio = await self.tts.synthesize_async(text)
+        except Exception as e:
+            logger.warning(f"[TTS] Node-route synthesis failed: {e}")
+            return False
+        try:
+            import numpy as _np
+            pcm_int16 = (_np.clip(audio, -1.0, 1.0) * 32767.0).astype(_np.int16)
+            payload = pcm_int16.tobytes()
+        except Exception as e:
+            logger.warning(f"[TTS] PCM conversion failed: {e}")
+            return False
+        try:
+            sent = await self.nodes.send_audio(room, payload)
+        except Exception as e:
+            logger.warning(f"[TTS] send_audio('{room}') failed: {e}")
+            return False
+        if sent:
+            logger.info(
+                f"[TTS] Routed {len(payload)} bytes to '{room}' node speaker"
+            )
+        return sent
+
     # ── TTS Helper ─────────────────────────────────────────────────────────
 
     async def _speak(self, text: str, room: str = "office", priority: str = "ambient") -> None:
         """
         Full speak pipeline: TTS → audio playback → log → broadcast.
-        Routes audio to appropriate room node if available, otherwise local playback.
+
+        Routes audio to the room's ESP node speaker via MQTT when:
+          - room has has_node=true in config
+          - that node is currently online
+          - the node has reported has_microphone (we use this as a proxy for
+            "audio path configured" since speakers ride the same I2S bus)
+
+        Otherwise falls back to local PC playback. Streaming sentence-level
+        synthesis is used either way so multi-sentence replies don't pause.
         """
         try:
             logger.info(f"[TTS] [{priority}] {text!r}")
 
-            # Guard: tts is Optional — initialized in _init_voice()
             if not self.tts:
                 logger.warning("[TTS] TTS module not initialized — skipping playback")
                 return
 
-            # Local playback (always available)
-            was_audio_io_active = self._audio_io_active
-            self._audio_io_active = True
-            try:
-                await asyncio.to_thread(self.tts.speak, text)
-            finally:
-                self._audio_io_active = was_audio_io_active
+            routed_to_node = False
+            if self.nodes is not None and self.nodes.is_online(room):
+                routed_to_node = await self._speak_via_node(text, room)
+
+            if not routed_to_node:
+                # Local playback. Streaming for multi-sentence; quick path for
+                # one-liners. _audio_io_active blocks the audio classifier from
+                # reading wake_word's buffer during our own playback.
+                was_audio_io_active = self._audio_io_active
+                self._audio_io_active = True
+                try:
+                    await self.tts.speak_async(text)
+                finally:
+                    self._audio_io_active = was_audio_io_active
 
             # Log to DB
             if self.event_log:
@@ -1505,6 +1668,11 @@ class Orchestrator:
                 self.dashboard.register_calendar(self.calendar)
             if self.interruptibility:
                 self.dashboard.register_interruptibility(self.interruptibility)
+            self.dashboard.register_orchestrator(self)
+            if self.speaker_id:
+                self.dashboard.register_speaker_id(self.speaker_id)
+            if self.face_recognizer:
+                self.dashboard.register_face_recognizer(self.face_recognizer)
 
         # Register event handlers
         self._register_event_handlers()

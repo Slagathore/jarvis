@@ -85,6 +85,18 @@ CREATE TABLE IF NOT EXISTS reminders (
     last_triggered     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS speakers (
+    name           TEXT PRIMARY KEY,
+    embedding      BLOB NOT NULL,    -- 256-dim float32 centroid from resemblyzer
+    sample_count   INTEGER DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS faces (
+    name           TEXT PRIMARY KEY,
+    embedding      BLOB NOT NULL,    -- 512-dim float32 centroid from insightface
+    sample_count   INTEGER DEFAULT 1
+);
+
 -- Indexes for common query patterns
 CREATE INDEX IF NOT EXISTS idx_events_room_ts ON events (room, timestamp);
 CREATE INDEX IF NOT EXISTS idx_conv_room_ts   ON conversation_log (room, timestamp);
