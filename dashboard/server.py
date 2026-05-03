@@ -77,6 +77,7 @@ class DashboardServer:
         self._camera_jpeg_quality = 70
         self._reminders_store = None  # Set by orchestrator via register_reminders_store()
         self._calendar = None         # Set by orchestrator via register_calendar()
+        self._interruptibility = None # Set by orchestrator via register_interruptibility()
 
         self._setup_routes()
 
@@ -136,6 +137,10 @@ class DashboardServer:
     def register_calendar(self, calendar) -> None:
         """Wire the orchestrator's GoogleCalendar so /api/calendar endpoints work."""
         self._calendar = calendar
+
+    def register_interruptibility(self, manager) -> None:
+        """Wire InterruptibilityManager so /api/dnd endpoints can toggle DND."""
+        self._interruptibility = manager
 
     def _setup_routes(self):
         app = self.app
@@ -307,6 +312,41 @@ class DashboardServer:
             if ok:
                 await self.broadcast({"type": "calendar_deleted", "id": event_id})
             return JSONResponse({"ok": ok})
+
+        @app.get("/api/dnd")
+        async def dnd_status():
+            mgr = self._interruptibility
+            if mgr is None:
+                return JSONResponse({"active": False, "until": None})
+            until = mgr.dnd_until() if mgr.is_dnd() else None
+            return JSONResponse({
+                "active": mgr.is_dnd(),
+                "until":  until.isoformat() if until else None,
+            })
+
+        @app.post("/api/dnd")
+        async def dnd_set(request: Request):
+            mgr = self._interruptibility
+            if mgr is None:
+                raise HTTPException(status_code=503, detail="Interruptibility not available")
+            body = await request.json()
+            minutes = body.get("minutes")
+            try:
+                minutes_f = float(minutes) if minutes is not None else 0.0
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="minutes must be a number")
+            if minutes_f <= 0:
+                mgr.clear_dnd()
+                await self.broadcast({"type": "dnd", "active": False, "until": None})
+                return JSONResponse({"active": False, "until": None})
+            until = mgr.set_dnd(minutes_f)
+            await self.broadcast({
+                "type":   "dnd",
+                "active": True,
+                "until":  until.isoformat(),
+                "minutes": minutes_f,
+            })
+            return JSONResponse({"active": True, "until": until.isoformat()})
 
         @app.get("/api/camera/{room}/snapshot.jpg")
         async def camera_snapshot(room: str):

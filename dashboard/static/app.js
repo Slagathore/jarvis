@@ -147,7 +147,11 @@ function applyEvent(event) {
       break;
     case "calendar_added":
     case "calendar_deleted":
+    case "calendar_updated":
       loadCalendar();
+      break;
+    case "dnd":
+      updateDndStatus(event.active, event.until);
       break;
   }
 }
@@ -717,6 +721,48 @@ function formatCalendarWhen(when, now) {
 
 setInterval(loadCalendar, 5 * 60 * 1000);  // refresh every 5 min
 loadCalendar();
+
+// ── DND ───────────────────────────────────────────────────────────────────
+
+function updateDndStatus(active, until) {
+  const el = document.getElementById("dnd-status");
+  if (!el) return;
+  if (active && until) {
+    const dt = new Date(until);
+    el.textContent = `until ${dt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false })}`;
+    el.classList.add("active");
+  } else {
+    el.textContent = "off";
+    el.classList.remove("active");
+  }
+}
+
+function loadDndStatus() {
+  fetch("/api/dnd")
+    .then((r) => r.json())
+    .then(({ active, until }) => updateDndStatus(active, until))
+    .catch(() => {});
+}
+
+function setDnd(minutes) {
+  fetch("/api/dnd", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ minutes }),
+  }).catch((e) => console.warn("[JARVIS] DND set failed:", e));
+}
+
+const dndOnBtn = document.getElementById("dnd-on");
+const dndOffBtn = document.getElementById("dnd-off");
+if (dndOnBtn) {
+  dndOnBtn.addEventListener("click", () => {
+    const sel = document.getElementById("dnd-duration");
+    const mins = sel ? parseInt(sel.value, 10) : 30;
+    setDnd(mins);
+  });
+}
+if (dndOffBtn) dndOffBtn.addEventListener("click", () => setDnd(0));
+loadDndStatus();
 
 // ── Init ──────────────────────────────────────────────────────────────────
 

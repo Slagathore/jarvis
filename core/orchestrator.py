@@ -108,6 +108,7 @@ from modules.vision.light_detector import LightDetector
 from modules.vision.object_detector import ObjectDetector
 from modules.vision.posture_analyzer import PostureAnalyzer
 from modules.vision.scene_analyzer import SceneAnalyzer
+from modules.voice.intents import parse_dnd
 from modules.voice.stt import WhisperSTT
 from modules.voice.tts import PiperTTS
 from modules.voice.wake_word import WakeWordDetector
@@ -480,6 +481,10 @@ class Orchestrator:
         if self.event_log:
             await self.event_log.log_event(room=room, event_type="user_speech", content=text)
 
+        # DND intent fast path: "shut up for 30 minutes" / "you can talk again"
+        if await self._try_dnd(text, room):
+            return
+
         # Reminder intent fast path: "remind me to X in N minutes" / "at HH:MM"
         if await self._try_create_reminder(text, room):
             return
@@ -762,6 +767,51 @@ class Orchestrator:
             "calendar_delete_event":  self._tool_calendar_delete_event,
             "calendar_update_event":  self._tool_calendar_update_event,
         }
+
+    async def _try_dnd(self, text: str, room: str) -> bool:
+        """
+        Handle "do not disturb" / "shut up for X" / "you can talk again" voice
+        commands. Returns True if handled. Uses the InterruptibilityManager's
+        DND state which gates all proactive speech.
+        """
+        minutes = parse_dnd(text)
+        if minutes is None or self.interruptibility is None:
+            return False
+        if minutes == 0.0:
+            self.interruptibility.clear_dnd()
+            await self._broadcast({"type": "dnd", "active": False, "until": None})
+            ack = await self._compose_in_character(
+                prompt=(
+                    "Cole just told you that you can talk again — DND is off. "
+                    "Speak a single short in-character acknowledgement. "
+                    "No preamble, no quotes."
+                ),
+                fallback="Back online.",
+            )
+            await self._speak(ack, room=room, priority="conversation")
+            return True
+        until = self.interruptibility.set_dnd(minutes)
+        await self._broadcast({
+            "type":   "dnd",
+            "active": True,
+            "until":  until.isoformat(),
+            "minutes": minutes,
+        })
+        # Pretty-print duration for the LLM prompt
+        if minutes >= 60:
+            dur_str = f"{minutes / 60:.1f} hours"
+        else:
+            dur_str = f"{int(minutes)} minutes"
+        ack = await self._compose_in_character(
+            prompt=(
+                f"Cole just put you in Do Not Disturb mode for {dur_str}. "
+                f"Acknowledge in a single short in-character line — you'll "
+                f"stay quiet until told otherwise. No preamble, no quotes."
+            ),
+            fallback=f"Going quiet for {dur_str}.",
+        )
+        await self._speak(ack, room=room, priority="conversation")
+        return True
 
     async def _try_create_reminder(self, text: str, room: str) -> bool:
         """
@@ -1453,6 +1503,8 @@ class Orchestrator:
                 self.dashboard.register_reminders_store(self.reminders_store)
             if self.calendar:
                 self.dashboard.register_calendar(self.calendar)
+            if self.interruptibility:
+                self.dashboard.register_interruptibility(self.interruptibility)
 
         # Register event handlers
         self._register_event_handlers()

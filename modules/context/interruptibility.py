@@ -39,7 +39,7 @@ Priority levels (higher = can override stricter gates):
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from datetime import time as dtime
 from typing import Optional
 
@@ -81,6 +81,10 @@ class InterruptibilityManager:
         self._quiet_end = self._parse_time(quiet_end_str)
 
         self._last_interrupt: Optional[float] = None  # monotonic timestamp
+        # Manual Do Not Disturb override. When set and in the future, blocks
+        # all priorities except "conversation" (direct user query). Cleared
+        # automatically when the time passes.
+        self._dnd_until: Optional[datetime] = None
 
     def can_interrupt(
         self,
@@ -100,6 +104,12 @@ class InterruptibilityManager:
         # Conversation priority is never blocked — user already spoke first
         if priority == "conversation":
             return True
+
+        # DND mode blocks all proactive speech (curiosity, alerts, summaries,
+        # appliance announcements). Conversation already short-circuited above.
+        if self.is_dnd():
+            logger.debug(f"[Interrupt] Blocked (DND active) — priority={priority}")
+            return False
 
         current_score = self._get_current_score(state)
 
@@ -157,6 +167,37 @@ class InterruptibilityManager:
         else:
             # Overnight range: e.g., 22:00 to 08:00
             return now >= self._quiet_start or now < self._quiet_end
+
+    def is_dnd(self) -> bool:
+        """True if a manual DND window is active right now."""
+        if self._dnd_until is None:
+            return False
+        if datetime.now() >= self._dnd_until:
+            # Auto-expire stale DND
+            self._dnd_until = None
+            return False
+        return True
+
+    def dnd_until(self) -> Optional[datetime]:
+        """Return when the active DND window ends, or None if not in DND."""
+        return self._dnd_until if self.is_dnd() else None
+
+    def set_dnd(self, duration_minutes: float) -> datetime:
+        """Activate DND for the given duration. Returns the expiry time."""
+        if duration_minutes <= 0:
+            self.clear_dnd()
+            return datetime.now()
+        self._dnd_until = datetime.now() + timedelta(minutes=duration_minutes)
+        logger.info(
+            f"[Interrupt] DND activated until {self._dnd_until.isoformat()}"
+        )
+        return self._dnd_until
+
+    def clear_dnd(self) -> None:
+        """Cancel any active DND window."""
+        if self._dnd_until is not None:
+            logger.info("[Interrupt] DND cleared")
+        self._dnd_until = None
 
     def time_since_last(self) -> Optional[float]:
         """

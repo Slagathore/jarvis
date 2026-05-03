@@ -117,6 +117,19 @@
             </select>
             <button class="dev-btn" id="voice-apply">SET</button>
           </div>
+          <div class="dev-row">
+            <span class="dev-label">DND</span>
+            <select class="dev-select" id="dnd-duration">
+              <option value="15">15 min</option>
+              <option value="30" selected>30 min</option>
+              <option value="60">1 hr</option>
+              <option value="120">2 hr</option>
+              <option value="480">8 hr</option>
+            </select>
+            <button class="dev-btn" id="dnd-on">ON</button>
+            <button class="dev-btn" id="dnd-off">OFF</button>
+            <span class="dnd-status" id="dnd-status"></span>
+          </div>
         </div>
       </div>
 
@@ -204,6 +217,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=9"></script>
+    <script src="/static/app.js?v=10"></script>
   </body>
 </html>

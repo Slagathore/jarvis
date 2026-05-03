@@ -576,6 +576,22 @@ main {
   text-align: center;
 }
 
+.reminder-recur {
+  width: 80px;
+}
+
+.dnd-status {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-left: auto;
+}
+
+.dnd-status.active {
+  color: var(--amber);
+  font-weight: bold;
+}
+
 /* ── Calendar ─────────────────────────────────────────────────────────────── */
 .calendar-list {
   display: flex;
