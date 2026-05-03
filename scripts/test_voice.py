@@ -129,15 +129,23 @@ def test_tts() -> bool:
 
         with open("config.yaml", "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
-        vcfg = config["voice"]["tts"]
 
-        # BUG FIX: PiperTTS takes config: dict — reads its own settings internally
         tts = PiperTTS(config)
+        # BUG FIX: previously skipped tts.load() so speak() silently no-op'd
+        # and the test reported a false PASS. Load the binary + voice and
+        # actually verify synthesis works.
+        tts.load()
+        if not tts.loaded:
+            fail("TTS failed to load (Piper binary or voice model missing)")
+            return False
 
         t0 = time.time()
-        tts.speak("Jarvis online. Voice pipeline operational.")
+        audio = tts.synthesize("Jarvis online. Voice pipeline operational.")
         elapsed = time.time() - t0
-        ok(f"TTS synthesis + playback completed in {elapsed:.1f}s")
+        if audio is None or len(audio) == 0:
+            fail("TTS synthesize returned no audio")
+            return False
+        ok(f"TTS synthesized {len(audio) / 22050:.2f}s of audio in {elapsed:.2f}s")
         return True
 
     except Exception as e:

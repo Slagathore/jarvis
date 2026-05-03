@@ -139,9 +139,13 @@ esp32_camera:
   pixel_clock_pin: GPIO22
   power_down_pin: GPIO32
   resolution: 640x480
-  jpeg_quality: 15           # Lower = smaller JPEG = faster WiFi transfer
-  # Only capture on-demand to save bandwidth
-  idle_framerate: 1fps        # One frame every 10 seconds when idle
+  # JPEG quality 25 (was 15) — ESPHome inverted scale: higher number = lower
+  # quality = smaller files = less WiFi pressure. Helps reduce the periodic
+  # MJPEG stream drops we see on the office node every ~minute.
+  jpeg_quality: 25
+  # idle_framerate is capped at 1fps by ESPHome. Active streaming (client
+  # connected) defaults to 10fps which is plenty for our dashboard poll.
+  idle_framerate: 1fps
 
 # Expose MJPEG stream on port 8080 — Python CameraManager connects here
 esp32_camera_web_server:

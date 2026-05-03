@@ -101,6 +101,14 @@ class StateFusion:
             if not signal:
                 continue
 
+            # Always merge context, even from signals that don't vote on
+            # activity. Posture, vision-presence, etc. carry context (sitting/
+            # lying, person count) that the LLM and dashboard want even when
+            # the signal isn't strong enough to drive activity classification.
+            context = signal.get("context")
+            if isinstance(context, Mapping):
+                merged_context.update(context)
+
             activity = signal.get("activity")
             if not activity or activity == "unknown":
                 continue
@@ -111,11 +119,6 @@ class StateFusion:
 
             vote_scores[activity] = vote_scores.get(activity, 0.0) + vote_score
             contributing_signals.append(f"{source}:{activity}")
-
-            # Merge context — higher-weight sources override lower-weight ones
-            context = signal.get("context")
-            if isinstance(context, Mapping):
-                merged_context.update(context)
 
         if not vote_scores:
             return ActivityState(

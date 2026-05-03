@@ -99,7 +99,7 @@ from modules.context.state_fusion import StateFusion
 from modules.memory.database import DatabaseManager
 from modules.memory.event_log import EventLogger
 from modules.memory.room_baselines import RoomBaselines
-from modules.agenda import GoogleCalendar, parse_calendar_add, parse_calendar_query
+from modules.agenda import GoogleCalendar
 from modules.network.mqtt_client import MQTTClient
 from modules.network.node_manager import NodeManager
 from modules.reminders import ReminderScheduler, RemindersStore, parse_reminder
@@ -293,7 +293,16 @@ class Orchestrator:
         message = (event.get("message") or "").strip()
         if not message:
             return
-        text = await self._compose_reminder_line(message)
+        text = await self._compose_in_character(
+            prompt=(
+                f"You set a reminder for Cole earlier and the time has now arrived. "
+                f"The thing he wanted to remember is: \"{message}\". "
+                f"Speak the reminder out loud in a single sentence — your usual "
+                f"voice, dry and a little witty, referencing the specific task. "
+                f"No preamble, no quotation marks, just the spoken line."
+            ),
+            fallback=f"Heads up — {message}.",
+        )
         await self._speak(text, room="office", priority="notification")
         await self._broadcast({
             "type": "reminder_fired",
@@ -301,22 +310,19 @@ class Orchestrator:
             "message": message,
         })
 
-    async def _compose_reminder_line(self, task: str) -> str:
+    async def _compose_in_character(self, prompt: str, fallback: str) -> str:
         """
-        Ask the LLM to write a single in-character reminder line for `task`.
-        Uses the configured Jarvis system prompt so phrasings stay in voice.
-        Falls back to a plain string only if the LLM call fails.
+        Ask the LLM to write a single in-character line using the configured
+        system prompt. Returns the LLM line on success; falls back only if the
+        LLM is unavailable or the call fails.
+
+        Use this for any user-facing Jarvis speech (announcements, confirmations,
+        proactive observations) so phrasings stay in-character instead of
+        robotic templates. See feedback memory: no hardcoded user-facing strings.
         """
         if self.llm is None:
-            return f"Heads up — {task}."
+            return fallback
         system = self.config["ollama"].get("system_prompt", "You are Jarvis.")
-        prompt = (
-            f"You set a reminder for Cole earlier and the time has now arrived. "
-            f"The thing he wanted to remember is: \"{task}\". "
-            f"Speak the reminder out loud to him in a single sentence — your "
-            f"usual voice, dry and a little witty, referencing the specific "
-            f"task. No preamble, no quotation marks, just the spoken line."
-        )
         try:
             response = await self.llm.chat([
                 {"role": "system", "content": system},
@@ -326,8 +332,8 @@ class Orchestrator:
             if line:
                 return line
         except Exception as e:
-            logger.warning(f"[Reminders] LLM phrasing failed, using fallback: {e}")
-        return f"Heads up — {task}."
+            logger.warning(f"[LLM] In-character phrasing failed, using fallback: {e}")
+        return fallback
 
     async def _on_audio_level(self, event: dict) -> None:
         """
@@ -475,11 +481,9 @@ class Orchestrator:
         if await self._try_create_reminder(text, room):
             return
 
-        # Calendar intents — query first (read-only), then add (write).
-        if await self._try_calendar_query(text, room):
-            return
-        if await self._try_calendar_add(text, room):
-            return
+        # Calendar intents are handled by the LLM via tool calling below —
+        # no regex shortcut needed since the model can call calendar_list_events
+        # / create_event / delete_event for any phrasing or date range.
 
         if not self.sessions or not self.prompts or not self.llm:
             logger.warning("[LLM] Brain modules not ready — skipping")
@@ -698,148 +702,6 @@ class Orchestrator:
             "calendar_delete_event":  self._tool_calendar_delete_event,
         }
 
-    async def _try_calendar_query(self, text: str, room: str) -> bool:
-        """
-        If `text` looks like a calendar question ("what's on today?"), fetch the
-        relevant events and have the LLM phrase a response in character.
-        Returns True if handled, False to fall through.
-        """
-        when = parse_calendar_query(text)
-        if not when or self.calendar is None or not self.calendar.is_authenticated:
-            return False
-
-        # Window depends on intent. "today" = until midnight; "tomorrow" =
-        # tomorrow 00:00 to 23:59; "upcoming" = next 24h.
-        from datetime import datetime as _dt, timedelta as _td
-        now = _dt.now()
-        if when == "today":
-            end = now.replace(hour=23, minute=59, second=59, microsecond=0)
-            hours = max(0.5, (end - now).total_seconds() / 3600)
-        elif when == "tomorrow":
-            tomorrow_end = (now + _td(days=1)).replace(hour=23, minute=59, second=59)
-            hours = max(0.5, (tomorrow_end - now).total_seconds() / 3600)
-        else:
-            hours = 24.0
-
-        events = await self.calendar.upcoming_events(hours=hours)
-        if when == "tomorrow":
-            tomorrow_start = (now + _td(days=1)).replace(hour=0, minute=0, second=0)
-            events = [e for e in events if e.get("start", "") >= tomorrow_start.isoformat()]
-
-        response = await self._compose_calendar_response(text, when, events)
-        await self._speak(response, room=room, priority="conversation")
-        return True
-
-    async def _try_calendar_add(self, text: str, room: str) -> bool:
-        """
-        If `text` looks like "schedule X today/tomorrow at HH", create the
-        event and have the LLM speak a confirmation in character.
-        """
-        parsed = parse_calendar_add(text)
-        if not parsed or self.calendar is None or not self.calendar.is_authenticated:
-            return False
-        title, start, end = parsed
-        event = await self.calendar.add_event(title=title, start=start, end=end)
-        if event is None:
-            await self._speak(
-                "I tried to add that to your calendar but the request failed.",
-                room=room, priority="conversation",
-            )
-            return True
-        await self._broadcast({
-            "type":  "calendar_added",
-            "event": event,
-        })
-        confirmation = await self._compose_calendar_add_confirmation(event)
-        await self._speak(confirmation, room=room, priority="conversation")
-        return True
-
-    async def _compose_calendar_response(
-        self, user_question: str, when: str, events: list[dict]
-    ) -> str:
-        """LLM-generated response to a calendar query in Jarvis's voice."""
-        if self.llm is None:
-            return self._calendar_response_fallback(when, events)
-        base_system = self.config["ollama"].get("system_prompt", "You are Jarvis.")
-        # Anti-hallucination guardrail: the model is told it can ONLY reference
-        # what's in the events list. Without this, the persona's tendency to
-        # be witty leads it to invent meetings that don't exist.
-        system = (
-            base_system
-            + "\n\nWhen reporting calendar information: ONLY mention events "
-            "that appear in the list provided. If the list is empty, say "
-            "there's nothing scheduled. NEVER invent, embellish, or guess at "
-            "events. Time and titles must match the list exactly."
-        )
-        if not events:
-            event_summary = "EVENT LIST: (empty — no events scheduled in this window)"
-        else:
-            lines = []
-            for e in events[:10]:
-                start = e.get("start") or ""
-                title = e.get("title") or "(untitled)"
-                location = e.get("location")
-                line = f"- {start}  {title}"
-                if location:
-                    line += f"  @ {location}"
-                lines.append(line)
-            event_summary = "EVENT LIST:\n" + "\n".join(lines)
-        prompt = (
-            f"Cole asked: \"{user_question}\"\n"
-            f"Calendar window: {when}.\n\n"
-            f"{event_summary}\n\n"
-            f"Reply in one or two sentences in your usual voice. "
-            f"If the list is empty, just say there's nothing on the calendar — "
-            f"don't make anything up. No preamble, no quotes, just the spoken "
-            f"response."
-        )
-        try:
-            line = await self.llm.chat([
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ])
-            line = line.strip().strip('"').strip("'").strip()
-            if line:
-                return line
-        except Exception as e:
-            logger.warning(f"[Calendar] LLM phrasing failed: {e}")
-        return self._calendar_response_fallback(when, events)
-
-    @staticmethod
-    def _calendar_response_fallback(when: str, events: list[dict]) -> str:
-        if not events:
-            return f"Nothing on your calendar for {when}."
-        first = events[0]
-        title = first.get("title") or "an event"
-        start = first.get("start") or ""
-        more = f" Plus {len(events) - 1} more." if len(events) > 1 else ""
-        return f"Next up: {title} at {start}.{more}"
-
-    async def _compose_calendar_add_confirmation(self, event: dict) -> str:
-        """LLM-generated confirmation for a newly-added calendar event."""
-        if self.llm is None:
-            return f"Added {event.get('title')} to your calendar."
-        system = self.config["ollama"].get("system_prompt", "You are Jarvis.")
-        prompt = (
-            f"You just added an event to Cole's Google Calendar:\n"
-            f"  Title: {event.get('title')}\n"
-            f"  Start: {event.get('start')}\n"
-            f"  End:   {event.get('end')}\n\n"
-            f"Speak a single short in-character confirmation. No preamble, "
-            f"no quotes."
-        )
-        try:
-            line = await self.llm.chat([
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ])
-            line = line.strip().strip('"').strip("'").strip()
-            if line:
-                return line
-        except Exception as e:
-            logger.warning(f"[Calendar] LLM phrasing failed: {e}")
-        return f"Added {event.get('title')} to your calendar."
-
     async def _try_create_reminder(self, text: str, room: str) -> bool:
         """
         Returns True (and sends confirmation TTS) if `text` parsed as a reminder.
@@ -860,30 +722,18 @@ class Orchestrator:
             "message":      task,
             "trigger_time": due.isoformat(),
         })
-        confirmation = self._format_reminder_confirmation(task, due)
+        confirmation = await self._compose_in_character(
+            prompt=(
+                f"Cole just asked you to remind him to '{task}'. The reminder "
+                f"will fire at {due.strftime('%A %B %d at %I:%M %p').replace(' 0', ' ')} "
+                f"({due.isoformat()}). Speak a single short in-character "
+                f"confirmation acknowledging that you've set the reminder. "
+                f"No preamble, no quotes."
+            ),
+            fallback=f"Got it — I'll remind you to {task}.",
+        )
         await self._speak(confirmation, room=room, priority="conversation")
         return True
-
-    @staticmethod
-    def _format_reminder_confirmation(task: str, due: datetime) -> str:
-        """Friendly natural-language confirmation for a newly-added reminder."""
-        delta = due - datetime.now()
-        secs = max(0, int(delta.total_seconds()))
-        if secs < 90:
-            when = f"in {secs} seconds"
-        elif secs < 3600:
-            when = f"in {secs // 60} minutes"
-        elif secs < 86400:
-            hours = secs // 3600
-            mins = (secs % 3600) // 60
-            when = f"in {hours}h {mins}m" if mins else f"in {hours} hours"
-        else:
-            # %#I (Windows) / %-I (POSIX) for no leading zero on hour are both
-            # platform-specific. Stick with %I and strip the leading zero
-            # manually so this works cross-platform.
-            hour_str = due.strftime("%I").lstrip("0") or "12"
-            when = f"on {due.strftime('%A')} at {hour_str}:{due.strftime('%M %p')}"
-        return f"Got it. I'll remind you to {task} {when}."
 
     async def _on_text_chat(self, text: str, room: str = "office") -> None:
         """Handle typed messages sent from the dashboard chat input."""
@@ -902,7 +752,16 @@ class Orchestrator:
             return
         success = self.tts.set_voice(voice_name)
         if success:
-            await self._speak(f"Switching to {voice_name}.", room="office", priority="ambient")
+            text = await self._compose_in_character(
+                prompt=(
+                    f"You just switched your text-to-speech voice to '{voice_name}'. "
+                    f"Speak a single short in-character line acknowledging the "
+                    f"new voice — note any persona vibes (Wheatley is bumbling "
+                    f"British, GLaDOS is sardonic AI). No preamble, no quotes."
+                ),
+                fallback=f"Voice switched to {voice_name}.",
+            )
+            await self._speak(text, room="office", priority="ambient")
 
     # ── Background Loops ───────────────────────────────────────────────────
 
@@ -960,8 +819,13 @@ class Orchestrator:
                         frame = await self.cameras.capture_frame_async("office_cam")
                         if frame is not None:
                             posture_result = await self.posture.analyze_async(frame)
+                            # Posture is context-only — sitting/standing/lying
+                            # isn't itself an activity, so we surface it via
+                            # state.context for the LLM/dashboard but don't
+                            # vote on activity. Sleep tracker consumes posture
+                            # directly and emits the actual sleep activity.
                             signals["posture"] = {
-                                "pose": posture_result,
+                                "context": {"posture": posture_result},
                                 "confidence": 0.7 if posture_result != "unknown" else 0.1,
                             }
                             # Update sleep tracker
@@ -1196,15 +1060,18 @@ class Orchestrator:
         })
 
         if new_status == "done":
-            # Map appliance name to a natural announcement
-            messages = {
-                "washer": f"Hey — the washer's done. That was about {int(runtime or 0)} minutes.",
-                "dryer":  f"Dryer's finished. Clothes are ready.",
-                "dishwasher": "Dishwasher cycle complete.",
-            }
-            text = messages.get(appliance, f"{appliance} is done.")
+            runtime_str = (
+                f" (ran about {int(runtime)} minutes)" if isinstance(runtime, (int, float)) else ""
+            )
+            text = await self._compose_in_character(
+                prompt=(
+                    f"The {appliance} just finished its cycle{runtime_str}. "
+                    f"Tell Cole in a single short in-character line. "
+                    f"No preamble, no quotes."
+                ),
+                fallback=f"The {appliance} just finished.",
+            )
 
-            # Check urgency vs interruptibility
             urgency_map = self.config["appliances"]
             urgency = urgency_map.get(f"{appliance}_done_urgency", 0.5)
             priority = "urgent" if urgency >= 0.7 else "notification"
@@ -1398,12 +1265,16 @@ class Orchestrator:
         if self.dashboard:
             tasks.append(self.dashboard.run())
 
-        # Announce startup
-        await self._speak(
-            "Jarvis online.",
-            room="office",
-            priority="ambient",
+        # Announce startup — let the LLM riff something in character
+        startup_line = await self._compose_in_character(
+            prompt=(
+                "You just finished booting up after a restart. Greet Cole "
+                "with a single short in-character line announcing you're "
+                "online and ready. No preamble, no quotes."
+            ),
+            fallback="Jarvis online.",
         )
+        await self._speak(startup_line, room="office", priority="ambient")
 
         # Run forever — cancel all tasks cleanly on exit
         gather = asyncio.gather(*tasks, return_exceptions=True)
