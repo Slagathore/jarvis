@@ -722,6 +722,81 @@ function formatCalendarWhen(when, now) {
 setInterval(loadCalendar, 5 * 60 * 1000);  // refresh every 5 min
 loadCalendar();
 
+// ── Config editor ─────────────────────────────────────────────────────────
+
+function loadConfig() {
+  const ta = document.getElementById("config-yaml");
+  const status = document.getElementById("config-status");
+  if (!ta) return;
+  fetch("/api/config")
+    .then((r) => r.json())
+    .then(({ yaml }) => {
+      ta.value = yaml || "";
+      if (status) {
+        status.textContent = "loaded";
+        status.className = "config-status";
+      }
+    })
+    .catch((e) => {
+      if (status) {
+        status.textContent = "load failed";
+        status.className = "config-status error";
+      }
+      console.warn("[JARVIS] config load failed:", e);
+    });
+}
+
+function saveConfig() {
+  const ta = document.getElementById("config-yaml");
+  const status = document.getElementById("config-status");
+  if (!ta) return;
+  fetch("/api/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ yaml: ta.value }),
+  })
+    .then(async (r) => {
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (status) {
+          status.textContent = body.detail || `save failed (${r.status})`;
+          status.className = "config-status error";
+        }
+        return;
+      }
+      if (status) {
+        status.textContent = body.restart_required
+          ? "saved — restart required"
+          : "saved";
+        status.className = "config-status ok";
+      }
+    })
+    .catch((e) => {
+      if (status) {
+        status.textContent = "save failed";
+        status.className = "config-status error";
+      }
+      console.warn("[JARVIS] config save failed:", e);
+    });
+}
+
+const configToggle = document.getElementById("config-toggle");
+const configBody = document.getElementById("config-body");
+const configLoadBtn = document.getElementById("config-load");
+const configSaveBtn = document.getElementById("config-save");
+if (configToggle && configBody) {
+  configToggle.addEventListener("click", () => {
+    const showing = configBody.style.display !== "none";
+    configBody.style.display = showing ? "none" : "block";
+    configToggle.textContent = showing
+      ? "CONFIG (click to expand)"
+      : "CONFIG (click to collapse)";
+    if (!showing) loadConfig();
+  });
+}
+if (configLoadBtn) configLoadBtn.addEventListener("click", loadConfig);
+if (configSaveBtn) configSaveBtn.addEventListener("click", saveConfig);
+
 // ── DND ───────────────────────────────────────────────────────────────────
 
 function updateDndStatus(active, until) {

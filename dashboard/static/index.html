@@ -162,6 +162,23 @@
           </div>
         </div>
 
+        <!-- Config Editor (collapsed by default) -->
+        <div class="card" id="config-card">
+          <div class="card-label config-toggle" id="config-toggle">CONFIG (click to expand)</div>
+          <div class="config-body" id="config-body" style="display: none;">
+            <textarea id="config-yaml" class="config-textarea" spellcheck="false"></textarea>
+            <div class="config-actions">
+              <button class="dev-btn" id="config-load">RELOAD</button>
+              <button class="dev-btn" id="config-save">SAVE</button>
+              <span class="config-status" id="config-status"></span>
+            </div>
+            <div class="config-hint">
+              Most changes require a restart of <code>python main.py</code> to take effect.
+              Previous file is backed up to <code>config.yaml.bak</code> before each save.
+            </div>
+          </div>
+        </div>
+
         <!-- Reminders -->
         <div class="card" id="reminders-card">
           <div class="card-label">REMINDERS</div>
@@ -217,6 +234,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=10"></script>
+    <script src="/static/app.js?v=11"></script>
   </body>
 </html>
