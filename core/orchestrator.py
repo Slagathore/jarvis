@@ -103,6 +103,7 @@ from modules.memory.room_baselines import RoomBaselines
 from modules.agenda import GoogleCalendar
 from modules.network.mqtt_client import MQTTClient
 from modules.network.node_manager import NodeManager
+from modules.network.webhooks import WebhookManager
 from modules.reminders import ReminderScheduler, RemindersStore, parse_reminder
 from modules.vision.anomaly_detector import AnomalyDetector
 from modules.vision.camera_manager import CameraManager
@@ -162,6 +163,7 @@ class Orchestrator:
 
         self.mqtt: Optional[MQTTClient] = None
         self.nodes: Optional[NodeManager] = None
+        self.webhooks: Optional[WebhookManager] = None
 
         self.reminders_store: Optional[RemindersStore] = None
         self.reminder_scheduler: Optional[ReminderScheduler] = None
@@ -304,6 +306,11 @@ class Orchestrator:
                 logger.warning(f"[Init] Face recognizer failed to load: {e}")
 
         logger.info("[Init] Vision pipeline ready")
+
+    async def _init_webhooks(self) -> None:
+        """Wire the inbound/outbound webhook bridge to the event bus."""
+        self.webhooks = WebhookManager(config=self.config, event_bus=self.bus)
+        await self.webhooks.load()
 
     async def _init_calendar(self) -> None:
         """
@@ -1720,6 +1727,11 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"[Init] Calendar init failed (continuing without): {e}")
 
+        try:
+            await self._init_webhooks()
+        except Exception as e:
+            logger.warning(f"[Init] Webhooks init failed (continuing without): {e}")
+
         # Restore conversation sessions from the event log so Jarvis remembers
         # what was discussed before the last restart. Idempotent.
         if self.db and self.sessions:
@@ -1755,6 +1767,8 @@ class Orchestrator:
                 self.dashboard.register_speaker_id(self.speaker_id)
             if self.face_recognizer:
                 self.dashboard.register_face_recognizer(self.face_recognizer)
+            if self.webhooks:
+                self.dashboard.register_webhook_manager(self.webhooks)
 
         # Register event handlers
         self._register_event_handlers()

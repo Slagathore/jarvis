@@ -144,6 +144,28 @@ anomaly:
   # Min seconds between scoring a given room. Stops the LLM getting hammered.
   cooldown_seconds: 600
 
+webhooks:
+  # Inbound: POST /api/webhook/<name> with X-Webhook-Token header → emits a
+  # 'webhook.<name>' event onto the internal bus that other modules can subscribe to.
+  # Empty by default — add named entries with secret tokens to enable.
+  inbound_tokens: {}
+  # Example:
+  # inbound_tokens:
+  #   ifttt_doorbell: "REPLACE_WITH_LONG_RANDOM_STRING"
+
+  # Outbound: when these internal event types fire, POST the payload to the listed URLs.
+  # Use any internal event name (speech, reminder.due, room_anomaly, person_recognized,
+  # appliance.state_changed, calendar_added, etc.) Empty by default.
+  outbound: {}
+  # Example:
+  # outbound:
+  #   person_recognized:
+  #     - "http://homeassistant.local:8123/api/webhook/jarvis_person_seen"
+  #   reminder.due:
+  #     - "https://maker.ifttt.com/trigger/jarvis_reminder/with/key/XYZ"
+
+  timeout_seconds: 10
+
 interruptibility:
   quiet_hours_start: "22:00"
   quiet_hours_end: "08:00"

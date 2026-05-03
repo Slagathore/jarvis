@@ -81,6 +81,7 @@ class DashboardServer:
         self._orchestrator = None     # Set by orchestrator via register_orchestrator()
         self._speaker_id = None       # Set by orchestrator via register_speaker_id()
         self._face_recognizer = None  # Set by orchestrator via register_face_recognizer()
+        self._webhook_manager = None  # Set by orchestrator via register_webhook_manager()
 
         self._setup_routes()
 
@@ -156,6 +157,10 @@ class DashboardServer:
     def register_face_recognizer(self, face_recognizer) -> None:
         """Wire FaceRecognizer so /api/faces endpoints can list/delete enrollments."""
         self._face_recognizer = face_recognizer
+
+    def register_webhook_manager(self, webhooks) -> None:
+        """Wire WebhookManager so /api/webhook/{name} endpoints can dispatch inbound calls."""
+        self._webhook_manager = webhooks
 
     def _setup_routes(self):
         app = self.app
@@ -403,6 +408,41 @@ class DashboardServer:
                 raise HTTPException(status_code=422, detail="No face detected in frame or enrollment failed")
             await self.broadcast({"type": "face_enrolled", "name": name})
             return JSONResponse({"ok": True, "name": name})
+
+        @app.post("/api/webhook/{name}")
+        async def webhook_inbound(name: str, request: Request):
+            """
+            External services (IFTTT, Home Assistant, Zapier, etc.) POST here
+            with a JSON payload + X-Webhook-Token header. We dispatch a
+            'webhook.{name}' event onto the internal bus. Token must match
+            the value configured under webhooks.inbound_tokens.{name}.
+            """
+            wm = self._webhook_manager
+            if wm is None:
+                raise HTTPException(status_code=503, detail="Webhooks not registered")
+            try:
+                payload = await request.json()
+            except Exception:
+                payload = {}
+            token = request.headers.get("X-Webhook-Token", "")
+            try:
+                await wm.trigger_inbound(name, token, payload)
+            except KeyError:
+                raise HTTPException(status_code=404, detail=f"Unknown webhook '{name}'")
+            except PermissionError:
+                raise HTTPException(status_code=401, detail="Invalid webhook token")
+            return JSONResponse({"ok": True})
+
+        @app.get("/api/webhooks")
+        async def webhooks_status():
+            """Return registered webhook names + outbound subscription map (no tokens)."""
+            wm = self._webhook_manager
+            if wm is None:
+                return JSONResponse({"inbound": [], "outbound": {}})
+            return JSONResponse({
+                "inbound":  wm.list_inbound_names(),
+                "outbound": wm.list_outbound_routes(),
+            })
 
         @app.get("/api/config")
         async def get_config_yaml():
