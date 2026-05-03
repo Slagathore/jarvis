@@ -97,6 +97,21 @@ CREATE TABLE IF NOT EXISTS faces (
     sample_count   INTEGER DEFAULT 1
 );
 
+-- Per-activity transition log used for predicted-duration + routine learning.
+-- A row is open (ended_at NULL) while the activity is current; closed when the
+-- activity changes.
+CREATE TABLE IF NOT EXISTS activity_log (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    activity         TEXT NOT NULL,
+    started_at       TEXT NOT NULL,
+    ended_at         TEXT,
+    duration_seconds INTEGER,
+    room             TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_log_activity ON activity_log (activity);
+CREATE INDEX IF NOT EXISTS idx_activity_log_started  ON activity_log (started_at);
+
 -- Indexes for common query patterns
 CREATE INDEX IF NOT EXISTS idx_events_room_ts ON events (room, timestamp);
 CREATE INDEX IF NOT EXISTS idx_conv_room_ts   ON conversation_log (room, timestamp);

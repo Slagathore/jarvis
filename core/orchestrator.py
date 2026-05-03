@@ -91,6 +91,7 @@ from modules.activity.pc_monitor import PCMonitor
 from modules.brain.llm import OllamaLLM
 from modules.brain.prompt_builder import PromptBuilder
 from modules.brain.session import SessionManager
+from modules.context.activity_history import ActivityHistory
 from modules.context.curiosity import CuriosityEngine
 from modules.context.interruptibility import InterruptibilityManager
 from modules.context.sleep_tracker import SleepTracker
@@ -144,6 +145,7 @@ class Orchestrator:
         self.interruptibility: Optional[InterruptibilityManager] = None
         self.curiosity: Optional[CuriosityEngine] = None
         self.sleep_tracker: Optional[SleepTracker] = None
+        self.activity_history: Optional[ActivityHistory] = None
 
         self.pc_monitor: Optional[PCMonitor] = None
         self.audio_classifier: Optional[AudioClassifier] = None
@@ -273,6 +275,8 @@ class Orchestrator:
         # no event loop exists — it never actually runs.
         await self.audio_classifier.load()
         self.appliance_tracker = ApplianceTracker(config=self.config, event_bus=self.bus)
+        if self.db is not None:
+            self.activity_history = ActivityHistory(self.db)
         logger.info("[Init] Context modules ready")
 
     async def _init_vision(self) -> None:
@@ -595,12 +599,26 @@ class Orchestrator:
             return
 
         session = self.sessions.get_session(room)
+
+        # Build activity-history context (predicted remaining + typical-now)
+        extras: dict = {}
+        if self.activity_history is not None and self._current_state is not None:
+            try:
+                blurb = await self.activity_history.summary_for_prompt(
+                    self._current_state.activity
+                )
+                if blurb:
+                    extras["activity_history"] = blurb
+            except Exception as e:
+                logger.debug(f"[ActivityHistory] prompt summary failed: {e}")
+
         prompt_context = await self.prompts.build_with_memory(
             user_text=text,
             state=self._current_state,
             session=session,
             room=room,
             db=self.db,
+            extras=extras or None,
         )
 
         # Tool calling: if calendar is available, give the LLM the calendar
@@ -1052,6 +1070,20 @@ class Orchestrator:
                                 sleep_signal = sleep_tracker.get_sleep_signal()
                                 if sleep_signal:
                                     signals["sleep"] = sleep_signal
+
+                # Track activity transitions for predicted-duration / routine learning
+                if (
+                    self.activity_history is not None
+                    and self._current_state is not None
+                    and self._current_state.activity not in ("unknown", "")
+                ):
+                    try:
+                        await self.activity_history.record_change(
+                            self._current_state.activity,
+                            self._current_state.location,
+                        )
+                    except Exception as e:
+                        logger.debug(f"[ActivityHistory] record_change failed: {e}")
 
                 # Fuse signals into final state
                 if self.state_fusion:
