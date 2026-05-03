@@ -323,7 +323,18 @@ class DashboardServer:
                     "person_present": event.get("person_present"),
                     "description":    event.get("description"),
                     "updated_at":     event.get("timestamp"),
+                    # Vision events only fire for rooms with cameras, so this
+                    # is a reliable signal even if register_camera_manager
+                    # hadn't run yet when the dashboard's full_state was sent.
+                    "has_camera":     True,
                 })
+
+        elif etype == "audio_level":
+            room = event.get("room")
+            if room:
+                if room not in self._state["rooms"]:
+                    self._state["rooms"][room] = {}
+                self._state["rooms"][room]["audio_db"] = event.get("db")
 
     async def run(self):
         """Start the dashboard server. Run as a background asyncio task."""

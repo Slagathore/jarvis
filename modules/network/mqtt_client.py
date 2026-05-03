@@ -236,8 +236,8 @@ class MQTTClient:
         iterator. Older asyncio-mqtt versions expose `client.messages()` as
         an async context manager.
         """
-        messages_attr = getattr(client, "messages")
-        messages = messages_attr() if callable(messages_attr) else messages_attr
+        messages_attr: Any = getattr(client, "messages")
+        messages: Any = messages_attr() if callable(messages_attr) else messages_attr
 
         if hasattr(messages, "__aenter__") and hasattr(messages, "__aexit__"):
             async with messages as stream:

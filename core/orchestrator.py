@@ -263,6 +263,23 @@ class Orchestrator:
         self.bus.subscribe("voice.wake_detected", self._on_wake_detected)
         self.bus.subscribe("appliance.state_changed", self._on_appliance_changed)
         self.bus.subscribe("node.status", self._on_node_status)
+        self.bus.subscribe("audio.level", self._on_audio_level)
+
+    async def _on_audio_level(self, event: dict) -> None:
+        """
+        Forward periodic mic dBFS readings from wake_word to the dashboard.
+        The PC mic lives at Cole's desk (next to the USB webcam), so we render
+        the meter on the office_cam card rather than the ESP32 office card.
+        Other room IDs pass through unchanged for future per-room mics.
+        """
+        room = event.get("room", "office")
+        if room == "office":
+            room = "office_cam"
+        await self._broadcast({
+            "type": "audio_level",
+            "room": room,
+            "db": event.get("db", -100.0),
+        })
 
     # ── Wake Word + Conversation Pipeline ─────────────────────────────────
 
@@ -324,6 +341,10 @@ class Orchestrator:
                             5.0,
                         ),
                         device=record_device,
+                        mode=recording_cfg.get("mode", "silence"),
+                        fixed_duration_seconds=float(
+                            recording_cfg.get("fixed_duration_seconds", 7.0)
+                        ),
                     )
                 finally:
                     # Always release the mic, even on exception
@@ -348,6 +369,22 @@ class Orchestrator:
                 transcript = await asyncio.to_thread(stt.transcribe, audio_data)
                 if not transcript or not transcript.strip():
                     logger.info("[Wake] Empty transcript — nothing heard after chime")
+                    # Dump capture to data/debug/ so we can listen and tell whether
+                    # the mic actually got speech or just noise.
+                    if self.config["voice"]["whisper"].get("debug_save_empty", False):
+                        try:
+                            from pathlib import Path
+                            import soundfile as sf
+                            debug_dir = (
+                                Path(self.config["system"].get("data_dir", "data/")) / "debug"
+                            )
+                            debug_dir.mkdir(parents=True, exist_ok=True)
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            wav_path = debug_dir / f"empty_transcript_{ts}.wav"
+                            sf.write(str(wav_path), audio_data, SAMPLE_RATE, subtype="PCM_16")
+                            logger.info(f"[Wake] Saved empty-transcript capture to {wav_path}")
+                        except Exception as save_err:
+                            logger.debug(f"[Wake] Could not save debug capture: {save_err}")
                     return
 
                 logger.info(f"[STT] Transcript: {transcript!r}")
@@ -541,16 +578,14 @@ class Orchestrator:
                         if self.posture:
                             posture_result = await self.posture.analyze_async(frame)
 
-                        # Scene description (LLM vision — slower, run last)
+                        # Scene description — SceneAnalyzer self-gates on local
+                        # frame-change detection, so we always call it and let
+                        # it decide whether to invoke the vision LLM.
                         if not self.scene_analyzer:
                             continue
-                        last_desc = self.scene_analyzer.last_description(room_id)
-                        should_describe = bool(detections) or last_desc is None
-                        if should_describe:
-                            description = await self.scene_analyzer.describe_async(
-                                frame, room=room_id, objects=detections
-                            )
-                            last_desc = description or last_desc
+                        last_desc = await self.scene_analyzer.describe_async(
+                            frame, room=room_id, objects=detections
+                        )
 
                         # BUG FIX: update_if_due() doesn't exist on RoomBaselines.
                         # Actual API: needs_update(room) → bool, then update(room, desc).

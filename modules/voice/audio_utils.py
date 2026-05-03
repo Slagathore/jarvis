@@ -54,7 +54,12 @@ from core.exceptions import AudioError
 # ── Module-level audio constants ─────────────────────────────────────────────
 SAMPLE_RATE = 16000      # 16kHz — required by Whisper and openWakeWord
 CHANNELS = 1             # Mono
-DTYPE = np.float32       # sounddevice native float
+DTYPE = np.float32       # exposed format for downstream callers (Whisper)
+# Capture as int16 because some USB sound cards (Sound Blaster G5, etc.) ship
+# zero-filled buffers when asked to capture as float32 directly even though
+# PortAudio claims auto-conversion. Convert to float32 in Python after read.
+CAPTURE_DTYPE = np.int16
+INT16_TO_FLOAT = 1.0 / 32768.0
 CHUNK_FRAMES = 1024      # Frames per read block (~64ms at 16kHz)
 
 
@@ -121,25 +126,30 @@ def record_until_silence(
     max_duration_seconds: float = 30.0,
     speech_start_timeout_seconds: Optional[float] = None,
     device: Optional[int | str] = None,
+    mode: str = "silence",
+    fixed_duration_seconds: float = 7.0,
 ) -> np.ndarray:
     """
-    Record audio from the microphone until a sustained period of silence.
+    Record audio from the microphone.
 
-    Silence detection logic:
-      - Audio below silence_threshold_db is considered silent.
-      - Recording only stops after silence_duration_ms of consecutive silence.
-      - Leading silence (before any speech) never triggers a stop — we wait
-        for the user to start speaking first.
-      - Hard limit: max_duration_seconds stops everything regardless.
+    Two modes:
+      "silence" — Wait for speech (block above silence_threshold_db), then stop
+                  after silence_duration_ms of consecutive silence. Hard cap at
+                  max_duration_seconds. Best when mic+voice reliably exceed the
+                  threshold.
+      "fixed"   — Record exactly fixed_duration_seconds regardless of audio
+                  level. No threshold gating. Best when the mic/voice combo
+                  doesn't reliably exceed any silence threshold so silence-mode
+                  never starts capturing.
 
     Args:
-        silence_threshold_db:  Level below which a block is silent (dBFS).
-        silence_duration_ms:   Consecutive ms of silence before stopping.
-        max_duration_seconds:  Absolute recording time limit.
-        speech_start_timeout_seconds:
-                               Stop early if no speech starts within this time.
-                               None waits the full max duration.
-        device:                sounddevice device index or name. None = system default.
+        silence_threshold_db:        (silence mode) Level below which a block is silent (dBFS).
+        silence_duration_ms:         (silence mode) Consecutive ms of silence before stopping.
+        max_duration_seconds:        (silence mode) Absolute recording time limit.
+        speech_start_timeout_seconds:(silence mode) Stop early if no speech in this time.
+        device:                      sounddevice device index or name. None = system default.
+        mode:                        "silence" or "fixed".
+        fixed_duration_seconds:      (fixed mode) How long to record.
 
     Returns:
         Float32 numpy array, shape (N,), at SAMPLE_RATE Hz.
@@ -149,7 +159,37 @@ def record_until_silence(
     """
     frames_collected: list[np.ndarray] = []
 
-    # How many consecutive silent blocks trigger stop
+    # Fixed-duration mode bypasses all silence/threshold logic — just record N
+    # seconds. Use this when your mic doesn't reliably exceed any threshold so
+    # silence-mode never even starts capturing.
+    if mode == "fixed":
+        fixed_blocks = max(1, int(fixed_duration_seconds * SAMPLE_RATE / CHUNK_FRAMES))
+        try:
+            with sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype=CAPTURE_DTYPE,
+                blocksize=CHUNK_FRAMES,
+                device=device,
+            ) as stream:
+                logger.debug(f"[Audio] Recording fixed {fixed_duration_seconds:.1f}s")
+                for _ in range(fixed_blocks):
+                    block_int16, overflowed = stream.read(CHUNK_FRAMES)
+                    if overflowed:
+                        logger.warning("[Audio] Input buffer overflow — audio gap possible")
+                    frames_collected.append(
+                        block_int16.astype(np.float32) * INT16_TO_FLOAT
+                    )
+        except sd.PortAudioError as e:
+            raise AudioError(f"PortAudio stream failed: {e}") from e
+
+        if not frames_collected:
+            raise AudioError("No audio frames were captured — check microphone")
+        audio = np.concatenate(frames_collected, axis=0).flatten()
+        logger.debug(f"[Audio] Captured {len(audio) / SAMPLE_RATE:.2f}s ({len(frames_collected)} blocks, fixed)")
+        return audio
+
+    # Silence-detection mode (legacy behavior)
     silence_blocks_needed = int(
         (silence_duration_ms / 1000.0) * SAMPLE_RATE / CHUNK_FRAMES
     )
@@ -169,7 +209,7 @@ def record_until_silence(
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
-            dtype=DTYPE,
+            dtype=CAPTURE_DTYPE,   # int16 native — see CAPTURE_DTYPE comment
             blocksize=CHUNK_FRAMES,
             device=device,
         ) as stream:
@@ -177,11 +217,13 @@ def record_until_silence(
             block_count = 0
 
             while block_count < max_blocks:
-                block, overflowed = stream.read(CHUNK_FRAMES)
+                block_int16, overflowed = stream.read(CHUNK_FRAMES)
                 if overflowed:
                     logger.warning("[Audio] Input buffer overflow — audio gap possible")
 
-                frames_collected.append(block.copy())
+                # Convert int16 to float32 [-1, 1] for downstream (Whisper expects float32)
+                block = block_int16.astype(np.float32) * INT16_TO_FLOAT
+                frames_collected.append(block)
                 block_count += 1
 
                 # Measure energy level of this block

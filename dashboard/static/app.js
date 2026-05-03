@@ -132,6 +132,9 @@ function applyEvent(event) {
     case "vision":
       updateRoomVision(event.room, event);
       break;
+    case "audio_level":
+      updateRoomAudio(event.room, event.db);
+      break;
   }
 }
 
@@ -272,9 +275,21 @@ function refreshRoomFeeds() {
 setInterval(refreshRoomFeeds, 2000);
 
 function updateRoomVision(roomId, data) {
-  roomsCache[roomId] = Object.assign({}, roomsCache[roomId] || {}, data);
+  // Vision events imply the room has a camera, so make sure has_camera sticks
+  // through cache merges even if the initial full_state didn't carry it.
+  const merged = Object.assign({}, roomsCache[roomId] || {}, data, {
+    has_camera: true,
+  });
+  roomsCache[roomId] = merged;
   const card = document.getElementById(`room-${roomId}`);
   if (!card) {
+    updateRooms(roomsCache);
+    return;
+  }
+
+  // Card exists but may be missing the <img> if it was first rendered before
+  // has_camera was known. Rebuild from scratch in that case.
+  if (!card.querySelector("img.room-feed")) {
     updateRooms(roomsCache);
     return;
   }
@@ -303,6 +318,28 @@ function updateRoomVision(roomId, data) {
 
   card.classList.add("active");
   setTimeout(() => card.classList.remove("active"), 2000);
+}
+
+function updateRoomAudio(roomId, db) {
+  if (!roomId || db == null) return;
+  roomsCache[roomId] = Object.assign({}, roomsCache[roomId] || {}, {
+    audio_db: db,
+  });
+  const card = document.getElementById(`room-${roomId}`);
+  if (!card) return;
+  let meter = card.querySelector(".room-meter");
+  if (!meter) {
+    meter = document.createElement("div");
+    meter.className = "room-meter";
+    meter.innerHTML = '<div class="room-meter-fill"></div><div class="room-meter-label">—</div>';
+    card.appendChild(meter);
+  }
+  // Map -60 dBFS → 0%, 0 dBFS → 100%, clamp.
+  const pct = Math.max(0, Math.min(100, Math.round((db + 60) * (100 / 60))));
+  const fill = meter.querySelector(".room-meter-fill");
+  const label = meter.querySelector(".room-meter-label");
+  if (fill) fill.style.width = `${pct}%`;
+  if (label) label.textContent = `${db.toFixed(0)} dBFS`;
 }
 
 function updateNodeStatus(roomId, online) {
