@@ -99,8 +99,10 @@ from modules.context.state_fusion import StateFusion
 from modules.memory.database import DatabaseManager
 from modules.memory.event_log import EventLogger
 from modules.memory.room_baselines import RoomBaselines
+from modules.agenda import GoogleCalendar, parse_calendar_add, parse_calendar_query
 from modules.network.mqtt_client import MQTTClient
 from modules.network.node_manager import NodeManager
+from modules.reminders import ReminderScheduler, RemindersStore, parse_reminder
 from modules.vision.camera_manager import CameraManager
 from modules.vision.light_detector import LightDetector
 from modules.vision.object_detector import ObjectDetector
@@ -147,6 +149,11 @@ class Orchestrator:
         self.mqtt: Optional[MQTTClient] = None
         self.nodes: Optional[NodeManager] = None
 
+        self.reminders_store: Optional[RemindersStore] = None
+        self.reminder_scheduler: Optional[ReminderScheduler] = None
+
+        self.calendar: Optional[GoogleCalendar] = None
+
         self._current_state: ActivityState = UNKNOWN_STATE
         self._wake_lock = asyncio.Lock()
         self._audio_io_active: bool = False
@@ -173,6 +180,12 @@ class Orchestrator:
         self.event_log = EventLogger(self.db)
         # BUG FIX: RoomBaselines takes (db, config) — was only receiving db
         self.room_baselines = RoomBaselines(db=self.db, config=self.config)
+        self.reminders_store = RemindersStore(self.db)
+        self.reminder_scheduler = ReminderScheduler(
+            config=self.config,
+            store=self.reminders_store,
+            event_bus=self.bus,
+        )
         logger.info("[Init] Database ready")
 
     async def _init_voice(self) -> None:
@@ -243,6 +256,15 @@ class Orchestrator:
         self.scene_analyzer = SceneAnalyzer(config=self.config, llm=self.llm)
         logger.info("[Init] Vision pipeline ready")
 
+    async def _init_calendar(self) -> None:
+        """
+        Authenticate with Google Calendar. First run opens a browser for OAuth;
+        subsequent runs are silent. If credentials.json is missing, calendar
+        features are simply disabled — the rest of Jarvis runs fine without it.
+        """
+        self.calendar = GoogleCalendar(self.config)
+        await self.calendar.authenticate()
+
     async def _init_network(self) -> None:
         """Initialize MQTT client and ESP32 node manager."""
         # BUG FIX: MQTTClient takes (config, event_bus) — was getting flat broker/port/etc kwargs
@@ -264,6 +286,48 @@ class Orchestrator:
         self.bus.subscribe("appliance.state_changed", self._on_appliance_changed)
         self.bus.subscribe("node.status", self._on_node_status)
         self.bus.subscribe("audio.level", self._on_audio_level)
+        self.bus.subscribe("reminder.due", self._on_reminder_due)
+
+    async def _on_reminder_due(self, event: dict) -> None:
+        """Speak a fired reminder. The scheduler already marked it fired."""
+        message = (event.get("message") or "").strip()
+        if not message:
+            return
+        text = await self._compose_reminder_line(message)
+        await self._speak(text, room="office", priority="notification")
+        await self._broadcast({
+            "type": "reminder_fired",
+            "id": event.get("id"),
+            "message": message,
+        })
+
+    async def _compose_reminder_line(self, task: str) -> str:
+        """
+        Ask the LLM to write a single in-character reminder line for `task`.
+        Uses the configured Jarvis system prompt so phrasings stay in voice.
+        Falls back to a plain string only if the LLM call fails.
+        """
+        if self.llm is None:
+            return f"Heads up — {task}."
+        system = self.config["ollama"].get("system_prompt", "You are Jarvis.")
+        prompt = (
+            f"You set a reminder for Cole earlier and the time has now arrived. "
+            f"The thing he wanted to remember is: \"{task}\". "
+            f"Speak the reminder out loud to him in a single sentence — your "
+            f"usual voice, dry and a little witty, referencing the specific "
+            f"task. No preamble, no quotation marks, just the spoken line."
+        )
+        try:
+            response = await self.llm.chat([
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ])
+            line = response.strip().strip('"').strip("'").strip()
+            if line:
+                return line
+        except Exception as e:
+            logger.warning(f"[Reminders] LLM phrasing failed, using fallback: {e}")
+        return f"Heads up — {task}."
 
     async def _on_audio_level(self, event: dict) -> None:
         """
@@ -399,10 +463,23 @@ class Orchestrator:
         """
         Core LLM pipeline shared by voice (wake word) and text chat.
         Broadcasts user speech, calls LLM, speaks the response.
+
+        First tries to parse the text as a reminder intent — if it matches,
+        creates the reminder and short-circuits the LLM call.
         """
         await self._broadcast({"type": "user_speech", "text": text, "room": room})
         if self.event_log:
             await self.event_log.log_event(room=room, event_type="user_speech", content=text)
+
+        # Reminder intent fast path: "remind me to X in N minutes" / "at HH:MM"
+        if await self._try_create_reminder(text, room):
+            return
+
+        # Calendar intents — query first (read-only), then add (write).
+        if await self._try_calendar_query(text, room):
+            return
+        if await self._try_calendar_add(text, room):
+            return
 
         if not self.sessions or not self.prompts or not self.llm:
             logger.warning("[LLM] Brain modules not ready — skipping")
@@ -416,7 +493,17 @@ class Orchestrator:
             room=room,
         )
 
-        response = await self.llm.chat(messages=prompt_context)
+        # Tool calling: if calendar is available, give the LLM the calendar
+        # tool schemas and it'll query Google Calendar in real time when needed
+        # (any date range, no stale cache). Otherwise fall back to plain chat.
+        if self.calendar is not None and self.calendar.is_authenticated:
+            response = await self.llm.chat_with_tools(
+                messages=prompt_context,
+                tools=self._CALENDAR_TOOLS,
+                tool_handlers=self._calendar_tool_handlers(),
+            )
+        else:
+            response = await self.llm.chat(messages=prompt_context)
         if not response:
             logger.warning("[LLM] Empty response")
             return
@@ -429,6 +516,374 @@ class Orchestrator:
             self.interruptibility.record_interruption()
 
         await self._speak(response, room=room, priority="conversation")
+
+    # ── Calendar tool schemas (Ollama / OpenAI function-calling format) ──────
+    # The LLM gets these on every chat call. It decides when to invoke them
+    # based on the user's question. Real-time queries — no stale cache, any
+    # date range works (today, "first Tuesday of May 2028", historical, etc.)
+    _CALENDAR_TOOLS: list[dict] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "calendar_list_events",
+                "description": (
+                    "Look up events on Cole's Google Calendar within a specific "
+                    "time range. Use this for ANY question about what's "
+                    "scheduled, what's coming up, what's on a particular day or "
+                    "date, etc. Always call this rather than guessing — the "
+                    "current date is in the system prompt so you can compute "
+                    "any range."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "start_iso": {
+                            "type": "string",
+                            "description": (
+                                "Start of range in ISO 8601 (YYYY-MM-DDTHH:MM:SS). "
+                                "Example: 2028-05-02T00:00:00. Defaults to now."
+                            ),
+                        },
+                        "end_iso": {
+                            "type": "string",
+                            "description": (
+                                "End of range in ISO 8601. Example: "
+                                "2028-05-02T23:59:59. Defaults to 7 days from now."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "calendar_create_event",
+                "description": "Create a new event on Cole's Google Calendar.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["title", "start_iso"],
+                    "properties": {
+                        "title":       {"type": "string"},
+                        "start_iso":   {"type": "string", "description": "ISO 8601 start time"},
+                        "end_iso":     {"type": "string", "description": "ISO 8601 end time. Defaults to start + 1h."},
+                        "description": {"type": "string"},
+                        "location":    {"type": "string"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "calendar_delete_event",
+                "description": (
+                    "Delete a specific event by its ID. ALWAYS call "
+                    "calendar_list_events first to look up the event ID — "
+                    "never guess one."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["event_id"],
+                    "properties": {
+                        "event_id": {
+                            "type": "string",
+                            "description": "Event ID returned by calendar_list_events.",
+                        },
+                    },
+                },
+            },
+        },
+    ]
+
+    async def _tool_calendar_list_events(
+        self,
+        start_iso: Optional[str] = None,
+        end_iso: Optional[str] = None,
+    ) -> dict:
+        """Tool handler: list calendar events in an arbitrary time range."""
+        if self.calendar is None or not self.calendar.is_authenticated:
+            return {"error": "calendar not available"}
+        from datetime import timedelta as _td
+        now = datetime.now()
+        try:
+            start = datetime.fromisoformat(start_iso) if start_iso else now
+        except ValueError:
+            return {"error": f"start_iso not parseable: {start_iso!r}"}
+        try:
+            end = datetime.fromisoformat(end_iso) if end_iso else (now + _td(days=7))
+        except ValueError:
+            return {"error": f"end_iso not parseable: {end_iso!r}"}
+
+        # GoogleCalendar.upcoming_events takes hours-from-now; fall back to a
+        # direct service.events().list call for an arbitrary range.
+        events = await self._calendar_list_in_range(start, end)
+        return {"start": start.isoformat(), "end": end.isoformat(), "events": events}
+
+    async def _calendar_list_in_range(self, start: datetime, end: datetime) -> list[dict]:
+        """List calendar events between two arbitrary datetimes."""
+        cal = self.calendar
+        if cal is None or cal._service is None:
+            return []
+        from datetime import timezone as _tz
+        # Google requires ISO with tz; assume local if naive.
+        if start.tzinfo is None:
+            start = start.astimezone()
+        if end.tzinfo is None:
+            end = end.astimezone()
+        service = cal._service
+
+        def _list() -> list[dict]:
+            resp = service.events().list(
+                calendarId=cal._calendar_id,
+                timeMin=start.isoformat(),
+                timeMax=end.isoformat(),
+                maxResults=50,
+                singleEvents=True,
+                orderBy="startTime",
+            ).execute()
+            return resp.get("items", [])
+
+        try:
+            raw = await asyncio.to_thread(_list)
+        except Exception as e:
+            logger.warning(f"[Calendar] tool list_in_range failed: {e}")
+            return []
+        return [cal._normalize_event(e) for e in raw]
+
+    async def _tool_calendar_create_event(
+        self,
+        title: str,
+        start_iso: str,
+        end_iso: Optional[str] = None,
+        description: Optional[str] = None,
+        location: Optional[str] = None,
+    ) -> dict:
+        """Tool handler: create a new event."""
+        if self.calendar is None or not self.calendar.is_authenticated:
+            return {"error": "calendar not available"}
+        try:
+            start = datetime.fromisoformat(start_iso)
+        except ValueError:
+            return {"error": f"start_iso not parseable: {start_iso!r}"}
+        end: Optional[datetime] = None
+        if end_iso:
+            try:
+                end = datetime.fromisoformat(end_iso)
+            except ValueError:
+                return {"error": f"end_iso not parseable: {end_iso!r}"}
+        event = await self.calendar.add_event(
+            title=title, start=start, end=end,
+            description=description, location=location,
+        )
+        if event is None:
+            return {"error": "calendar API rejected create"}
+        await self._broadcast({"type": "calendar_added", "event": event})
+        return event
+
+    async def _tool_calendar_delete_event(self, event_id: str) -> dict:
+        """Tool handler: delete an event by ID."""
+        if self.calendar is None or not self.calendar.is_authenticated:
+            return {"error": "calendar not available"}
+        ok = await self.calendar.delete_event(event_id)
+        if ok:
+            await self._broadcast({"type": "calendar_deleted", "id": event_id})
+        return {"ok": ok, "event_id": event_id}
+
+    def _calendar_tool_handlers(self) -> dict:
+        """Map tool names to bound async handlers."""
+        return {
+            "calendar_list_events":   self._tool_calendar_list_events,
+            "calendar_create_event":  self._tool_calendar_create_event,
+            "calendar_delete_event":  self._tool_calendar_delete_event,
+        }
+
+    async def _try_calendar_query(self, text: str, room: str) -> bool:
+        """
+        If `text` looks like a calendar question ("what's on today?"), fetch the
+        relevant events and have the LLM phrase a response in character.
+        Returns True if handled, False to fall through.
+        """
+        when = parse_calendar_query(text)
+        if not when or self.calendar is None or not self.calendar.is_authenticated:
+            return False
+
+        # Window depends on intent. "today" = until midnight; "tomorrow" =
+        # tomorrow 00:00 to 23:59; "upcoming" = next 24h.
+        from datetime import datetime as _dt, timedelta as _td
+        now = _dt.now()
+        if when == "today":
+            end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+            hours = max(0.5, (end - now).total_seconds() / 3600)
+        elif when == "tomorrow":
+            tomorrow_end = (now + _td(days=1)).replace(hour=23, minute=59, second=59)
+            hours = max(0.5, (tomorrow_end - now).total_seconds() / 3600)
+        else:
+            hours = 24.0
+
+        events = await self.calendar.upcoming_events(hours=hours)
+        if when == "tomorrow":
+            tomorrow_start = (now + _td(days=1)).replace(hour=0, minute=0, second=0)
+            events = [e for e in events if e.get("start", "") >= tomorrow_start.isoformat()]
+
+        response = await self._compose_calendar_response(text, when, events)
+        await self._speak(response, room=room, priority="conversation")
+        return True
+
+    async def _try_calendar_add(self, text: str, room: str) -> bool:
+        """
+        If `text` looks like "schedule X today/tomorrow at HH", create the
+        event and have the LLM speak a confirmation in character.
+        """
+        parsed = parse_calendar_add(text)
+        if not parsed or self.calendar is None or not self.calendar.is_authenticated:
+            return False
+        title, start, end = parsed
+        event = await self.calendar.add_event(title=title, start=start, end=end)
+        if event is None:
+            await self._speak(
+                "I tried to add that to your calendar but the request failed.",
+                room=room, priority="conversation",
+            )
+            return True
+        await self._broadcast({
+            "type":  "calendar_added",
+            "event": event,
+        })
+        confirmation = await self._compose_calendar_add_confirmation(event)
+        await self._speak(confirmation, room=room, priority="conversation")
+        return True
+
+    async def _compose_calendar_response(
+        self, user_question: str, when: str, events: list[dict]
+    ) -> str:
+        """LLM-generated response to a calendar query in Jarvis's voice."""
+        if self.llm is None:
+            return self._calendar_response_fallback(when, events)
+        base_system = self.config["ollama"].get("system_prompt", "You are Jarvis.")
+        # Anti-hallucination guardrail: the model is told it can ONLY reference
+        # what's in the events list. Without this, the persona's tendency to
+        # be witty leads it to invent meetings that don't exist.
+        system = (
+            base_system
+            + "\n\nWhen reporting calendar information: ONLY mention events "
+            "that appear in the list provided. If the list is empty, say "
+            "there's nothing scheduled. NEVER invent, embellish, or guess at "
+            "events. Time and titles must match the list exactly."
+        )
+        if not events:
+            event_summary = "EVENT LIST: (empty — no events scheduled in this window)"
+        else:
+            lines = []
+            for e in events[:10]:
+                start = e.get("start") or ""
+                title = e.get("title") or "(untitled)"
+                location = e.get("location")
+                line = f"- {start}  {title}"
+                if location:
+                    line += f"  @ {location}"
+                lines.append(line)
+            event_summary = "EVENT LIST:\n" + "\n".join(lines)
+        prompt = (
+            f"Cole asked: \"{user_question}\"\n"
+            f"Calendar window: {when}.\n\n"
+            f"{event_summary}\n\n"
+            f"Reply in one or two sentences in your usual voice. "
+            f"If the list is empty, just say there's nothing on the calendar — "
+            f"don't make anything up. No preamble, no quotes, just the spoken "
+            f"response."
+        )
+        try:
+            line = await self.llm.chat([
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ])
+            line = line.strip().strip('"').strip("'").strip()
+            if line:
+                return line
+        except Exception as e:
+            logger.warning(f"[Calendar] LLM phrasing failed: {e}")
+        return self._calendar_response_fallback(when, events)
+
+    @staticmethod
+    def _calendar_response_fallback(when: str, events: list[dict]) -> str:
+        if not events:
+            return f"Nothing on your calendar for {when}."
+        first = events[0]
+        title = first.get("title") or "an event"
+        start = first.get("start") or ""
+        more = f" Plus {len(events) - 1} more." if len(events) > 1 else ""
+        return f"Next up: {title} at {start}.{more}"
+
+    async def _compose_calendar_add_confirmation(self, event: dict) -> str:
+        """LLM-generated confirmation for a newly-added calendar event."""
+        if self.llm is None:
+            return f"Added {event.get('title')} to your calendar."
+        system = self.config["ollama"].get("system_prompt", "You are Jarvis.")
+        prompt = (
+            f"You just added an event to Cole's Google Calendar:\n"
+            f"  Title: {event.get('title')}\n"
+            f"  Start: {event.get('start')}\n"
+            f"  End:   {event.get('end')}\n\n"
+            f"Speak a single short in-character confirmation. No preamble, "
+            f"no quotes."
+        )
+        try:
+            line = await self.llm.chat([
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ])
+            line = line.strip().strip('"').strip("'").strip()
+            if line:
+                return line
+        except Exception as e:
+            logger.warning(f"[Calendar] LLM phrasing failed: {e}")
+        return f"Added {event.get('title')} to your calendar."
+
+    async def _try_create_reminder(self, text: str, room: str) -> bool:
+        """
+        Returns True (and sends confirmation TTS) if `text` parsed as a reminder.
+        False otherwise — caller should fall through to the LLM.
+        """
+        parsed = parse_reminder(text)
+        if not parsed or self.reminders_store is None:
+            return False
+        task, due = parsed
+        try:
+            rid = await self.reminders_store.add(task, due)
+        except Exception as e:
+            logger.error(f"[Reminders] Failed to add: {e}")
+            return False
+        await self._broadcast({
+            "type":         "reminder_added",
+            "id":           rid,
+            "message":      task,
+            "trigger_time": due.isoformat(),
+        })
+        confirmation = self._format_reminder_confirmation(task, due)
+        await self._speak(confirmation, room=room, priority="conversation")
+        return True
+
+    @staticmethod
+    def _format_reminder_confirmation(task: str, due: datetime) -> str:
+        """Friendly natural-language confirmation for a newly-added reminder."""
+        delta = due - datetime.now()
+        secs = max(0, int(delta.total_seconds()))
+        if secs < 90:
+            when = f"in {secs} seconds"
+        elif secs < 3600:
+            when = f"in {secs // 60} minutes"
+        elif secs < 86400:
+            hours = secs // 3600
+            mins = (secs % 3600) // 60
+            when = f"in {hours}h {mins}m" if mins else f"in {hours} hours"
+        else:
+            # %#I (Windows) / %-I (POSIX) for no leading zero on hour are both
+            # platform-specific. Stick with %I and strip the leading zero
+            # manually so this works cross-platform.
+            hour_str = due.strftime("%I").lstrip("0") or "12"
+            when = f"on {due.strftime('%A')} at {hour_str}:{due.strftime('%M %p')}"
+        return f"Got it. I'll remind you to {task} {when}."
 
     async def _on_text_chat(self, text: str, room: str = "office") -> None:
         """Handle typed messages sent from the dashboard chat input."""
@@ -470,17 +925,27 @@ class Orchestrator:
                         signals["pc"] = pc_signal
 
                 if self.audio_classifier and not self._audio_io_active:
-                    # BUG FIX: classify_async() returns list[dict] (not a single dict).
-                    # Each dict has keys "label", "yamnet_class", "score".
-                    # Calling .get("classifications", []) on a list crashes at runtime.
-                    # state_fusion expects: signals["audio"] = {"activity": str, "confidence": float}
-                    # so we take the top classification from the list.
-                    classifications = await self.audio_classifier.classify_async()
+                    # YAMNet records its own audio window via sd.rec(), which
+                    # collides with the wake_word InputStream on the same mic.
+                    # On Windows WASAPI, two concurrent InputStreams on one
+                    # device returns silence for one of them — leaving us with
+                    # no audio classification (and a stuck "unknown" state).
+                    # Suspend wake briefly to give YAMNet exclusive access.
+                    if self.wake:
+                        self.wake.suspend()
+                    try:
+                        # BUG FIX: classify_async() returns list[dict] (not a
+                        # single dict). state_fusion expects:
+                        # signals["audio"] = {"activity": str, "confidence": float}
+                        classifications = await self.audio_classifier.classify_async()
+                    finally:
+                        if self.wake:
+                            self.wake.wakeup()
+
                     if classifications:
-                        # Feed raw list to appliance tracker (it expects list[dict])
+                        # Feed raw list to appliance tracker (expects list[dict])
                         if self.appliance_tracker:
                             self.appliance_tracker.update(classifications)
-                        # Build state-fusion-compatible dict from top result
                         signals["audio"] = {
                             "activity":   classifications[0]["label"],
                             "confidence": classifications[0]["score"],
@@ -518,6 +983,16 @@ class Orchestrator:
 
                 # Fuse signals into final state
                 if self.state_fusion:
+                    # Surface what we collected so a stuck "unknown" state can
+                    # be diagnosed — log every signal name + activity it voted
+                    # for. Empty {} = no source produced a usable signal this
+                    # cycle (the cause of activity stuck at unknown / 50%).
+                    signal_summary = {
+                        s: (sig.get("activity") if isinstance(sig, dict) else "?")
+                        for s, sig in signals.items()
+                    }
+                    logger.debug(f"[Context] Signals this cycle: {signal_summary}")
+
                     # BUG FIX: StateFusion.fuse() is async def — must be awaited
                     new_state = await self.state_fusion.fuse(signals, room="office")
                     self._current_state = new_state
@@ -865,6 +1340,11 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"[Init] Network init failed (continuing without): {e}")
 
+        try:
+            await self._init_calendar()
+        except Exception as e:
+            logger.warning(f"[Init] Calendar init failed (continuing without): {e}")
+
         # Wire dashboard to config + handlers
         if self.dashboard:
             room_ids = [r["id"] for r in self.config.get("rooms", [])]
@@ -878,6 +1358,10 @@ class Orchestrator:
                 )
             if self.cameras:
                 self.dashboard.register_camera_manager(self.cameras)
+            if self.reminders_store:
+                self.dashboard.register_reminders_store(self.reminders_store)
+            if self.calendar:
+                self.dashboard.register_calendar(self.calendar)
 
         # Register event handlers
         self._register_event_handlers()
@@ -905,6 +1389,10 @@ class Orchestrator:
             tasks.append(self.mqtt.listen_forever())
         if self.nodes:
             tasks.append(self.nodes.monitor_heartbeats())
+
+        # Reminder scheduler
+        if self.reminder_scheduler:
+            tasks.append(self.reminder_scheduler.run())
 
         # Dashboard
         if self.dashboard:

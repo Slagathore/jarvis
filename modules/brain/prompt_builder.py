@@ -97,11 +97,12 @@ class PromptBuilder:
         to the base personality prompt.
         """
         now = datetime.now()
-        time_str = now.strftime("%I:%M %p")
-        day_str = f"{now.strftime('%A, %B')} {now.day}"  # %-d is Linux-only
+        time_str = now.strftime("%I:%M %p").lstrip("0")
+        day_str = f"{now.strftime('%A, %B')} {now.day}, {now.year}"
+        iso_str = now.strftime("%Y-%m-%dT%H:%M:%S")
 
         lines = [self._base_system, ""]
-        lines.append(f"Current time: {time_str} on {day_str}.")
+        lines.append(f"Current time: {time_str} on {day_str} (ISO: {iso_str}).")
         lines.append(f"Active room: {room.replace('_', ' ').title()}.")
 
         # Activity state context
@@ -122,10 +123,18 @@ class PromptBuilder:
             if context.get("window_title"):
                 lines.append(f"Active window: {context['window_title']}.")
 
-        # Any caller-injected extras (room baseline, reminders, etc.)
+        # Any caller-injected extras (room baseline, calendar, reminders, etc.)
+        # Multi-line values get their own section so structured context (lists
+        # of events, etc.) doesn't get squashed onto one line with a label.
         if extras:
             for key, value in extras.items():
-                if value:
-                    lines.append(f"{key.replace('_', ' ').title()}: {value}.")
+                if not value:
+                    continue
+                str_value = str(value)
+                if "\n" in str_value:
+                    lines.append("")
+                    lines.append(str_value)
+                else:
+                    lines.append(f"{key.replace('_', ' ').title()}: {str_value}.")
 
         return "\n".join(lines)

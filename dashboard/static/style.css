@@ -481,6 +481,150 @@ main {
   color: var(--text-muted);
 }
 
+/* ── Reminders ────────────────────────────────────────────────────────────── */
+.reminders-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.reminders-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.reminder-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.reminder-row.due {
+  border-color: var(--amber);
+  box-shadow: 0 0 12px #ffb30033;
+}
+
+.reminder-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.reminder-msg {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reminder-when {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.reminder-dismiss {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 2px;
+  padding: 2px 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.reminder-dismiss:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.reminders-add {
+  display: flex;
+  gap: 6px;
+}
+
+.reminder-input {
+  flex: 1;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 12px;
+  font-family: var(--sans);
+}
+
+.reminder-min {
+  width: 50px;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 6px 4px;
+  font-size: 12px;
+  font-family: var(--mono);
+  text-align: center;
+}
+
+/* ── Calendar ─────────────────────────────────────────────────────────────── */
+.calendar-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.calendar-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.calendar-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.calendar-row:last-child {
+  border-bottom: none;
+}
+
+.calendar-when {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  min-width: 70px;
+}
+
+.calendar-title {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.calendar-row.soon {
+  border-left: 2px solid var(--amber);
+  padding-left: 8px;
+}
+
 /* ── Last Speech Card ─────────────────────────────────────────────────────── */
 .card-speech {
   border-color: #00ff8822;

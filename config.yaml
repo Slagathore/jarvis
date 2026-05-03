@@ -6,7 +6,7 @@
 system:
   name: "Jarvis"
   version: "1.0.0"
-  log_level: "INFO"           # DEBUG | INFO | WARNING | ERROR
+  log_level: "DEBUG"          # DEBUG | INFO | WARNING | ERROR
   data_dir: "data/"
   dashboard_enabled: true
   dashboard_port: 7070
@@ -117,6 +117,9 @@ rooms:
 
 context:
   vision_scan_interval_minutes: 1
+  pc_poll_interval_seconds: 10
+  audio_classify_window_seconds: 3
+  posture_analysis_fps: 1
 
 vision:
   # Mean absolute pixel difference (0-255 grayscale, blurred + downscaled) above
@@ -128,9 +131,6 @@ vision:
   # frame-to-frame sensor noise that masquerades as "change" — bump it higher.
   scene_change_threshold_per_room:
     office: 25.0   # ESP32-CAM, noisy sensor
-  pc_poll_interval_seconds: 10
-  audio_classify_window_seconds: 3
-  posture_analysis_fps: 1
 
 interruptibility:
   quiet_hours_start: "22:00"
@@ -180,6 +180,15 @@ memory:
   db_path: "data/jarvis.db"
   max_conversation_turns: 20
   room_baseline_update_hours: 24
+
+reminders:
+  poll_interval_seconds: 30   # How often the scheduler checks for due reminders
+
+calendar:
+  credentials_path: "data/google_credentials.json"  # OAuth client JSON from Google Cloud Console
+  token_path: "data/google_token.json"              # cached refresh token (auto-created on first auth)
+  calendar_id: "primary"                            # "primary" = your default calendar
+  timezone: "America/Chicago"                       # IANA tz for new events
 
 # ── Process → Activity mapping for PC monitor ──────────────────────────────
 # Key is the process .exe name (case-insensitive), value is the activity label.

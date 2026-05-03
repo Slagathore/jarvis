@@ -140,6 +140,40 @@
             <span id="speech-time">—</span>
           </div>
         </div>
+
+        <!-- Calendar -->
+        <div class="card" id="calendar-card">
+          <div class="card-label">UPCOMING (24H)</div>
+          <div class="calendar-list" id="calendar-list">
+            <div class="calendar-empty">Loading…</div>
+          </div>
+        </div>
+
+        <!-- Reminders -->
+        <div class="card" id="reminders-card">
+          <div class="card-label">REMINDERS</div>
+          <div class="reminders-list" id="reminders-list">
+            <div class="reminders-empty">No pending reminders.</div>
+          </div>
+          <div class="reminders-add">
+            <input
+              type="text"
+              id="reminder-text"
+              class="reminder-input"
+              placeholder="What to remember…"
+              autocomplete="off"
+            />
+            <input
+              type="number"
+              id="reminder-min"
+              class="reminder-min"
+              placeholder="min"
+              min="1"
+              value="10"
+            />
+            <button class="dev-btn" id="reminder-add">ADD</button>
+          </div>
+        </div>
       </div>
 
       <!-- RIGHT COLUMN -->
@@ -164,6 +198,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=6"></script>
+    <script src="/static/app.js?v=8"></script>
   </body>
 </html>

@@ -87,13 +87,17 @@ class PCMonitor:
         Returns a signal dict for StateFusion.
         """
         if not _WIN32_AVAILABLE:
-            return self._unknown_signal()
+            return self._idle_signal()
 
         try:
             process_name, window_title = self._get_active_window()
         except Exception as e:
+            # Don't go to "unknown" on a transient win32 hiccup — state_fusion
+            # filters out "unknown" signals which leaves no data and the dashboard
+            # gauge stuck. "idle" is a valid fallback that still produces a
+            # reasonable interruptibility score.
             logger.debug(f"[PCMonitor] Error reading active window: {e}")
-            return self._unknown_signal()
+            return self._idle_signal()
 
         activity, confidence = self._classify_activity(process_name, window_title)
 
@@ -133,16 +137,31 @@ class PCMonitor:
             raise RuntimeError("win32/psutil dependencies are unavailable")
 
         hwnd = win32gui.GetForegroundWindow()
-        window_title = win32gui.GetWindowText(hwnd) or ""
-
-        # Get the PID of the window's owning process
-        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        # hwnd == 0 means no window has focus (lock screen, transition, etc.)
+        # GetWindowThreadProcessId(0) raises pywintypes.error — bail early so
+        # the caller still gets a signal instead of falling to "unknown".
+        if not hwnd:
+            return "", ""
 
         try:
-            proc = psutil.Process(pid)
-            process_name = proc.name() or ""
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            process_name = ""
+            window_title = win32gui.GetWindowText(hwnd) or ""
+        except Exception:
+            window_title = ""
+
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:
+            pid = 0
+
+        process_name = ""
+        if pid:
+            try:
+                proc = psutil.Process(pid)
+                process_name = proc.name() or ""
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                process_name = ""
+            except Exception:
+                process_name = ""
 
         return process_name.lower(), window_title.lower()
 
@@ -179,12 +198,17 @@ class PCMonitor:
         return self._default_activity, 0.4
 
     @staticmethod
-    def _unknown_signal() -> dict:
-        """Return a no-data signal for when the monitor cannot operate."""
+    def _idle_signal() -> dict:
+        """
+        Fallback signal when the monitor can't read the active window.
+        Reports "idle" (not "unknown") because state_fusion filters out
+        "unknown" signals — and we'd rather show "idle" than have the
+        whole pipeline collapse to no signals at all.
+        """
         return {
-            "activity":     "unknown",
+            "activity":     "idle",
             "process_name": "",
             "window_title": "",
-            "confidence":   0.0,
+            "confidence":   0.3,
             "context":      {},
         }

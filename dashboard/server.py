@@ -75,6 +75,8 @@ class DashboardServer:
         self._active_voice: str = ""
         self._camera_manager = None  # Set by orchestrator via register_camera_manager()
         self._camera_jpeg_quality = 70
+        self._reminders_store = None  # Set by orchestrator via register_reminders_store()
+        self._calendar = None         # Set by orchestrator via register_calendar()
 
         self._setup_routes()
 
@@ -126,6 +128,14 @@ class DashboardServer:
         for room_id in rooms:
             self._state["rooms"].setdefault(room_id, {})
             self._state["rooms"][room_id]["has_camera"] = True
+
+    def register_reminders_store(self, store) -> None:
+        """Wire the orchestrator's RemindersStore so /api/reminders endpoints work."""
+        self._reminders_store = store
+
+    def register_calendar(self, calendar) -> None:
+        """Wire the orchestrator's GoogleCalendar so /api/calendar endpoints work."""
+        self._calendar = calendar
 
     def _setup_routes(self):
         app = self.app
@@ -204,6 +214,90 @@ class DashboardServer:
                 asyncio.create_task(self._voice_handler(voice))
                 self._active_voice = voice
             return JSONResponse({"ok": True, "voice": voice})
+
+        @app.get("/api/reminders")
+        async def list_reminders():
+            store = self._reminders_store
+            if store is None:
+                return JSONResponse({"reminders": []})
+            try:
+                items = await store.list_pending()
+            except Exception as e:
+                logger.warning(f"[Dashboard] list_reminders failed: {e}")
+                return JSONResponse({"reminders": []})
+            return JSONResponse({"reminders": items})
+
+        @app.post("/api/reminders")
+        async def create_reminder(request: Request):
+            store = self._reminders_store
+            if store is None:
+                raise HTTPException(status_code=503, detail="Reminders not available")
+            body = await request.json()
+            message = str(body.get("message", "")).strip()
+            trigger_iso = str(body.get("trigger_time", "")).strip()
+            if not message or not trigger_iso:
+                raise HTTPException(status_code=400, detail="message and trigger_time required")
+            try:
+                trigger_time = datetime.fromisoformat(trigger_iso)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="trigger_time must be ISO 8601")
+            rid = await store.add(message, trigger_time)
+            await self.broadcast({
+                "type":         "reminder_added",
+                "id":           rid,
+                "message":      message,
+                "trigger_time": trigger_time.isoformat(),
+            })
+            return JSONResponse({"id": rid, "ok": True})
+
+        @app.delete("/api/reminders/{reminder_id}")
+        async def delete_reminder(reminder_id: int):
+            store = self._reminders_store
+            if store is None:
+                raise HTTPException(status_code=503, detail="Reminders not available")
+            await store.delete(reminder_id)
+            await self.broadcast({"type": "reminder_deleted", "id": reminder_id})
+            return JSONResponse({"ok": True})
+
+        @app.get("/api/calendar/upcoming")
+        async def calendar_upcoming(hours: float = 24.0):
+            cal = self._calendar
+            if cal is None or not getattr(cal, "is_authenticated", False):
+                return JSONResponse({"events": [], "authenticated": False})
+            events = await cal.upcoming_events(hours=hours)
+            return JSONResponse({"events": events, "authenticated": True})
+
+        @app.post("/api/calendar")
+        async def calendar_create(request: Request):
+            cal = self._calendar
+            if cal is None or not getattr(cal, "is_authenticated", False):
+                raise HTTPException(status_code=503, detail="Calendar not available")
+            body = await request.json()
+            title = str(body.get("title", "")).strip()
+            start_iso = str(body.get("start", "")).strip()
+            end_iso = str(body.get("end", "")).strip()
+            if not title or not start_iso:
+                raise HTTPException(status_code=400, detail="title and start required")
+            try:
+                start = datetime.fromisoformat(start_iso)
+                end = datetime.fromisoformat(end_iso) if end_iso else None
+            except ValueError:
+                raise HTTPException(status_code=400, detail="start/end must be ISO 8601")
+            event = await cal.add_event(title=title, start=start, end=end)
+            if event is None:
+                raise HTTPException(status_code=502, detail="Calendar API rejected event")
+            await self.broadcast({"type": "calendar_added", "event": event})
+            return JSONResponse(event)
+
+        @app.delete("/api/calendar/{event_id}")
+        async def calendar_delete(event_id: str):
+            cal = self._calendar
+            if cal is None or not getattr(cal, "is_authenticated", False):
+                raise HTTPException(status_code=503, detail="Calendar not available")
+            ok = await cal.delete_event(event_id)
+            if ok:
+                await self.broadcast({"type": "calendar_deleted", "id": event_id})
+            return JSONResponse({"ok": ok})
 
         @app.get("/api/camera/{room}/snapshot.jpg")
         async def camera_snapshot(room: str):

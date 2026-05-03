@@ -98,49 +98,74 @@ class CameraManager:
                 continue
 
             label = str(source)
-            logger.info(f"[CameraManager] Connecting to {label} for '{room_id}'...")
-            try:
-                # cv2.VideoCapture blocks (network connection for URLs) — run in thread
-                # with a timeout so an offline node doesn't stall the whole startup.
-                # Local cameras (int index) need more time on Windows DirectShow
-                open_timeout = 20.0 if isinstance(source, int) else 8.0
-                cap = await asyncio.wait_for(
-                    asyncio.to_thread(cv2.VideoCapture, source),  # type: ignore[arg-type]
-                    timeout=open_timeout,
+            # USB webcams on Windows DirectShow open flakily — sometimes the
+            # first cv2.VideoCapture() returns an unopened cap or fails to read
+            # a frame. Retry a couple times with a short delay before giving up.
+            attempts = 3 if isinstance(source, int) else 1
+            opened = False
+            for attempt in range(1, attempts + 1):
+                logger.info(
+                    f"[CameraManager] Connecting to {label} for '{room_id}' "
+                    f"(attempt {attempt}/{attempts})..."
                 )
-                if cap.isOpened():
-                    ok, frame = await asyncio.wait_for(
-                        asyncio.to_thread(cap.read),
-                        timeout=5.0,
-                    )
-                    if not ok or frame is None:
+                try:
+                    open_timeout = 20.0 if isinstance(source, int) else 8.0
+                    # On Windows, explicitly pick DirectShow for USB webcams.
+                    # The default (auto-select MSMF / DSHOW) hangs for ~20s on
+                    # some devices including the Sound BlasterX G5 capture path.
+                    # MJPEG URLs use the FFmpeg backend automatically.
+                    if isinstance(source, int):
+                        cap = await asyncio.wait_for(
+                            asyncio.to_thread(cv2.VideoCapture, source, cv2.CAP_DSHOW),  # type: ignore[arg-type]
+                            timeout=open_timeout,
+                        )
+                    else:
+                        cap = await asyncio.wait_for(
+                            asyncio.to_thread(cv2.VideoCapture, source),  # type: ignore[arg-type]
+                            timeout=open_timeout,
+                        )
+                    if cap.isOpened():
+                        ok, frame = await asyncio.wait_for(
+                            asyncio.to_thread(cap.read),
+                            timeout=5.0,
+                        )
+                        if not ok or frame is None:
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            logger.warning(
+                                f"[CameraManager] Opened {label} for '{room_id}' but could not read a frame"
+                            )
+                        else:
+                            self._caps[room_id] = cap
+                            self._sources[room_id] = source
+                            self._fail_counts[room_id] = 0
+                            self._last_frames[room_id] = frame
+                            self._read_locks[room_id] = asyncio.Lock()
+                            logger.info(f"[CameraManager] Opened {label} for '{room_id}'")
+                            opened = True
+                            break
+                    else:
                         try:
                             cap.release()
                         except Exception:
                             pass
-                        logger.warning(
-                            f"[CameraManager] Opened {label} for '{room_id}' but could not read a frame"
-                        )
-                        continue
-                    self._caps[room_id] = cap
-                    self._sources[room_id] = source
-                    self._fail_counts[room_id] = 0
-                    self._last_frames[room_id] = frame
-                    self._read_locks[room_id] = asyncio.Lock()
-                    logger.info(f"[CameraManager] Opened {label} for '{room_id}'")
-                else:
-                    try:
-                        cap.release()
-                    except Exception:
-                        pass
-                    logger.warning(f"[CameraManager] Could not open {label} for '{room_id}'")
-            except asyncio.TimeoutError:
+                        logger.warning(f"[CameraManager] Could not open {label} for '{room_id}'")
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[CameraManager] Timed out connecting to {label} for '{room_id}'"
+                    )
+                except Exception as e:
+                    logger.warning(f"[CameraManager] Error opening {label} for '{room_id}': {e}")
+
+                if attempt < attempts:
+                    await asyncio.sleep(1.5)
+
+            if not opened:
                 logger.warning(
-                    f"[CameraManager] Timed out connecting to {label} for '{room_id}' — "
-                    "node may be offline"
+                    f"[CameraManager] Gave up on '{room_id}' after {attempts} attempt(s)"
                 )
-            except Exception as e:
-                logger.warning(f"[CameraManager] Error opening {label} for '{room_id}': {e}")
 
         if not self._caps:
             logger.warning("[CameraManager] No cameras available")

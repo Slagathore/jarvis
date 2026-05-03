@@ -102,6 +102,103 @@ class OllamaLLM:
         except Exception as e:
             raise LLMError(f"Ollama chat failed: {e}") from e
 
+    async def chat_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_handlers: dict[str, Any],
+        max_iterations: int = 5,
+    ) -> str:
+        """
+        Chat with tool-calling support. Loops: if the LLM emits tool_calls,
+        execute them via tool_handlers, append the results, call the LLM again.
+        Returns the final text response once the LLM stops requesting tools.
+
+        Args:
+            messages:       Standard chat messages list.
+            tools:          OpenAI/Ollama tool schema list. Each entry:
+                            {"type": "function", "function": {"name", "description", "parameters"}}
+            tool_handlers:  {function_name: async_callable(**args) → result}
+                            Result is JSON-serialized and fed back to the LLM.
+            max_iterations: Cap on tool-call loops so a misbehaving model can't
+                            burn budget forever.
+
+        Returns:
+            The assistant's final text response.
+
+        Raises:
+            LLMError: On connection failure, timeout, or unrecognized tool call.
+        """
+        import json
+
+        working_messages = list(messages)
+
+        for iteration in range(max_iterations):
+            try:
+                response = await asyncio.wait_for(
+                    self._client.chat(
+                        model=self._model,
+                        messages=working_messages,
+                        tools=tools,
+                    ),
+                    timeout=self._timeout,
+                )
+            except asyncio.TimeoutError:
+                raise LLMError(f"Ollama chat (tools) timed out after {self._timeout}s")
+            except Exception as e:
+                raise LLMError(f"Ollama chat (tools) failed: {e}") from e
+
+            message = response.get("message", {}) or {}
+            tool_calls = message.get("tool_calls") or []
+
+            if not tool_calls:
+                text = (message.get("content") or "").strip()
+                logger.debug(
+                    f"[LLM] Tool-loop done in {iteration + 1} iter(s), "
+                    f"final response ({len(text)} chars): {text[:100]}..."
+                )
+                return text
+
+            # Append the assistant turn that requested the tools
+            working_messages.append(dict(message))
+
+            for call in tool_calls:
+                fn = (call.get("function") or {})
+                name = fn.get("name") or ""
+                # Ollama may pass arguments as a dict OR a JSON string depending
+                # on model. Normalize to dict.
+                raw_args = fn.get("arguments") or {}
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        args = {}
+                else:
+                    args = raw_args
+
+                handler = tool_handlers.get(name)
+                if handler is None:
+                    result = {"error": f"unknown tool: {name}"}
+                    logger.warning(f"[LLM] Model requested unknown tool '{name}'")
+                else:
+                    try:
+                        logger.debug(f"[LLM] Tool call: {name}({args})")
+                        result = await handler(**args)
+                    except Exception as e:
+                        logger.warning(f"[LLM] Tool '{name}' raised: {e}")
+                        result = {"error": str(e)}
+
+                working_messages.append({
+                    "role":    "tool",
+                    "name":    name,
+                    "content": json.dumps(result, default=str),
+                })
+
+        logger.warning(
+            f"[LLM] Tool loop hit max_iterations={max_iterations} without final answer"
+        )
+        return ""
+
     async def vision_query(
         self,
         frame: np.ndarray,

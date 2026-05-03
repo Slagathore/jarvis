@@ -135,6 +135,20 @@ function applyEvent(event) {
     case "audio_level":
       updateRoomAudio(event.room, event.db);
       break;
+    case "reminder_added":
+      addReminder(event);
+      break;
+    case "reminder_fired":
+      flashReminderFired(event);
+      removeReminder(event.id);
+      break;
+    case "reminder_deleted":
+      removeReminder(event.id);
+      break;
+    case "calendar_added":
+    case "calendar_deleted":
+      loadCalendar();
+      break;
   }
 }
 
@@ -506,6 +520,181 @@ const chatInput = document.getElementById("chat-input");
 const chatSend = document.getElementById("chat-send");
 if (chatInput) chatInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
 if (chatSend) chatSend.addEventListener("click", sendChat);
+
+// ── Reminders ─────────────────────────────────────────────────────────────
+
+let remindersCache = [];
+
+function loadReminders() {
+  fetch("/api/reminders")
+    .then((r) => r.json())
+    .then(({ reminders }) => {
+      remindersCache = reminders || [];
+      renderReminders();
+    })
+    .catch(() => {});
+}
+
+function renderReminders() {
+  const list = document.getElementById("reminders-list");
+  if (!list) return;
+  list.innerHTML = "";
+  if (remindersCache.length === 0) {
+    list.innerHTML = '<div class="reminders-empty">No pending reminders.</div>';
+    return;
+  }
+  remindersCache
+    .slice()
+    .sort((a, b) => (a.trigger_time || "").localeCompare(b.trigger_time || ""))
+    .forEach((r) => list.appendChild(reminderRow(r)));
+}
+
+function reminderRow(r) {
+  const row = document.createElement("div");
+  row.className = "reminder-row";
+  row.dataset.id = String(r.id);
+  const due = r.trigger_time ? new Date(r.trigger_time) : null;
+  const when = due ? formatRelative(due) : "—";
+  row.innerHTML = `
+    <div class="reminder-info">
+      <div class="reminder-msg">${escapeHtml(r.message || "")}</div>
+      <div class="reminder-when">${when}</div>
+    </div>
+    <button class="reminder-dismiss" aria-label="Dismiss">×</button>
+  `;
+  if (due && due <= new Date()) row.classList.add("due");
+  row.querySelector(".reminder-dismiss").addEventListener("click", () => {
+    fetch(`/api/reminders/${r.id}`, { method: "DELETE" }).catch(() => {});
+  });
+  return row;
+}
+
+function addReminder(event) {
+  remindersCache = remindersCache.filter((r) => r.id !== event.id);
+  remindersCache.push({
+    id: event.id,
+    message: event.message,
+    trigger_time: event.trigger_time,
+  });
+  renderReminders();
+}
+
+function removeReminder(id) {
+  remindersCache = remindersCache.filter((r) => r.id !== id);
+  renderReminders();
+}
+
+function flashReminderFired(event) {
+  // Pulse the speech card so a fired reminder is visually obvious — the
+  // actual audio comes from Jarvis via the existing TTS pipeline.
+  pulse("speech-card");
+}
+
+function formatRelative(when) {
+  const now = new Date();
+  const ms = when - now;
+  const past = ms < 0;
+  const abs = Math.abs(ms);
+  const mins = Math.round(abs / 60000);
+  if (mins < 1) return past ? "just now" : "in <1 min";
+  if (mins < 60) return past ? `${mins}m ago` : `in ${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return past ? `${hours}h ago` : `in ${hours}h`;
+  return when.toLocaleString("en-US", {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+}
+
+function submitReminder() {
+  const textEl = document.getElementById("reminder-text");
+  const minEl = document.getElementById("reminder-min");
+  if (!textEl || !minEl) return;
+  const text = textEl.value.trim();
+  const mins = parseInt(minEl.value, 10);
+  if (!text || !mins || mins < 1) return;
+  const due = new Date(Date.now() + mins * 60 * 1000);
+  fetch("/api/reminders", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: text, trigger_time: due.toISOString() }),
+  })
+    .then(() => {
+      textEl.value = "";
+    })
+    .catch((e) => console.warn("[JARVIS] Reminder add failed:", e));
+}
+
+const reminderTextEl = document.getElementById("reminder-text");
+const reminderAddBtn = document.getElementById("reminder-add");
+if (reminderTextEl) {
+  reminderTextEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitReminder();
+  });
+}
+if (reminderAddBtn) reminderAddBtn.addEventListener("click", submitReminder);
+
+// Re-render every 30s so "in 5m" labels stay current
+setInterval(renderReminders, 30000);
+loadReminders();
+
+// ── Calendar ──────────────────────────────────────────────────────────────
+
+let calendarCache = [];
+
+function loadCalendar() {
+  fetch("/api/calendar/upcoming?hours=24")
+    .then((r) => r.json())
+    .then(({ events, authenticated }) => {
+      const list = document.getElementById("calendar-list");
+      if (!list) return;
+      if (!authenticated) {
+        list.innerHTML = '<div class="calendar-empty">Calendar not connected.</div>';
+        return;
+      }
+      calendarCache = events || [];
+      renderCalendar();
+    })
+    .catch(() => {});
+}
+
+function renderCalendar() {
+  const list = document.getElementById("calendar-list");
+  if (!list) return;
+  if (calendarCache.length === 0) {
+    list.innerHTML = '<div class="calendar-empty">Nothing in the next 24h.</div>';
+    return;
+  }
+  const now = new Date();
+  list.innerHTML = "";
+  calendarCache.forEach((e) => {
+    const start = e.start ? new Date(e.start) : null;
+    const row = document.createElement("div");
+    row.className = "calendar-row";
+    const minutesAway = start ? (start - now) / 60000 : Infinity;
+    if (minutesAway > 0 && minutesAway < 60) row.classList.add("soon");
+    const when = start ? formatCalendarWhen(start, now) : "—";
+    row.innerHTML = `
+      <div class="calendar-when">${when}</div>
+      <div class="calendar-title">${escapeHtml(e.title || "(untitled)")}</div>
+    `;
+    list.appendChild(row);
+  });
+}
+
+function formatCalendarWhen(when, now) {
+  const sameDay = when.toDateString() === now.toDateString();
+  const opts = { hour: "2-digit", minute: "2-digit", hour12: false };
+  if (sameDay) return when.toLocaleTimeString("en-US", opts);
+  // Tomorrow / further
+  const tomorrow = new Date(now); tomorrow.setDate(tomorrow.getDate() + 1);
+  if (when.toDateString() === tomorrow.toDateString()) {
+    return "tmrw " + when.toLocaleTimeString("en-US", opts);
+  }
+  return when.toLocaleString("en-US", { month: "short", day: "numeric", ...opts });
+}
+
+setInterval(loadCalendar, 5 * 60 * 1000);  // refresh every 5 min
+loadCalendar();
 
 // ── Init ──────────────────────────────────────────────────────────────────
 
