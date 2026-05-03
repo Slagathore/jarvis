@@ -25,8 +25,12 @@ htmlcov/
 logs/
 data/*.log
 data/jarvis.db
+data/jarvis.db-*
 data/*.sqlite
 data/*.sqlite3
+data/debug/
+data/google_token.json
+data/google_credentials.json
 data/test_frame_*.jpg
 
 # Local config / secrets
