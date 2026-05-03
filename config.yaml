@@ -120,6 +120,7 @@ context:
   pc_poll_interval_seconds: 10
   audio_classify_window_seconds: 3
   posture_analysis_fps: 1
+  os_idle_away_seconds: 600      # PCMonitor overrides activity to "away" after this many idle seconds (no kbd/mouse)
 
 vision:
   # Mean absolute pixel difference (0-255 grayscale, blurred + downscaled) above
@@ -180,6 +181,10 @@ memory:
   db_path: "data/jarvis.db"
   max_conversation_turns: 20
   room_baseline_update_hours: 24
+  prompt_memory_events: 8        # how many recent non-speech events to inject as system-prompt context
+  eod_summary_hour: 23           # local hour to generate end-of-day summary
+  eod_summary_minute: 0
+  eod_summary_speak: false       # set true to have Jarvis speak the summary out loud at EOD
 
 reminders:
   poll_interval_seconds: 30   # How often the scheduler checks for due reminders

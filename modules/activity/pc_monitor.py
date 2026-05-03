@@ -50,10 +50,12 @@ win32process = None
 
 try:
     import psutil
+    import win32api
     import win32gui
     import win32process
     _WIN32_AVAILABLE = True
 except ImportError:
+    win32api = None  # type: ignore[assignment]
     _WIN32_AVAILABLE = False
     logger.warning("[PCMonitor] win32gui/psutil not available — PC monitor disabled")
 
@@ -81,6 +83,13 @@ class PCMonitor:
 
         self._default_activity: str = "idle"
 
+        # OS-level idle threshold: above this many seconds with no keyboard or
+        # mouse input the activity is overridden to "away" regardless of what
+        # window is focused. A locked or unattended PC running Spotify
+        # shouldn't read as "browsing_general" forever.
+        ctx_cfg = config.get("context", {}) if isinstance(config.get("context"), dict) else {}
+        self._away_idle_seconds: int = int(ctx_cfg.get("os_idle_away_seconds", 600))
+
     def get_signal(self) -> dict:
         """
         Blocking call to read the current active window.
@@ -98,6 +107,24 @@ class PCMonitor:
             # reasonable interruptibility score.
             logger.debug(f"[PCMonitor] Error reading active window: {e}")
             return self._idle_signal()
+
+        # OS idle override — if the keyboard and mouse have been quiet for a
+        # while, Cole is away regardless of which window is "focused". A
+        # background Spotify or browser tab shouldn't keep activity at
+        # "browsing_general" overnight.
+        idle_seconds = self._os_idle_seconds()
+        if idle_seconds is not None and idle_seconds >= self._away_idle_seconds:
+            return {
+                "activity":     "away",
+                "process_name": process_name,
+                "window_title": window_title,
+                "confidence":   0.95,
+                "context": {
+                    "process_name": process_name,
+                    "window_title": window_title,
+                    "os_idle_seconds": int(idle_seconds),
+                },
+            }
 
         activity, confidence = self._classify_activity(process_name, window_title)
 
@@ -196,6 +223,26 @@ class PCMonitor:
                 return activity, 0.75
 
         return self._default_activity, 0.4
+
+    @staticmethod
+    def _os_idle_seconds() -> Optional[float]:
+        """
+        Return seconds since the last keyboard or mouse input, or None if
+        unavailable (non-Windows, pywin32 missing, or call failed).
+        Uses GetLastInputInfo + GetTickCount.
+        """
+        if not _WIN32_AVAILABLE or win32api is None:
+            return None
+        try:
+            last_input = win32api.GetLastInputInfo()
+            now = win32api.GetTickCount()
+            elapsed_ms = now - last_input
+            if elapsed_ms < 0:
+                # Tick count wraps every ~49 days; just report 0 if we hit it
+                return 0.0
+            return elapsed_ms / 1000.0
+        except Exception:
+            return None
 
     @staticmethod
     def _idle_signal() -> dict:

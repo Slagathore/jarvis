@@ -989,6 +989,97 @@ class Orchestrator:
             except Exception as e:
                 logger.error(f"[Curiosity] Loop error: {e}")
 
+    async def _eod_summary_loop(self) -> None:
+        """
+        Once per day at the configured time, ask the LLM to summarise the day's
+        events and persist the result to the events table as 'daily_summary'.
+        Optionally speak it (off by default — late-night TTS startle is real).
+        """
+        mem_cfg = self.config.get("memory", {}) if isinstance(self.config.get("memory"), dict) else {}
+        summary_hour = int(mem_cfg.get("eod_summary_hour", 23))
+        summary_minute = int(mem_cfg.get("eod_summary_minute", 0))
+        speak_summary = bool(mem_cfg.get("eod_summary_speak", False))
+
+        last_summary_date = None
+        logger.info(
+            f"[Summary] EOD loop started (fires daily at {summary_hour:02d}:{summary_minute:02d})"
+        )
+        while True:
+            try:
+                await asyncio.sleep(60)
+                now = datetime.now()
+                if (now.hour, now.minute) >= (summary_hour, summary_minute):
+                    today = now.date()
+                    if last_summary_date != today:
+                        last_summary_date = today
+                        await self._generate_daily_summary(today, speak=speak_summary)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[Summary] EOD loop error: {e}")
+
+    async def _generate_daily_summary(self, target_date, speak: bool = False) -> None:
+        """Generate and persist an LLM-written summary for one day."""
+        from datetime import datetime as _dt, timedelta as _td
+        if self.db is None or self.llm is None:
+            return
+        start = _dt.combine(target_date, _dt.min.time())
+        end = start + _td(days=1)
+        try:
+            rows = await self.db.fetchall(
+                "SELECT timestamp, type, room, content FROM events "
+                "WHERE timestamp >= ? AND timestamp < ? "
+                "  AND type != 'daily_summary' "
+                "ORDER BY timestamp ASC",
+                (start.isoformat(), end.isoformat()),
+            )
+        except Exception as e:
+            logger.warning(f"[Summary] event fetch failed: {e}")
+            return
+        if not rows:
+            logger.info(f"[Summary] No events for {target_date} — skipping")
+            return
+
+        # Cap the digest size so we don't blow the prompt budget on a busy day.
+        # 200 events with ~120 chars each is ~24KB which fits comfortably.
+        lines = []
+        for r in rows[:200]:
+            ts = (r["timestamp"] or "")[:19]
+            content = (r["content"] or "").strip()[:140]
+            lines.append(f"[{ts}] {r['room']}/{r['type']}: {content}")
+        digest = "\n".join(lines)
+
+        summary = await self._compose_in_character(
+            prompt=(
+                f"Below is a chronological log of everything Jarvis recorded on "
+                f"{target_date.isoformat()} ({len(rows)} events). Write a 2-4 "
+                f"sentence end-of-day summary in your usual voice — what Cole "
+                f"actually got up to, anything notable. Dry but warm. No "
+                f"preamble, no quotes, just the spoken summary.\n\n{digest}"
+            ),
+            fallback=(
+                f"Day summary for {target_date.isoformat()}: {len(rows)} events "
+                f"logged across {len({r['room'] for r in rows})} rooms."
+            ),
+        )
+        if self.event_log:
+            try:
+                await self.event_log.log_event(
+                    room="office",
+                    event_type="daily_summary",
+                    content=summary,
+                )
+            except Exception as e:
+                logger.warning(f"[Summary] persist failed: {e}")
+        logger.info(f"[Summary] Day {target_date}: {summary[:120]}...")
+        await self._broadcast({
+            "type":    "daily_summary",
+            "date":    target_date.isoformat(),
+            "summary": summary,
+        })
+        if speak:
+            await self._speak(summary, room="office", priority="ambient")
+
     async def _health_broadcast_loop(self) -> None:
         """
         Periodically checks Ollama and MQTT health, broadcasts system_health events.
@@ -1261,6 +1352,7 @@ class Orchestrator:
             self._vision_loop(),
             self._curiosity_loop(),
             self._health_broadcast_loop(),
+            self._eod_summary_loop(),
         ]
 
         # MQTT monitoring
