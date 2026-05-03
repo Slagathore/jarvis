@@ -147,10 +147,17 @@ esp32_camera:
   # connected) defaults to 10fps which is plenty for our dashboard poll.
   idle_framerate: 1fps
 
-# Expose MJPEG stream on port 8080 — Python CameraManager connects here
+# Expose camera over HTTP. Two ports:
+#   :8080 stream   — MJPEG, kept for browser/dashboard direct viewing
+#   :8081 snapshot — single JPEG per request. Python CameraManager uses this
+#                    by default because the persistent MJPEG stream periodically
+#                    terminates ("Stream ends prematurely") and short HTTP
+#                    request/response cycles are far more stable on the ESP web server.
 esp32_camera_web_server:
   - port: 8080
     mode: stream
+  - port: 8081
+    mode: snapshot
 
 # ── Status LED ────────────────────────────────────────────────────────────
 # GPIO33 is the onboard LED on AI-Thinker ESP32-CAM (active LOW)
