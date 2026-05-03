@@ -59,6 +59,10 @@ NOTABLE_CLASSES: set[str] = {
     "food", "pizza", "sandwich", "bowl",
 }
 
+# COCO classes that count as a "pet" — Jarvis surfaces these specifically so
+# downstream code can react ("cat is on the keyboard again").
+PET_CLASSES: set[str] = {"cat", "dog", "bird"}
+
 
 class ObjectDetector:
     """
@@ -174,3 +178,8 @@ class ObjectDetector:
     def has_person(detections: list[dict]) -> bool:
         """Return True if at least one person was detected."""
         return any(d["class"] == "person" for d in detections)
+
+    @staticmethod
+    def pets(detections: list[dict]) -> list[dict]:
+        """Return only the detections that are pets (cat/dog/bird)."""
+        return [d for d in detections if d.get("class") in PET_CLASSES]

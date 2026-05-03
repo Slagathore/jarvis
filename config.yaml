@@ -144,6 +144,13 @@ anomaly:
   # Min seconds between scoring a given room. Stops the LLM getting hammered.
   cooldown_seconds: 600
 
+mess:
+  # Absolute tidiness scoring (0=immaculate, 10=disaster). Independent of
+  # baseline — used for "kitchen looks unusually messy" type comments.
+  alert_threshold: 6.5
+  # 30 minutes between scores per room — tidiness changes slowly.
+  cooldown_seconds: 1800
+
 webhooks:
   # Inbound: POST /api/webhook/<name> with X-Webhook-Token header → emits a
   # 'webhook.<name>' event onto the internal bus that other modules can subscribe to.

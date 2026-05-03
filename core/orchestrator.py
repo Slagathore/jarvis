@@ -109,6 +109,7 @@ from modules.vision.anomaly_detector import AnomalyDetector
 from modules.vision.camera_manager import CameraManager
 from modules.vision.face_recognizer import FaceRecognizer
 from modules.vision.light_detector import LightDetector
+from modules.vision.mess_detector import MessDetector
 from modules.vision.object_detector import ObjectDetector
 from modules.vision.posture_analyzer import PostureAnalyzer
 from modules.vision.scene_analyzer import SceneAnalyzer
@@ -160,6 +161,7 @@ class Orchestrator:
         self.scene_analyzer: Optional[SceneAnalyzer] = None
         self.face_recognizer: Optional[FaceRecognizer] = None
         self.anomaly_detector: Optional[AnomalyDetector] = None
+        self.mess_detector: Optional[MessDetector] = None
 
         self.mqtt: Optional[MQTTClient] = None
         self.nodes: Optional[NodeManager] = None
@@ -174,6 +176,9 @@ class Orchestrator:
         self._calendar_alerted: set[str] = set()
 
         self._current_state: ActivityState = UNKNOWN_STATE
+        # Last seen pet classes per room — used to dedup pet_seen events so a
+        # cat camped on Cole's desk doesn't fire once per minute forever.
+        self._last_pets_per_room: dict[str, list[str]] = {}
         self._wake_lock = asyncio.Lock()
         self._audio_io_active: bool = False
         self.dashboard: Optional[DashboardServer]
@@ -296,6 +301,7 @@ class Orchestrator:
         await self.object_detector.load_async()
         self.scene_analyzer = SceneAnalyzer(config=self.config, llm=self.llm)
         self.anomaly_detector = AnomalyDetector(config=self.config, llm=self.llm)
+        self.mess_detector = MessDetector(config=self.config, llm=self.llm)
 
         # Face recognition — best-effort, fine if it can't load
         if self.db is not None:
@@ -1162,6 +1168,25 @@ class Orchestrator:
                         object_summary = self.object_detector.summarize(detections)
                         person_present = self.object_detector.has_person(detections)
 
+                        # Pet detection — broadcast a discrete event so the
+                        # dashboard / curiosity engine can react. Tracking
+                        # last-seen prevents firing once per scan when a pet
+                        # is just camped out.
+                        pets_now = self.object_detector.pets(detections)
+                        pet_classes_now = sorted({p["class"] for p in pets_now})
+                        prev_pets = self._last_pets_per_room.get(room_id, [])
+                        if pet_classes_now != prev_pets:
+                            self._last_pets_per_room[room_id] = pet_classes_now
+                            if pet_classes_now:
+                                await self._broadcast({
+                                    "type": "pet_seen",
+                                    "room": room_id,
+                                    "pets": pet_classes_now,
+                                })
+                                logger.info(
+                                    f"[Vision] '{room_id}' pets: {', '.join(pet_classes_now)}"
+                                )
+
                         # Posture (for person pose context)
                         posture_result = None
                         if self.posture:
@@ -1233,6 +1258,32 @@ class Orchestrator:
                                             logger.info(
                                                 f"[Anomaly] '{room_id}' {score:.1f}/10: {reason}"
                                             )
+
+                            # Mess scoring — independent absolute tidiness check
+                            # against the current scene description (no baseline
+                            # comparison). Heavier cooldown so we don't burn LLM
+                            # calls on a steady-state room.
+                            if (
+                                self.mess_detector is not None
+                                and self.mess_detector.should_check(room_id)
+                                and last_desc
+                            ):
+                                mess_result = await self.mess_detector.score(room_id, last_desc)
+                                if mess_result is not None:
+                                    mess_score, mess_reason = mess_result
+                                    logger.debug(
+                                        f"[Mess] '{room_id}' tidiness={mess_score:.1f} reason={mess_reason!r}"
+                                    )
+                                    if mess_score >= self.mess_detector.threshold:
+                                        await self._broadcast({
+                                            "type":   "room_messy",
+                                            "room":   room_id,
+                                            "score":  mess_score,
+                                            "reason": mess_reason,
+                                        })
+                                        logger.info(
+                                            f"[Mess] '{room_id}' {mess_score:.1f}/10: {mess_reason}"
+                                        )
 
                         # Broadcast vision state — use lights_on bool directly
                         await self._broadcast({
