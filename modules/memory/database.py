@@ -77,11 +77,12 @@ CREATE TABLE IF NOT EXISTS user_routines (
 );
 
 CREATE TABLE IF NOT EXISTS reminders (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    message         TEXT    NOT NULL,
-    trigger_time    TEXT,
-    recurring       INTEGER DEFAULT 0,
-    last_triggered  TEXT
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    message            TEXT    NOT NULL,
+    trigger_time       TEXT,
+    recurring          INTEGER DEFAULT 0,        -- legacy bool flag
+    recurrence_seconds INTEGER,                  -- if set, repeat every N seconds after firing
+    last_triggered     TEXT
 );
 
 -- Indexes for common query patterns
@@ -129,6 +130,18 @@ class DatabaseManager:
 
             # Apply schema
             await conn.executescript(SCHEMA_SQL)
+
+            # Idempotent column additions for older databases. SQLite has no
+            # native ADD COLUMN IF NOT EXISTS so we just try and swallow the
+            # "duplicate column" error.
+            for migration_sql in (
+                "ALTER TABLE reminders ADD COLUMN recurrence_seconds INTEGER",
+            ):
+                try:
+                    await conn.execute(migration_sql)
+                except aiosqlite.OperationalError:
+                    pass  # column already exists
+
             await conn.commit()
             self._conn = conn
 

@@ -555,10 +555,13 @@ function reminderRow(r) {
   row.dataset.id = String(r.id);
   const due = r.trigger_time ? new Date(r.trigger_time) : null;
   const when = due ? formatRelative(due) : "—";
+  const recurLabel = r.recurrence_seconds
+    ? ` · repeats ${formatInterval(r.recurrence_seconds)}`
+    : "";
   row.innerHTML = `
     <div class="reminder-info">
       <div class="reminder-msg">${escapeHtml(r.message || "")}</div>
-      <div class="reminder-when">${when}</div>
+      <div class="reminder-when">${when}${recurLabel}</div>
     </div>
     <button class="reminder-dismiss" aria-label="Dismiss">×</button>
   `;
@@ -575,6 +578,7 @@ function addReminder(event) {
     id: event.id,
     message: event.message,
     trigger_time: event.trigger_time,
+    recurrence_seconds: event.recurrence_seconds,
   });
   renderReminders();
 }
@@ -588,6 +592,20 @@ function flashReminderFired(event) {
   // Pulse the speech card so a fired reminder is visually obvious — the
   // actual audio comes from Jarvis via the existing TTS pipeline.
   pulse("speech-card");
+}
+
+function formatInterval(secs) {
+  if (!secs) return "";
+  if (secs % 86400 === 0) {
+    const d = secs / 86400;
+    return d === 1 ? "daily" : d === 7 ? "weekly" : `every ${d} days`;
+  }
+  if (secs % 3600 === 0) {
+    const h = secs / 3600;
+    return h === 1 ? "hourly" : `every ${h}h`;
+  }
+  if (secs % 60 === 0) return `every ${secs / 60}m`;
+  return `every ${secs}s`;
 }
 
 function formatRelative(when) {
@@ -608,15 +626,19 @@ function formatRelative(when) {
 function submitReminder() {
   const textEl = document.getElementById("reminder-text");
   const minEl = document.getElementById("reminder-min");
+  const recurEl = document.getElementById("reminder-recur");
   if (!textEl || !minEl) return;
   const text = textEl.value.trim();
   const mins = parseInt(minEl.value, 10);
   if (!text || !mins || mins < 1) return;
   const due = new Date(Date.now() + mins * 60 * 1000);
+  const recur = recurEl ? parseInt(recurEl.value, 10) : 0;
+  const body = { message: text, trigger_time: due.toISOString() };
+  if (recur && recur > 0) body.recurrence_seconds = recur;
   fetch("/api/reminders", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message: text, trigger_time: due.toISOString() }),
+    body: JSON.stringify(body),
   })
     .then(() => {
       textEl.value = "";

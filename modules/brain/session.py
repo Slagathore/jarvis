@@ -129,6 +129,45 @@ class SessionManager:
             logger.debug(f"[Session] New session for room '{room}'")
         return self._sessions[room]
 
+    async def restore_from_log(self, room: str, db) -> int:
+        """
+        Hydrate the room's session from the events table so conversations
+        survive across restarts. Returns the number of turns loaded.
+
+        Reads the last `max_turns * 2` user_speech / jarvis_speech rows for
+        the room and appends them to the session as user/assistant turns in
+        chronological order. Idempotent — safe to call multiple times (turns
+        already in memory will be deduplicated by skipping if session is
+        non-empty).
+        """
+        if room in self._sessions and self._sessions[room].turns:
+            return 0  # Already populated; don't double-load on warm restart
+        try:
+            rows = await db.fetchall(
+                "SELECT timestamp, type, content FROM events "
+                "WHERE room = ? AND type IN ('user_speech', 'jarvis_speech') "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (room, self._max_turns * 2),
+            )
+        except Exception as e:
+            logger.warning(f"[Session] restore_from_log failed for '{room}': {e}")
+            return 0
+
+        if not rows:
+            return 0
+
+        session = self.get_session(room)
+        # Rows came back DESC (newest first); reverse to chronological order.
+        for row in reversed(rows):
+            role = "user" if row["type"] == "user_speech" else "assistant"
+            content = (row["content"] or "").strip()
+            if content:
+                session.turns.append({"role": role, "content": content})
+        logger.info(
+            f"[Session] Restored {len(session.turns)} turns from log for '{room}'"
+        )
+        return len(session.turns)
+
     def clear_room(self, room: str) -> None:
         """Force-clear a room's session. The next get_session() will start fresh."""
         if room in self._sessions:

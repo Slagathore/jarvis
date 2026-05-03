@@ -490,11 +490,12 @@ class Orchestrator:
             return
 
         session = self.sessions.get_session(room)
-        prompt_context = self.prompts.build(
+        prompt_context = await self.prompts.build_with_memory(
             user_text=text,
             state=self._current_state,
             session=session,
             room=room,
+            db=self.db,
         )
 
         # Tool calling: if calendar is available, give the LLM the calendar
@@ -1211,6 +1212,17 @@ class Orchestrator:
             await self._init_calendar()
         except Exception as e:
             logger.warning(f"[Init] Calendar init failed (continuing without): {e}")
+
+        # Restore conversation sessions from the event log so Jarvis remembers
+        # what was discussed before the last restart. Idempotent.
+        if self.db and self.sessions:
+            for room_cfg in self.config.get("rooms", []):
+                room_id = room_cfg.get("id")
+                if room_id:
+                    try:
+                        await self.sessions.restore_from_log(room_id, self.db)
+                    except Exception as e:
+                        logger.warning(f"[Init] Session restore for '{room_id}' failed: {e}")
 
         # Wire dashboard to config + handlers
         if self.dashboard:

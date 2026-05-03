@@ -25,7 +25,7 @@ Variables:
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from loguru import logger
 
@@ -48,6 +48,10 @@ class PromptBuilder:
             "system_prompt",
             "You are Jarvis, an ambient home AI assistant.",
         ).strip()
+        # How many recent non-speech events to surface as memory context
+        self._memory_event_limit: int = int(
+            config.get("memory", {}).get("prompt_memory_events", 8)
+        )
 
     def build(
         self,
@@ -85,6 +89,59 @@ class PromptBuilder:
 
         logger.debug(f"[Prompt] Built {len(messages)} messages for room '{room}'")
         return messages
+
+    async def build_with_memory(
+        self,
+        user_text: str,
+        state=None,
+        session=None,
+        room: str = "office",
+        db=None,
+        extras: Optional[dict] = None,
+    ) -> list[dict]:
+        """
+        Like build(), but also pulls a brief summary of recent non-speech events
+        from the database (vision descriptions, appliance state changes, etc.)
+        and injects it into the system prompt. Lets the LLM reference what's
+        been happening in the room without needing to re-derive context.
+        """
+        enriched: dict[str, Any] = dict(extras or {})
+        if db is not None:
+            memory_block = await self._fetch_recent_events(db, room)
+            if memory_block:
+                enriched["recent_events"] = memory_block
+        return self.build(
+            user_text=user_text,
+            state=state,
+            session=session,
+            room=room,
+            extras=enriched,
+        )
+
+    async def _fetch_recent_events(self, db, room: str) -> Optional[str]:
+        """
+        Pull last N non-speech events for the room — vision descriptions,
+        appliance changes, jarvis observations, etc. Excludes user_speech /
+        jarvis_speech because those are already in the conversation history.
+        """
+        try:
+            rows = await db.fetchall(
+                "SELECT timestamp, type, content FROM events "
+                "WHERE room = ? AND type NOT IN ('user_speech', 'jarvis_speech') "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (room, self._memory_event_limit),
+            )
+        except Exception as e:
+            logger.debug(f"[Prompt] memory fetch failed: {e}")
+            return None
+        if not rows:
+            return None
+        lines = ["Recent room events (newest first, for context only — don't recite):"]
+        for r in rows:
+            content = (r["content"] or "")[:140]
+            ts = (r["timestamp"] or "")[:19]
+            lines.append(f"  [{ts}] {r['type']}: {content}")
+        return "\n".join(lines)
 
     def _build_system(
         self,

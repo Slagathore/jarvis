@@ -241,12 +241,21 @@ class DashboardServer:
                 trigger_time = datetime.fromisoformat(trigger_iso)
             except ValueError:
                 raise HTTPException(status_code=400, detail="trigger_time must be ISO 8601")
-            rid = await store.add(message, trigger_time)
+            recurrence_seconds = body.get("recurrence_seconds")
+            if recurrence_seconds is not None:
+                try:
+                    recurrence_seconds = int(recurrence_seconds)
+                    if recurrence_seconds <= 0:
+                        recurrence_seconds = None
+                except (TypeError, ValueError):
+                    recurrence_seconds = None
+            rid = await store.add(message, trigger_time, recurrence_seconds=recurrence_seconds)
             await self.broadcast({
-                "type":         "reminder_added",
-                "id":           rid,
-                "message":      message,
-                "trigger_time": trigger_time.isoformat(),
+                "type":               "reminder_added",
+                "id":                 rid,
+                "message":            message,
+                "trigger_time":       trigger_time.isoformat(),
+                "recurrence_seconds": recurrence_seconds,
             })
             return JSONResponse({"id": rid, "ok": True})
 
