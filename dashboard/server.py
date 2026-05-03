@@ -404,6 +404,55 @@ class DashboardServer:
             await self.broadcast({"type": "face_enrolled", "name": name})
             return JSONResponse({"ok": True, "name": name})
 
+        @app.get("/api/config")
+        async def get_config_yaml():
+            """Return the raw config.yaml text so the dashboard can edit it."""
+            from pathlib import Path as _Path
+            cfg_path = _Path(__file__).parent.parent / "config.yaml"
+            if not cfg_path.exists():
+                raise HTTPException(status_code=404, detail="config.yaml not found")
+            try:
+                return JSONResponse({"path": str(cfg_path), "yaml": cfg_path.read_text(encoding="utf-8")})
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"read failed: {e}")
+
+        @app.post("/api/config")
+        async def save_config_yaml(request: Request):
+            """
+            Persist the dashboard-edited config.yaml back to disk. Most config
+            changes only take effect on next restart — we don't try to hot-reload
+            because that would require careful re-init of every module.
+            Validates that the YAML parses before writing; on parse error we
+            return 400 and don't touch the file.
+            """
+            from pathlib import Path as _Path
+            import yaml as _yaml
+            body = await request.json()
+            new_yaml = str(body.get("yaml", ""))
+            if not new_yaml.strip():
+                raise HTTPException(status_code=400, detail="empty yaml")
+            try:
+                parsed = _yaml.safe_load(new_yaml)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"yaml parse error: {e}")
+            if not isinstance(parsed, dict):
+                raise HTTPException(status_code=400, detail="root must be a mapping")
+            cfg_path = _Path(__file__).parent.parent / "config.yaml"
+            # Backup the current file before overwrite — easy rollback if
+            # the new YAML breaks startup.
+            try:
+                if cfg_path.exists():
+                    backup = cfg_path.with_suffix(".yaml.bak")
+                    backup.write_text(cfg_path.read_text(encoding="utf-8"), encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"[Dashboard] config backup failed: {e}")
+            try:
+                cfg_path.write_text(new_yaml, encoding="utf-8")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"write failed: {e}")
+            await self.broadcast({"type": "config_saved"})
+            return JSONResponse({"ok": True, "restart_required": True})
+
         @app.delete("/api/faces/{name}")
         async def delete_face(name: str):
             fr = self._face_recognizer
