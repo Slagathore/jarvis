@@ -237,15 +237,39 @@ function updateRooms(rooms) {
         ? ""
         : `<span class="room-light ${lightsOn ? "on" : "off"}">${lightsOn ? "LIGHTS ON" : "LIGHTS OFF"}</span>`;
 
+    const feedTag = data.has_camera
+      ? `<img class="room-feed" data-room="${roomId}" alt="${roomId} feed" />`
+      : "";
+
     card.innerHTML = `
       <div class="room-name">${roomId.replace(/_/g, " ").toUpperCase()}</div>
+      ${feedTag}
       <div class="room-status">${data.person_present ? "● Person detected" : "○ Empty"}</div>
       <div class="room-meta">${escapeHtml(data.description || "No camera data yet")}</div>
       ${lightLabel}
     `;
     grid.appendChild(card);
   });
+
+  refreshRoomFeeds();
 }
+
+// ── Camera feed refresh ───────────────────────────────────────────────────
+// Poll-style refresh: cheaper than MJPEG long-poll, gracefully degrades when
+// the snapshot endpoint 404s (rooms without cameras hide the <img>).
+function refreshRoomFeeds() {
+  const imgs = document.querySelectorAll("img.room-feed");
+  const stamp = Date.now();
+  imgs.forEach((img) => {
+    const room = img.dataset.room;
+    if (!room) return;
+    img.onerror = () => img.classList.add("dead");
+    img.onload = () => img.classList.remove("dead");
+    img.src = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?t=${stamp}`;
+  });
+}
+
+setInterval(refreshRoomFeeds, 2000);
 
 function updateRoomVision(roomId, data) {
   roomsCache[roomId] = Object.assign({}, roomsCache[roomId] || {}, data);

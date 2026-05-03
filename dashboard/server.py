@@ -35,7 +35,6 @@ Endpoints:
 
 #todo: Add authentication (simple token header) to prevent unauthorized dashboard access
 #todo: Add event replay buffer — allow catching up on missed events after reconnect
-#todo: Add room camera MJPEG streaming endpoint /api/camera/{room}
 #todo: Add REST API to manually set Jarvis DND mode from the dashboard
 """
 
@@ -46,10 +45,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
+
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None
+    _CV2_AVAILABLE = False
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -67,6 +73,8 @@ class DashboardServer:
         self._voice_handler = None  # Callable[[str], Awaitable] for runtime voice switching
         self._available_voices: list = []
         self._active_voice: str = ""
+        self._camera_manager = None  # Set by orchestrator via register_camera_manager()
+        self._camera_jpeg_quality = 70
 
         self._setup_routes()
 
@@ -110,6 +118,14 @@ class DashboardServer:
         self._voice_handler = handler
         self._available_voices = voices
         self._active_voice = active
+
+    def register_camera_manager(self, camera_manager) -> None:
+        """Wire the orchestrator's CameraManager so /api/camera/{room}/snapshot.jpg works."""
+        self._camera_manager = camera_manager
+        rooms = camera_manager.get_available_rooms() if camera_manager else []
+        for room_id in rooms:
+            self._state["rooms"].setdefault(room_id, {})
+            self._state["rooms"][room_id]["has_camera"] = True
 
     def _setup_routes(self):
         app = self.app
@@ -188,6 +204,28 @@ class DashboardServer:
                 asyncio.create_task(self._voice_handler(voice))
                 self._active_voice = voice
             return JSONResponse({"ok": True, "voice": voice})
+
+        @app.get("/api/camera/{room}/snapshot.jpg")
+        async def camera_snapshot(room: str):
+            """Single-frame JPEG snapshot of a room's camera. Browser polls this."""
+            if not _CV2_AVAILABLE or cv2 is None:
+                raise HTTPException(status_code=503, detail="OpenCV not available")
+            cm = self._camera_manager
+            if cm is None:
+                raise HTTPException(status_code=503, detail="Camera manager not registered")
+            if room not in cm.get_available_rooms():
+                raise HTTPException(status_code=404, detail=f"No camera for '{room}'")
+            frame = await cm.capture_frame_async(room)
+            if frame is None:
+                raise HTTPException(status_code=502, detail="Frame capture failed")
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self._camera_jpeg_quality])
+            if not ok:
+                raise HTTPException(status_code=500, detail="JPEG encode failed")
+            return Response(
+                content=buf.tobytes(),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "no-store"},
+            )
 
     async def broadcast(self, event: dict):
         """

@@ -259,11 +259,20 @@ class MQTTClient:
         and forward relevant node events to the event bus.
         """
         try:
-            # Try to decode JSON payload
+            # Decode payload: prefer JSON, fall back to UTF-8 text, only keep raw
+            # bytes for genuinely binary topics (audio streams). Without the text
+            # fallback, plain string statuses like "online" arrive as bytes and
+            # break downstream isinstance(data, str) checks.
+            data: Any
             try:
-                data = json.loads(payload.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                data = payload  # Keep as bytes for audio payloads
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                data = payload
+            else:
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    data = text
 
             # Dispatch to registered handlers
             for pattern, handler in self._subscriptions.items():

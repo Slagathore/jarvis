@@ -45,8 +45,11 @@ from typing import Optional
 
 from loguru import logger
 
-# Seconds without heartbeat before a node is considered offline
-NODE_STALE_SECONDS: float = 30.0
+# Seconds without heartbeat before a node is considered offline.
+# ESPHome firmware publishes status every 15s via interval automation; the broker
+# also fires the LWT instantly on ungraceful disconnect. 90s gives ~6 missed
+# heartbeats of slack before we call it dead.
+NODE_STALE_SECONDS: float = 90.0
 
 
 @dataclass

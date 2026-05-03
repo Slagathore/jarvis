@@ -451,8 +451,11 @@ class Orchestrator:
 
                 if self.posture and self.cameras:
                     rooms = self.cameras.get_available_rooms()
-                    if "office" in rooms:
-                        frame = await self.cameras.capture_frame_async("office")
+                    # Posture / sleep observations come from the camera pointed at Cole's
+                    # desk (the USB webcam), not the ESP32 node camera which may be aimed
+                    # elsewhere in the room.
+                    if "office_cam" in rooms:
+                        frame = await self.cameras.capture_frame_async("office_cam")
                         if frame is not None:
                             posture_result = await self.posture.analyze_async(frame)
                             signals["posture"] = {
@@ -463,14 +466,14 @@ class Orchestrator:
                             sleep_tracker = self.sleep_tracker
                             if sleep_tracker is not None:
                                 lights_on = (
-                                    self.light_detector.last_state("office")
+                                    self.light_detector.last_state("office_cam")
                                     if self.light_detector
                                     else None
                                 )
                                 sleep_tracker.update(
                                     posture=posture_result,
                                     lights_on=lights_on,
-                                    room="office",
+                                    room="office_cam",
                                 )
                                 sleep_signal = sleep_tracker.get_sleep_signal()
                                 if sleep_signal:
@@ -838,6 +841,8 @@ class Orchestrator:
                     voices=self.tts.available_voices(),
                     active=self.tts._active_voice,
                 )
+            if self.cameras:
+                self.dashboard.register_camera_manager(self.cameras)
 
         # Register event handlers
         self._register_event_handlers()
