@@ -115,14 +115,17 @@ rooms:
     speaker_sink: "local"     # PC mic + PC speakers live here
     fps_active: 30            # local webcam, full 30fps capture
     fps_idle: 30
-  - id: "living_room"
-    display_name: "Living Room"
+  - id: "laundry_room"
+    display_name: "Laundry Room"
     camera_source: null
-    has_node: true             # ESP32-CAM node (was previously labelled "office")
+    has_node: true             # ESP32-CAM node (repurposed: office → living_room → laundry_room)
     node_ip: "192.168.1.101"
     speaker_sink: "node"
     fps_active: 5
     fps_idle: 1
+  # main rooms (living_room, bedroom, kitchen, etc.) will be served by the
+  # Wyze v2 cam adapter that Cole is building — register them here once that
+  # adapter lands so CameraManager + identity_manager see them as rooms.
   - id: "bedroom"
     display_name: "Bedroom"
     camera_source: null
