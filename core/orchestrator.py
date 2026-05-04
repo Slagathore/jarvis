@@ -120,6 +120,7 @@ from modules.identity.identity_manager import IdentityManager
 from modules.voice.stt import WhisperSTT
 from modules.voice.tts import PiperTTS
 from modules.voice.wake_word import WakeWordDetector
+from modules.voice.wake_source import WakeSourceManager
 
 
 class Orchestrator:
@@ -133,6 +134,11 @@ class Orchestrator:
         self.room_baselines: Optional[RoomBaselines] = None
 
         self.wake: Optional[WakeWordDetector] = None
+        # Multi-room wake registry. PC mic continues to flow through `self.wake`
+        # (no behavior change). Additional sources — Wyze cam mic streams,
+        # ESP node mic publishes — register against this manager so they fire
+        # room-tagged 'voice.wake_detected' events on detection.
+        self.wake_sources: Optional[WakeSourceManager] = None
         self.stt: Optional[WhisperSTT] = None
         self.tts: Optional[PiperTTS] = None
         self.speaker_id: Optional[SpeakerIdentifier] = None
@@ -196,6 +202,16 @@ class Orchestrator:
         self._active_user_room: str = "office"
         self._wake_lock = asyncio.Lock()
         self._audio_io_active: bool = False
+        # Continuous-conversation follow-up listener: after each conversation
+        # TTS reply, we open a window where the user can speak again without
+        # re-saying the wake word. Depth cap stops runaway chains.
+        self._followup_depth: int = 0
+        self._followup_max_depth: int = 3
+        # Live conversational enrollment state machine. When set, the next
+        # follow-up listen captures a name claim (instead of being processed
+        # as a normal turn) and seeds a new person from the original audio +
+        # the active room's camera frame.
+        self._pending_live_enroll: Optional[dict] = None
         self.dashboard: Optional[DashboardServer]
 
         # Dashboard
@@ -248,6 +264,11 @@ class Orchestrator:
         self.wake = WakeWordDetector(config=self.config, bus=self.bus)
         await asyncio.to_thread(self.wake.load)
         logger.info("[Init] Wake word detector ready")
+
+        # Multi-room wake registry — empty today, populated by Wyze cam adapter
+        # and ESP node mic firmware once those land. Started when the run loop
+        # spins up so any sources registered between init and start are picked up.
+        self.wake_sources = WakeSourceManager(config=self.config, bus=self.bus)
 
         # Speaker identification — best-effort, fine if it fails to load
         if self.db is not None:
@@ -492,6 +513,9 @@ class Orchestrator:
                         fixed_duration_seconds=float(
                             recording_cfg.get("fixed_duration_seconds", 7.0)
                         ),
+                        adaptive_noise_floor=recording_cfg.get(
+                            "adaptive_noise_floor", True
+                        ),
                     )
                 finally:
                     # Always release the mic, even on exception
@@ -576,11 +600,13 @@ class Orchestrator:
                 # the next vision tick can opportunistically verify the face for
                 # this person (drift refresh).
                 speaker_name: Optional[str] = None
+                identified = False
                 if self.identity is not None:
                     try:
                         match = await self.identity.identify_voice(audio_data)
                         if match is not None:
                             speaker_name = match.name
+                            identified = True
                             ambig = " (ambiguous)" if match.is_ambiguous else ""
                             logger.info(
                                 f"[Identity/voice] '{match.name}' "
@@ -591,6 +617,32 @@ class Orchestrator:
                             logger.debug("[Identity/voice] no match — sample queued in pending")
                     except Exception as e:
                         logger.debug(f"[Identity/voice] identify failed: {e}")
+
+                # Live conversational enrollment: voice didn't match anyone but
+                # they actually said something. Ask them who they are; the
+                # follow-up listener will catch the reply, extract the name,
+                # and seed a person row with this original audio + camera face.
+                if (
+                    not identified
+                    and self.identity is not None
+                    and self._pending_live_enroll is None
+                ):
+                    self._pending_live_enroll = {
+                        "audio": audio_data,
+                        "room": room,
+                        "first_transcript": transcript,
+                    }
+                    question = await self._compose_in_character(
+                        prompt=(
+                            "You just heard a voice you don't recognize. They "
+                            "said: " + repr(transcript) + ". Ask, in one short "
+                            "in-character line, what you should call them. No "
+                            "preamble, no quotes."
+                        ),
+                        fallback="I don't think we've met — what should I call you?",
+                    )
+                    await self._speak(question, room=room, priority="conversation")
+                    return
 
                 await self._process_user_text(transcript, room, speaker=speaker_name)
 
@@ -1756,6 +1808,227 @@ class Orchestrator:
                 return sink if sink in ("local", "node") else "local"
         return "local"
 
+    # ── Continuous-conversation follow-up listener ─────────────────────────
+
+    async def _listen_followup(self, room: str) -> None:
+        """
+        Open a short listen window after a conversational reply so the user
+        can keep talking without re-saying the wake word. If they say
+        anything substantive, route it through the normal STT → identity →
+        LLM pipeline as a continuation of the same conversation. If they
+        stay quiet for the configured window, exit silently.
+
+        Also handles the live-enrollment second turn: when self._pending_live_enroll
+        is set, the captured reply is treated as a name claim instead of a
+        normal user turn — Jarvis extracts the name, saves the original
+        unknown-speaker audio as their first voice sample, snaps a face
+        sample if a person is in frame, and welcomes them.
+        """
+        if self._followup_depth >= self._followup_max_depth:
+            return
+        recording_cfg = self.config.get("voice", {}).get("recording", {})
+        listen_seconds = float(recording_cfg.get("follow_up_listen_seconds", 6.0))
+        if listen_seconds <= 0:
+            return
+
+        # Brief grace so reverb from our own TTS dies before we open the mic.
+        await asyncio.sleep(0.25)
+
+        async with self._wake_lock:
+            self._followup_depth += 1
+            self._audio_io_active = True
+            try:
+                from modules.voice.audio_utils import (
+                    SAMPLE_RATE,
+                    record_until_silence,
+                )
+
+                if self.wake:
+                    self.wake.suspend()
+                try:
+                    record_device = (
+                        self.wake.device if self.wake else recording_cfg.get("device")
+                    )
+                    audio_data = await asyncio.to_thread(
+                        record_until_silence,
+                        silence_threshold_db=recording_cfg.get("silence_threshold_db", -45.0),
+                        silence_duration_ms=recording_cfg.get("silence_duration_ms", 600),
+                        # Cap the whole follow-up listen at listen_seconds so
+                        # we exit quickly when nobody replies.
+                        max_duration_seconds=listen_seconds,
+                        # If no speech in the first ~half of the window, bail.
+                        speech_start_timeout_seconds=max(1.5, listen_seconds * 0.6),
+                        device=record_device,
+                        mode="silence",
+                        adaptive_noise_floor=recording_cfg.get("adaptive_noise_floor", True),
+                    )
+                finally:
+                    if self.wake:
+                        self.wake.wakeup()
+
+                if audio_data is None or len(audio_data) == 0:
+                    return
+
+                # Heuristic: ignore captures that are clearly just our own
+                # TTS tail or pure ambient. We rely on speech_start_timeout
+                # above to bail when there's no real speech, so anything that
+                # gets here had energy in it.
+                duration_s = len(audio_data) / SAMPLE_RATE
+                if duration_s < 0.5:
+                    logger.debug(f"[Followup] Capture too short ({duration_s:.2f}s) — discarding")
+                    return
+
+                stt = self.stt
+                if stt is None:
+                    return
+                transcript = await asyncio.to_thread(stt.transcribe, audio_data)
+                if not transcript or not transcript.strip():
+                    logger.debug("[Followup] Empty transcript — closing window")
+                    return
+
+                logger.info(f"[Followup] Captured turn: {transcript!r}")
+
+                # Live-enroll branch: this reply is the user telling us their name.
+                if self._pending_live_enroll is not None:
+                    enroll_state = self._pending_live_enroll
+                    self._pending_live_enroll = None
+                    await self._complete_live_enroll(
+                        reply_transcript=transcript,
+                        original_audio=enroll_state["audio"],
+                        room=enroll_state["room"],
+                    )
+                    return
+
+                # Normal continuation — same identification + LLM path as a
+                # wake-driven turn, just no chime / no wake word required.
+                speaker_name: Optional[str] = None
+                if self.identity is not None:
+                    try:
+                        match = await self.identity.identify_voice(audio_data)
+                        if match is not None:
+                            speaker_name = match.name
+                            self._last_wake_audio = audio_data
+                    except Exception as e:
+                        logger.debug(f"[Followup] identify failed: {e}")
+
+                await self._process_user_text(transcript, room, speaker=speaker_name)
+
+            except Exception as e:
+                logger.warning(f"[Followup] Pipeline error: {e}")
+            finally:
+                self._audio_io_active = False
+                self._followup_depth -= 1
+
+    async def _complete_live_enroll(
+        self,
+        reply_transcript: str,
+        original_audio: Any,
+        room: str,
+    ) -> None:
+        """Second turn of live conversational enrollment.
+
+        The user just told us their name in `reply_transcript`. Extract a
+        clean first name via the LLM, persist a voice sample (using the
+        ORIGINAL audio that triggered enrollment, not the name-reply audio
+        which is too short and contains the name only), grab a face sample
+        from the active room camera if a person is in frame, and welcome
+        them by name.
+        """
+        if self.identity is None:
+            return
+
+        # LLM extraction: turn "uh, my name's, like, Jordan I guess?" into 'Jordan'.
+        # Fallback heuristic: take the longest capitalized-looking token.
+        name = await self._extract_name_from_reply(reply_transcript)
+        if not name:
+            confirmation = await self._compose_in_character(
+                prompt=(
+                    f"You couldn't make out a name from the reply: {reply_transcript!r}. "
+                    "Apologize briefly in character and ask them to try again. "
+                    "One short line, no preamble."
+                ),
+                fallback="Sorry, I didn't catch a name — try again?",
+            )
+            # Re-arm enrollment so the next reply is treated as the name retry.
+            self._pending_live_enroll = {
+                "audio": original_audio,
+                "room": room,
+                "first_transcript": "",
+            }
+            await self._speak(confirmation, room=room, priority="conversation")
+            return
+
+        # Persist voice sample from ORIGINAL audio (longer, has real speech)
+        sample_id = await self.identity.enroll_voice(
+            name, original_audio, prompt_id="live_question"
+        )
+
+        # Snap a face sample if a person is currently in frame in the active
+        # room. Best-effort — failures are silent.
+        face_saved = False
+        if self.cameras is not None:
+            try:
+                frame = await self.cameras.capture_frame_async(room)
+                if frame is not None:
+                    fid = await self.identity.enroll_face(name, frame, pose="candid")
+                    face_saved = fid is not None
+            except Exception as e:
+                logger.debug(f"[LiveEnroll] face snap failed: {e}")
+
+        await self._broadcast({
+            "type": "identity_live_enrolled",
+            "name": name,
+            "voice_ok": sample_id is not None,
+            "face_ok":  face_saved,
+        })
+
+        # Greet in character. Mention the face capture only if it happened so
+        # we don't promise something we didn't deliver.
+        face_note = (
+            " I also got a face capture so I can recognize you on camera."
+            if face_saved
+            else ""
+        )
+        greeting = await self._compose_in_character(
+            prompt=(
+                f"You just learned a new person's name is '{name}'. Greet them "
+                f"warmly in one short in-character line.{face_note} No preamble, "
+                "no quotes."
+            ),
+            fallback=f"Nice to meet you, {name}.{face_note}",
+        )
+        await self._speak(greeting, room=room, priority="conversation")
+
+    async def _extract_name_from_reply(self, reply: str) -> Optional[str]:
+        """LLM-extract a first-name from the reply. None if no plausible name."""
+        if not self.llm:
+            # Heuristic fallback: take the first capitalized token of length >= 2
+            for tok in reply.split():
+                cleaned = "".join(c for c in tok if c.isalpha())
+                if len(cleaned) >= 2 and cleaned[0].isupper():
+                    return cleaned
+            return None
+        try:
+            prompt = (
+                "Extract the person's first name from this self-introduction. "
+                "Respond with ONLY the name, no punctuation, no extra words. "
+                "If there is no clear name, respond with the literal word: NONE.\n\n"
+                f"Self-introduction: {reply!r}"
+            )
+            resp = await self.llm.chat([{"role": "user", "content": prompt}])
+            extracted = (resp or "").strip().split()
+            if not extracted:
+                return None
+            candidate = extracted[0].strip(".,;:!?'\"")
+            if not candidate or candidate.upper() == "NONE":
+                return None
+            if not candidate[0].isalpha() or len(candidate) > 32:
+                return None
+            return candidate
+        except Exception as e:
+            logger.debug(f"[LiveEnroll] name extraction failed: {e}")
+            return None
+
     # ── TTS Helper ─────────────────────────────────────────────────────────
 
     async def _speak(
@@ -1828,6 +2101,18 @@ class Orchestrator:
                 "priority": priority,
             })
 
+            # Continuous-conversation: after a conversational reply, open a
+            # short listen window so the user can keep talking without saying
+            # the wake word again. Don't chain past max depth; don't follow-up
+            # on proactive speech (curiosity/reminders/calendar/EOD).
+            if (
+                priority == "conversation"
+                and self._followup_depth < self._followup_max_depth
+            ):
+                # Fire-and-forget — _listen_followup acquires the wake lock
+                # internally so it serializes with normal wake captures.
+                asyncio.create_task(self._listen_followup(room))
+
         except Exception as e:
             logger.error(f"[TTS] Speak error: {e}")
 
@@ -1845,6 +2130,11 @@ class Orchestrator:
         """Release long-lived resources cleanly during shutdown."""
         if self.wake:
             self.wake.stop()
+        if self.wake_sources is not None:
+            try:
+                await self.wake_sources.stop()
+            except Exception as e:
+                logger.debug(f"[Shutdown] wake_sources stop failed: {e}")
 
         if self.mqtt:
             try:
@@ -1985,6 +2275,12 @@ class Orchestrator:
             tasks.append(self.mqtt.listen_forever())
         if self.nodes:
             tasks.append(self.nodes.monitor_heartbeats())
+
+        # Multi-room wake — start any pre-registered sources. The manager is
+        # safe to start with zero sources; new ones (Wyze, ESP) can register
+        # post-start and will spin up on demand.
+        if self.wake_sources is not None:
+            self.wake_sources.start()
 
         # Reminder scheduler
         if self.reminder_scheduler:

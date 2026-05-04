@@ -128,6 +128,9 @@ def record_until_silence(
     device: Optional[int | str] = None,
     mode: str = "silence",
     fixed_duration_seconds: float = 7.0,
+    adaptive_noise_floor: bool = True,
+    noise_floor_calibration_ms: int = 400,
+    noise_floor_margin_db: float = 5.0,
 ) -> np.ndarray:
     """
     Record audio from the microphone.
@@ -142,14 +145,26 @@ def record_until_silence(
                   doesn't reliably exceed any silence threshold so silence-mode
                   never starts capturing.
 
+    Adaptive noise floor (silence mode only):
+      The first noise_floor_calibration_ms of audio are treated as ambient and
+      used to compute the room's actual noise floor. The effective silence
+      threshold becomes max(silence_threshold_db, p75_calibration + margin) so
+      mics in noisy rooms (HyperX SoloCast in an office with a fan running)
+      don't read ambient noise as ongoing speech and burn the max_duration cap
+      on every utterance. Set adaptive_noise_floor=False to use the static
+      threshold only.
+
     Args:
-        silence_threshold_db:        (silence mode) Level below which a block is silent (dBFS).
-        silence_duration_ms:         (silence mode) Consecutive ms of silence before stopping.
-        max_duration_seconds:        (silence mode) Absolute recording time limit.
-        speech_start_timeout_seconds:(silence mode) Stop early if no speech in this time.
+        silence_threshold_db:        Lower bound for the silence threshold (dBFS).
+        silence_duration_ms:         Consecutive ms of silence before stopping.
+        max_duration_seconds:        Absolute recording time limit.
+        speech_start_timeout_seconds:Stop early if no speech in this time.
         device:                      sounddevice device index or name. None = system default.
         mode:                        "silence" or "fixed".
         fixed_duration_seconds:      (fixed mode) How long to record.
+        adaptive_noise_floor:        Auto-tune the silence threshold from ambient.
+        noise_floor_calibration_ms:  How long to sample ambient before locking the threshold.
+        noise_floor_margin_db:       Speech must exceed (calibrated_floor + margin).
 
     Returns:
         Float32 numpy array, shape (N,), at SAMPLE_RATE Hz.
@@ -189,7 +204,7 @@ def record_until_silence(
         logger.debug(f"[Audio] Captured {len(audio) / SAMPLE_RATE:.2f}s ({len(frames_collected)} blocks, fixed)")
         return audio
 
-    # Silence-detection mode (legacy behavior)
+    # Silence-detection mode (legacy behavior + adaptive noise floor)
     silence_blocks_needed = int(
         (silence_duration_ms / 1000.0) * SAMPLE_RATE / CHUNK_FRAMES
     )
@@ -200,6 +215,13 @@ def record_until_silence(
             1,
             int(speech_start_timeout_seconds * SAMPLE_RATE / CHUNK_FRAMES),
         )
+
+    calibration_blocks = max(
+        1, int(noise_floor_calibration_ms / 1000.0 * SAMPLE_RATE / CHUNK_FRAMES)
+    )
+    calibration_levels: list[float] = []
+    effective_threshold_db: float = silence_threshold_db
+    threshold_locked: bool = not adaptive_noise_floor
 
     silence_block_count = 0
     speech_started = False  # Don't stop on pre-speech silence
@@ -230,7 +252,31 @@ def record_until_silence(
                 rms = float(np.sqrt(np.mean(block ** 2)))
                 level_db = db_from_rms(rms)
 
-                if level_db > silence_threshold_db:
+                # Adaptive noise floor: collect ambient RMS during the calibration
+                # window, then lock the threshold to (75th-percentile + margin).
+                # 75th-percentile (instead of max) so a stray clack doesn't
+                # poison the floor. Floor never goes BELOW the configured
+                # silence_threshold_db, so this can only RAISE the bar.
+                if not threshold_locked:
+                    calibration_levels.append(level_db)
+                    if block_count >= calibration_blocks:
+                        ambient_p75 = float(
+                            np.percentile(calibration_levels, 75)
+                        )
+                        adaptive_db = ambient_p75 + noise_floor_margin_db
+                        effective_threshold_db = max(
+                            silence_threshold_db, adaptive_db
+                        )
+                        threshold_locked = True
+                        logger.debug(
+                            f"[Audio] Noise floor calibrated: ambient_p75="
+                            f"{ambient_p75:.1f} dBFS → threshold="
+                            f"{effective_threshold_db:.1f} dBFS "
+                            f"(static={silence_threshold_db:.1f}, "
+                            f"adaptive={adaptive_db:.1f})"
+                        )
+
+                if level_db > effective_threshold_db:
                     # Speech detected
                     if not speech_started:
                         # Keep ~250ms of pre-roll so initial consonants are not clipped.
