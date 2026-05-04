@@ -1681,7 +1681,16 @@ class Orchestrator:
                 return
 
             routed_to_node = False
-            if self.nodes is not None and self.nodes.is_online(room):
+            # Per-room TTS routing is gated behind voice.tts.route_to_nodes
+            # because the ESP firmware doesn't play received audio_out yet —
+            # silently routing TTS to the node = Cole hears nothing. Default
+            # OFF until the firmware speaker path is implemented.
+            tts_cfg = self.config.get("voice", {}).get("tts", {})
+            if (
+                tts_cfg.get("route_to_nodes", False)
+                and self.nodes is not None
+                and self.nodes.is_online(room)
+            ):
                 routed_to_node = await self._speak_via_node(text, room)
 
             if not routed_to_node:

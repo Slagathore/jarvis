@@ -47,6 +47,11 @@ voice:
   tts:
     engine: "piper"
     active_voice: "glados"
+    # Per-room TTS routing — when true AND the room's ESP node is online, send
+    # TTS audio bytes over MQTT to the node's speaker instead of playing locally.
+    # Default OFF because the ESP firmware doesn't yet play received audio_out;
+    # turning it on would mean Jarvis appears silent until the firmware is updated.
+    route_to_nodes: false
     piper_binary: "C:/Users/Cole/CodeStuff/Misc/piper/piper.exe"
     voices:
       glados:   "C:/Users/Cole/CodeStuff/Misc/piper/voices/vits-piper-en_US-glados-high/en_US-glados-high.onnx"
