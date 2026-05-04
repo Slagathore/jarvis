@@ -150,7 +150,7 @@ class IdentityManager:
 
         async def _ensure_person(name: str) -> Optional[int]:
             row = await self._db.fetchone(
-                "SELECT id FROM persons WHERE name = ?", (name,)
+                "SELECT id FROM persons WHERE name = ? COLLATE NOCASE", (name,)
             )
             if row is not None:
                 return int(row["id"])
@@ -325,8 +325,16 @@ class IdentityManager:
     # ── enrollment (active, multi-sample) ───────────────────────────────────
 
     async def ensure_person(self, name: str) -> int:
-        """Return person_id for `name`, creating the row if needed."""
-        row = await self._db.fetchone("SELECT id FROM persons WHERE name = ?", (name,))
+        """Return person_id for `name`, creating the row if needed.
+
+        Lookup is case-insensitive — 'Cole', 'cole', and 'COLE' resolve to the
+        same person. The first-written casing is preserved as the display name.
+        Two genuinely different people with the same name need distinct display
+        labels (e.g. 'Cole' vs 'Cole S').
+        """
+        row = await self._db.fetchone(
+            "SELECT id FROM persons WHERE name = ? COLLATE NOCASE", (name,)
+        )
         if row is not None:
             return int(row["id"])
         pid = await self._db.execute(

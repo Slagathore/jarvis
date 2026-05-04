@@ -901,10 +901,24 @@ function renderPersons(persons) {
   });
 }
 
+// Cached persons list — drives the pending-review assign dropdown so it can
+// list everyone already in the system without an extra fetch per row.
+let _personsCache = [];
+
 function loadPersons() {
-  fetch("/api/identity/persons")
+  return fetch("/api/identity/persons")
     .then((r) => r.json())
-    .then(({ persons }) => renderPersons(persons || []))
+    .then(({ persons }) => {
+      _personsCache = persons || [];
+      renderPersons(_personsCache);
+      // Re-render pending too, since its dropdown reads from _personsCache.
+      const pl = document.getElementById("pending-list");
+      if (pl && pl.dataset.lastItems) {
+        try {
+          renderPending(JSON.parse(pl.dataset.lastItems));
+        } catch (_) {}
+      }
+    })
     .catch(() => {});
 }
 
@@ -997,9 +1011,25 @@ function populatePersonRoomSelect() {
 
 // ── PENDING REVIEW ────────────────────────────────────────────────────────
 
+const NEW_PERSON_SENTINEL = "__new__";
+
+function _personOptions(selectedName) {
+  const sel = (selectedName || "").toLowerCase();
+  let html = "";
+  _personsCache.forEach((p) => {
+    const isSelected = p.name && p.name.toLowerCase() === sel ? "selected" : "";
+    html += `<option value="${escapeHtml(p.name)}" ${isSelected}>${escapeHtml(p.name)}</option>`;
+  });
+  html += `<option value="${NEW_PERSON_SENTINEL}">+ new person…</option>`;
+  return html;
+}
+
 function renderPending(items) {
   const el = document.getElementById("pending-list");
   if (!el) return;
+  // Cache so loadPersons() can re-render after the persons list refreshes
+  // without re-fetching pending. Lets the dropdown stay in sync hot.
+  el.dataset.lastItems = JSON.stringify(items || []);
   if (!items || items.length === 0) {
     el.innerHTML = `<div class="who-empty">No pending review items.</div>`;
     return;
@@ -1019,6 +1049,9 @@ function renderPending(items) {
     } else if (p.has_audio) {
       preview = `<audio controls class="pending-audio" src="/api/identity/pending/${p.id}/audio.wav"></audio>`;
     }
+    // Pre-select the existing person if this is a drift case, so a one-click
+    // assign actually reuses the right person row.
+    const optionsHtml = _personOptions(p.person_name);
     row.innerHTML = `
       ${preview}
       <div class="pending-meta">
@@ -1029,23 +1062,56 @@ function renderPending(items) {
               ? `<button class="dev-btn pending-confirm" data-id="${p.id}">YES, IT'S ${escapeHtml(p.person_name || "")}</button>`
               : ""
           }
-          <input type="text" class="reminder-input pending-name" placeholder="${isCluster ? "Name this person" : "Reassign to…"}" />
+          <select class="dev-select pending-select">${optionsHtml}</select>
+          <input type="text" class="reminder-input pending-name" placeholder="New person name" hidden />
           <button class="dev-btn pending-assign" data-id="${p.id}">${isCluster ? "ASSIGN" : "REASSIGN"}</button>
           <button class="dev-btn pending-reject" data-id="${p.id}">REJECT</button>
         </div>
       </div>
     `;
+    const select = row.querySelector(".pending-select");
+    const newInput = row.querySelector(".pending-name");
+    select.addEventListener("change", () => {
+      if (select.value === NEW_PERSON_SENTINEL) {
+        newInput.hidden = false;
+        newInput.focus();
+      } else {
+        newInput.hidden = true;
+        newInput.value = "";
+      }
+    });
     const confirmBtn = row.querySelector(".pending-confirm");
     if (confirmBtn) {
       confirmBtn.addEventListener("click", () => resolvePending(p.id, "confirm"));
     }
     row.querySelector(".pending-assign").addEventListener("click", () => {
-      const nameInput = row.querySelector(".pending-name");
-      const target = nameInput ? nameInput.value.trim() : "";
-      if (!target) {
-        nameInput.focus();
-        return;
+      let target = select.value;
+      if (target === NEW_PERSON_SENTINEL) {
+        target = newInput.value.trim();
+        if (!target) {
+          newInput.focus();
+          return;
+        }
+        // Warn if the user is creating a new person with a name that already
+        // exists case-insensitively — likely they meant to pick the existing
+        // entry from the dropdown.
+        const collision = _personsCache.find(
+          (pp) => pp.name && pp.name.toLowerCase() === target.toLowerCase()
+        );
+        if (collision) {
+          if (
+            !confirm(
+              `'${target}' will reuse the existing person '${collision.name}'.\n` +
+              `If this is genuinely a different person with the same name, ` +
+              `pick a distinct label first (e.g. '${target} S').\n\nProceed?`
+            )
+          ) {
+            return;
+          }
+          target = collision.name; // preserve original casing
+        }
       }
+      if (!target) return;
       resolvePending(p.id, "assign", target);
     });
     row.querySelector(".pending-reject").addEventListener("click", () => resolvePending(p.id, "reject"));
