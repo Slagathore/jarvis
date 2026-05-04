@@ -92,6 +92,7 @@ class CameraManager:
         for room_cfg in self._rooms_config:
             room_id = room_cfg.get("id", "unknown")
             source = room_cfg.get("camera_source")
+            fps_active = room_cfg.get("fps_active")  # may be None — caller passes through to cv2.set
 
             # ESP32-CAM nodes get the snapshot URL on port 8081
             if source is None and room_cfg.get("has_node", False):
@@ -116,7 +117,7 @@ class CameraManager:
                 continue
 
             # Local USB device (int) — keep cv2.VideoCapture path
-            await self._open_local_device(room_id, source)
+            await self._open_local_device(room_id, source, fps_active)
 
         if not self._caps and not self._http_urls:
             logger.warning("[CameraManager] No cameras available")
@@ -134,7 +135,12 @@ class CameraManager:
         logger.info(f"[CameraManager] Connected snapshot source {url} for '{room_id}'")
         return True
 
-    async def _open_local_device(self, room_id: str, source: int) -> None:
+    async def _open_local_device(
+        self,
+        room_id: str,
+        source: int,
+        fps_active: Optional[int] = None,
+    ) -> None:
         """Open a USB webcam via cv2.VideoCapture with retries (DirectShow flakiness)."""
         assert cv2 is not None
         label = str(source)
@@ -153,6 +159,20 @@ class CameraManager:
                     timeout=20.0,
                 )
                 if cap.isOpened():
+                    if fps_active is not None:
+                        try:
+                            await asyncio.to_thread(
+                                cap.set, cv2.CAP_PROP_FPS, float(fps_active)
+                            )
+                            actual = await asyncio.to_thread(cap.get, cv2.CAP_PROP_FPS)
+                            logger.info(
+                                f"[CameraManager] '{room_id}' requested {fps_active} fps, "
+                                f"driver reports {actual:.1f}"
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                f"[CameraManager] Could not set fps for '{room_id}': {e}"
+                            )
                     ok, frame = await asyncio.wait_for(
                         asyncio.to_thread(cap.read),
                         timeout=5.0,

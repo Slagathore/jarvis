@@ -103,30 +103,42 @@ rooms:
   #   "local"  → TTS plays on the PC's sound device (the machine running this script)
   #   "node"   → TTS audio is published to MQTT for the room's ESP node speaker.
   #              Falls back to local if the node isn't online or firmware can't play yet.
+  # fps_active / fps_idle:
+  #   For local USB webcams, fps_active is set via cv2 CAP_PROP_FPS at open.
+  #   For ESP nodes, fps_idle is published to jarvis/nodes/<room>/camera/fps on connect
+  #   (ESPHome's idle_framerate is capped at ~10fps in firmware regardless).
   - id: "office"
     display_name: "Office"
     camera_source: 0          # USB webcam (device index 0) at Cole's desk
     has_node: false
     node_ip: null
     speaker_sink: "local"     # PC mic + PC speakers live here
+    fps_active: 30            # local webcam, full 30fps capture
+    fps_idle: 30
   - id: "living_room"
     display_name: "Living Room"
     camera_source: null
     has_node: true             # ESP32-CAM node (was previously labelled "office")
     node_ip: "192.168.1.101"
     speaker_sink: "node"
+    fps_active: 5
+    fps_idle: 1
   - id: "bedroom"
     display_name: "Bedroom"
     camera_source: null
     has_node: false
     node_ip: null
     speaker_sink: "local"
+    fps_active: 5
+    fps_idle: 1
   - id: "kitchen"
     display_name: "Kitchen"
     camera_source: null
     has_node: false
     node_ip: null
     speaker_sink: "local"
+    fps_active: 5
+    fps_idle: 1
 
 context:
   vision_scan_interval_minutes: 1

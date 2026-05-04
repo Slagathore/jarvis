@@ -79,6 +79,9 @@ class NodeManager:
 
         # Initialize node records from rooms config
         self._nodes: dict[str, NodeInfo] = {}
+        # Per-room desired FPS, published on connect so the firmware's
+        # set_idle_update_interval lambda picks it up.
+        self._room_fps_idle: dict[str, int] = {}
         for room_cfg in config.get("rooms", []):
             room_id = room_cfg.get("id", "unknown")
             if room_cfg.get("has_node", False):
@@ -86,6 +89,9 @@ class NodeManager:
                     room=room_id,
                     ip_address=room_cfg.get("node_ip"),
                 )
+            fps_idle = room_cfg.get("fps_idle")
+            if isinstance(fps_idle, (int, float)) and fps_idle > 0:
+                self._room_fps_idle[room_id] = int(fps_idle)
 
     async def load(self) -> None:
         """Register MQTT subscriptions for node status topics."""
@@ -177,6 +183,18 @@ class NodeManager:
 
         if not was_online:
             logger.info(f"[NodeManager] Node '{room}' came online (IP: {node.ip_address})")
+            # Push the configured idle FPS to the node so its camera frame rate
+            # matches what's in config.yaml (firmware default is 1fps idle).
+            fps_idle = self._room_fps_idle.get(room)
+            if fps_idle:
+                topic = f"jarvis/nodes/{room}/camera/fps"
+                try:
+                    await self._mqtt.publish(topic, str(fps_idle), qos=0)
+                    logger.info(
+                        f"[NodeManager] Set '{room}' camera idle fps to {fps_idle}"
+                    )
+                except Exception as e:
+                    logger.debug(f"[NodeManager] FPS publish to '{room}' failed: {e}")
 
     async def monitor_heartbeats(self) -> None:
         """
