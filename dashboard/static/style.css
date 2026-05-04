@@ -722,6 +722,117 @@ main {
   min-height: 12px;
 }
 
+/* ── PEOPLE (Identity v2) ─────────────────────────────────────────────────── */
+.person-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 12px;
+}
+.person-row .who-name { flex: 1; color: var(--text); }
+.person-counts {
+  display: flex;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.person-counts span {
+  background: var(--bg-card);
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+.person-row .who-delete {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 2px;
+  padding: 1px 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  cursor: pointer;
+}
+.person-row .who-delete:hover { border-color: var(--red); color: var(--red); }
+
+.enroll-wizard { margin-top: 8px; }
+.enroll-row-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--text-dim);
+  margin: 8px 0 4px;
+}
+.enroll-poses {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+}
+.pose-btn { font-size: 10px; }
+.enroll-prompts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.voice-prompt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.voice-arm-btn { min-width: 56px; font-size: 10px; }
+.voice-prompt-text { color: var(--text-dim); font-style: italic; }
+
+/* ── Pending review ───────────────────────────────────────────────────────── */
+.pending-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.pending-row {
+  display: flex;
+  gap: 8px;
+  padding: 6px;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.pending-thumb {
+  width: 80px;
+  height: 80px;
+  object-fit: cover;
+  border-radius: 2px;
+  background: #000;
+  flex-shrink: 0;
+}
+.pending-audio { width: 200px; flex-shrink: 0; }
+.pending-meta {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.pending-hint {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.pending-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+.pending-actions .reminder-input { flex: 1; min-width: 100px; font-size: 11px; }
+.pending-actions .dev-btn { font-size: 10px; }
+.pending-confirm { background: var(--bg-card); border-color: var(--green, #4ade80); }
+.pending-reject:hover { border-color: var(--red); color: var(--red); }
+
 /* ── Calendar ─────────────────────────────────────────────────────────────── */
 .calendar-list {
   display: flex;

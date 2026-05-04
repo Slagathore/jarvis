@@ -81,6 +81,7 @@ class DashboardServer:
         self._orchestrator = None     # Set by orchestrator via register_orchestrator()
         self._speaker_id = None       # Set by orchestrator via register_speaker_id()
         self._face_recognizer = None  # Set by orchestrator via register_face_recognizer()
+        self._identity = None         # Set by orchestrator via register_identity() — Identity v2
         self._webhook_manager = None  # Set by orchestrator via register_webhook_manager()
 
         self._setup_routes()
@@ -157,6 +158,11 @@ class DashboardServer:
     def register_face_recognizer(self, face_recognizer) -> None:
         """Wire FaceRecognizer so /api/faces endpoints can list/delete enrollments."""
         self._face_recognizer = face_recognizer
+
+    def register_identity(self, identity_manager) -> None:
+        """Wire the Identity v2 manager so /api/identity endpoints can drive
+        cross-modal enrollment and the pending-review queue."""
+        self._identity = identity_manager
 
     def register_webhook_manager(self, webhooks) -> None:
         """Wire WebhookManager so /api/webhook/{name} endpoints can dispatch inbound calls."""
@@ -365,7 +371,10 @@ class DashboardServer:
             name = str(body.get("name", "")).strip()
             if not name:
                 raise HTTPException(status_code=400, detail="name required")
-            orch._pending_speaker_enrollment = name
+            # Default to a single 'wake' prompt for the legacy single-button
+            # ARM. Identity v2's 3-sentence enrollment uses /api/identity/voice/arm
+            # which lets the dashboard pass an explicit prompt_id.
+            orch._pending_speaker_enrollment = (name, "wake")
             await self.broadcast({"type": "speaker_enrollment_armed", "name": name})
             return JSONResponse({"armed": True, "name": name})
 
@@ -500,6 +509,146 @@ class DashboardServer:
                 raise HTTPException(status_code=503, detail="Face recognition not available")
             ok = await fr.delete(name)
             await self.broadcast({"type": "face_deleted", "name": name})
+            return JSONResponse({"ok": ok})
+
+        # ── Identity v2 (cross-modal persons) ────────────────────────────────
+
+        @app.get("/api/identity/persons")
+        async def identity_list_persons():
+            ident = self._identity
+            if ident is None:
+                return JSONResponse({"persons": []})
+            return JSONResponse({"persons": await ident.list_persons()})
+
+        @app.post("/api/identity/face/enroll")
+        async def identity_enroll_face(request: Request):
+            """Capture a frame from the given room and enroll it as a face
+            sample for `name` with the given pose label (one of:
+            center, left, right, up, down)."""
+            ident = self._identity
+            cm = self._camera_manager
+            if ident is None or cm is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            body = await request.json()
+            name = str(body.get("name", "")).strip()
+            pose = str(body.get("pose", "center")).strip().lower()
+            room = str(body.get("room", "office"))
+            if not name:
+                raise HTTPException(status_code=400, detail="name required")
+            if pose not in ("center", "left", "right", "up", "down", "candid"):
+                raise HTTPException(status_code=400, detail="invalid pose")
+            frame = await cm.capture_frame_async(room)
+            if frame is None:
+                raise HTTPException(
+                    status_code=502, detail=f"Could not capture frame from '{room}'"
+                )
+            sample_id = await ident.enroll_face(name, frame, pose=pose)
+            if sample_id is None:
+                raise HTTPException(status_code=422, detail="No face detected in frame")
+            await self.broadcast(
+                {"type": "identity_face_enrolled", "name": name, "pose": pose}
+            )
+            return JSONResponse({"ok": True, "name": name, "pose": pose, "sample_id": sample_id})
+
+        @app.post("/api/identity/voice/arm")
+        async def identity_arm_voice(request: Request):
+            """Arm the next wake-word capture to be saved as a voice sample
+            for `name` with the given prompt_id (e.g. 'sentence_1')."""
+            orch = self._orchestrator
+            if orch is None:
+                raise HTTPException(status_code=503, detail="Orchestrator not registered")
+            body = await request.json()
+            name = str(body.get("name", "")).strip()
+            prompt_id = str(body.get("prompt_id", "wake")).strip() or "wake"
+            if not name:
+                raise HTTPException(status_code=400, detail="name required")
+            orch._pending_speaker_enrollment = (name, prompt_id)
+            await self.broadcast(
+                {
+                    "type": "identity_voice_armed",
+                    "name": name,
+                    "prompt_id": prompt_id,
+                }
+            )
+            return JSONResponse({"armed": True, "name": name, "prompt_id": prompt_id})
+
+        @app.delete("/api/identity/persons/{person_id}")
+        async def identity_delete_person(person_id: int):
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            ok = await ident.delete_person(person_id)
+            await self.broadcast({"type": "identity_person_deleted", "person_id": person_id})
+            return JSONResponse({"ok": ok})
+
+        @app.post("/api/identity/persons/{person_id}/rename")
+        async def identity_rename_person(person_id: int, request: Request):
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            body = await request.json()
+            new_name = str(body.get("name", "")).strip()
+            if not new_name:
+                raise HTTPException(status_code=400, detail="name required")
+            ok = await ident.rename_person(person_id, new_name)
+            await self.broadcast(
+                {"type": "identity_person_renamed", "person_id": person_id, "name": new_name}
+            )
+            return JSONResponse({"ok": ok, "name": new_name})
+
+        @app.get("/api/identity/pending")
+        async def identity_list_pending():
+            ident = self._identity
+            if ident is None:
+                return JSONResponse({"pending": []})
+            return JSONResponse({"pending": await ident.list_pending()})
+
+        @app.get("/api/identity/pending/{pending_id}/image.jpg")
+        async def identity_pending_image(pending_id: int):
+            from fastapi.responses import Response
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            data = await ident.get_pending_image(pending_id)
+            if data is None:
+                raise HTTPException(status_code=404, detail="No image for this pending row")
+            return Response(content=data, media_type="image/jpeg")
+
+        @app.get("/api/identity/pending/{pending_id}/audio.wav")
+        async def identity_pending_audio(pending_id: int):
+            from fastapi.responses import Response
+            import struct
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            pcm = await ident.get_pending_audio(pending_id)
+            if pcm is None:
+                raise HTTPException(status_code=404, detail="No audio for this pending row")
+            # Wrap raw PCM16 16kHz mono in a WAV header so <audio> can play it.
+            sample_rate = 16000
+            byte_rate = sample_rate * 2
+            data_size = len(pcm)
+            header = b"RIFF" + struct.pack("<I", 36 + data_size) + b"WAVE"
+            header += b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, byte_rate, 2, 16)
+            header += b"data" + struct.pack("<I", data_size)
+            return Response(content=header + pcm, media_type="audio/wav")
+
+        @app.post("/api/identity/pending/{pending_id}/resolve")
+        async def identity_resolve_pending(pending_id: int, request: Request):
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            body = await request.json()
+            action = str(body.get("action", "")).strip()
+            target_name = body.get("target_name")
+            if action not in ("confirm", "assign", "reject"):
+                raise HTTPException(status_code=400, detail="action must be confirm|assign|reject")
+            ok = await ident.resolve_pending(
+                pending_id, action, target_name=target_name
+            )
+            await self.broadcast(
+                {"type": "identity_pending_resolved", "pending_id": pending_id, "action": action}
+            )
             return JSONResponse({"ok": ok})
 
         @app.post("/api/dnd")

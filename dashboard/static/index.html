@@ -179,41 +179,63 @@
           </div>
         </div>
 
-        <!-- Who (face + voice enrollments) -->
-        <div class="card" id="who-card">
-          <div class="card-label">WHO</div>
+        <!-- People (Identity v2 — cross-modal persons with multi-sample faces + voices) -->
+        <div class="card" id="people-card">
+          <div class="card-label">PEOPLE</div>
           <div class="who-section">
-            <div class="who-section-title">FACES</div>
-            <div class="who-list" id="faces-list">
-              <div class="who-empty">No faces enrolled.</div>
-            </div>
-            <div class="who-add">
-              <input
-                type="text"
-                id="face-name"
-                class="reminder-input"
-                placeholder="Name"
-                autocomplete="off"
-              />
-              <button class="dev-btn" id="face-enroll" title="Capture office camera frame as this face">SNAP</button>
+            <div class="who-list" id="persons-list">
+              <div class="who-empty">No people enrolled.</div>
             </div>
           </div>
+
           <div class="who-section">
-            <div class="who-section-title">VOICES</div>
-            <div class="who-list" id="speakers-list">
-              <div class="who-empty">No voices enrolled.</div>
-            </div>
+            <div class="who-section-title">ADD / UPDATE PERSON</div>
             <div class="who-add">
               <input
                 type="text"
-                id="speaker-name"
+                id="person-name"
                 class="reminder-input"
                 placeholder="Name"
                 autocomplete="off"
               />
-              <button class="dev-btn" id="speaker-arm" title="Arm next wake utterance for enrollment">ARM</button>
+              <select class="dev-select" id="person-room" title="Room camera to use for face poses">
+                <option value="office">office</option>
+              </select>
             </div>
-            <div class="who-hint" id="speaker-hint"></div>
+            <div class="enroll-wizard">
+              <div class="enroll-row-label">FACE — capture each angle</div>
+              <div class="enroll-poses">
+                <button class="dev-btn pose-btn" data-pose="center">CENTER</button>
+                <button class="dev-btn pose-btn" data-pose="left">LEFT</button>
+                <button class="dev-btn pose-btn" data-pose="right">RIGHT</button>
+                <button class="dev-btn pose-btn" data-pose="up">UP</button>
+                <button class="dev-btn pose-btn" data-pose="down">DOWN</button>
+              </div>
+              <div class="enroll-row-label">VOICE — read each sentence after wake word</div>
+              <div class="enroll-prompts" id="voice-prompts">
+                <div class="voice-prompt" data-prompt-id="sentence_1">
+                  <button class="dev-btn voice-arm-btn" data-prompt-id="sentence_1">ARM 1</button>
+                  <span class="voice-prompt-text">"The quick brown fox jumps over the lazy dog."</span>
+                </div>
+                <div class="voice-prompt" data-prompt-id="sentence_2">
+                  <button class="dev-btn voice-arm-btn" data-prompt-id="sentence_2">ARM 2</button>
+                  <span class="voice-prompt-text">"She sells sea shells by the seashore."</span>
+                </div>
+                <div class="voice-prompt" data-prompt-id="sentence_3">
+                  <button class="dev-btn voice-arm-btn" data-prompt-id="sentence_3">ARM 3</button>
+                  <span class="voice-prompt-text">"How now brown cow, the rain in Spain falls mainly on the plain."</span>
+                </div>
+              </div>
+              <div class="who-hint" id="enroll-hint"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pending review (drift conflicts + unknown clusters surfaced for naming) -->
+        <div class="card" id="pending-card">
+          <div class="card-label">PENDING REVIEW</div>
+          <div class="pending-list" id="pending-list">
+            <div class="who-empty">No pending review items.</div>
           </div>
         </div>
 
@@ -272,6 +294,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=12"></script>
+    <script src="/static/app.js?v=13"></script>
   </body>
 </html>

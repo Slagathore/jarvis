@@ -116,6 +116,7 @@ from modules.vision.scene_analyzer import SceneAnalyzer
 from modules.voice.audio_focus import AudioFocus
 from modules.voice.intents import parse_dnd
 from modules.voice.speaker_id import SpeakerIdentifier
+from modules.identity.identity_manager import IdentityManager
 from modules.voice.stt import WhisperSTT
 from modules.voice.tts import PiperTTS
 from modules.voice.wake_word import WakeWordDetector
@@ -135,9 +136,10 @@ class Orchestrator:
         self.stt: Optional[WhisperSTT] = None
         self.tts: Optional[PiperTTS] = None
         self.speaker_id: Optional[SpeakerIdentifier] = None
-        # When set, the next wake-recording captured audio is enrolled as this
-        # name instead of being run through STT/LLM. Cleared after enrollment.
-        self._pending_speaker_enrollment: Optional[str] = None
+        # When set, the next wake-recording captured audio is enrolled as a
+        # voice sample for this person (instead of being run through STT/LLM).
+        # Tuple is (name, prompt_id); cleared after enrollment.
+        self._pending_speaker_enrollment: Optional[tuple[str, str]] = None
         self.audio_focus: Optional[AudioFocus] = None
 
         self.llm: Optional[OllamaLLM] = None
@@ -160,6 +162,13 @@ class Orchestrator:
         self.object_detector: Optional[ObjectDetector] = None
         self.scene_analyzer: Optional[SceneAnalyzer] = None
         self.face_recognizer: Optional[FaceRecognizer] = None
+        # Cross-modal unified identity manager — wraps speaker_id + face_recognizer
+        # and persists multiple samples per person across both modalities.
+        self.identity: Optional[IdentityManager] = None
+        # Last audio buffer captured during a wake event, used by vision loop's
+        # opportunistic verify_voice when a face is recognized after the wake.
+        # Cleared after one verify cycle.
+        self._last_wake_audio: Optional[np.ndarray] = None
         self.anomaly_detector: Optional[AnomalyDetector] = None
         self.mess_detector: Optional[MessDetector] = None
 
@@ -500,22 +509,24 @@ class Orchestrator:
                     f"(rms={db_from_rms(rms):.1f} dBFS)"
                 )
 
-                # Speaker enrollment fast-path: if dashboard set a pending name,
-                # route this capture to enroll instead of transcribe+LLM. The
-                # 5+s of audio captured by wake_word's silence detector is
-                # plenty for resemblyzer's encoder.
+                # Voice enrollment fast-path: if dashboard armed an enrollment,
+                # route this capture into IdentityManager as a voice_sample for
+                # the given name + prompt_id, instead of running STT/LLM.
                 if (
                     self._pending_speaker_enrollment is not None
-                    and self.speaker_id is not None
+                    and self.identity is not None
                 ):
-                    name = self._pending_speaker_enrollment
+                    name, prompt_id = self._pending_speaker_enrollment
                     self._pending_speaker_enrollment = None
-                    ok = await self.speaker_id.enroll(name, audio_data)
+                    sample_id = await self.identity.enroll_voice(
+                        name, audio_data, prompt_id=prompt_id
+                    )
+                    ok = sample_id is not None
                     await self._broadcast({
-                        "type":          "speaker_enrolled",
-                        "name":          name,
-                        "ok":            ok,
-                        "sample_count":  await self.speaker_id._get_sample_count(name) if ok else 0,
+                        "type":      "speaker_enrolled",
+                        "name":      name,
+                        "ok":        ok,
+                        "prompt_id": prompt_id,
                     })
                     confirmation = await self._compose_in_character(
                         prompt=(
@@ -560,24 +571,26 @@ class Orchestrator:
 
                 logger.info(f"[STT] Transcript: {transcript!r}")
 
-                # Identify the speaker from the same audio buffer. Best-effort;
-                # if identification fails or no speaker is enrolled yet, just
-                # process the text without a speaker label.
+                # Identify the speaker via the unified IdentityManager. Match on
+                # voice samples across all enrolled persons. Stash the buffer so
+                # the next vision tick can opportunistically verify the face for
+                # this person (drift refresh).
                 speaker_name: Optional[str] = None
-                speaker_sim: float = 0.0
-                if self.speaker_id is not None and self.speaker_id.is_loaded:
+                if self.identity is not None:
                     try:
-                        speaker_name, speaker_sim = await self.speaker_id.identify(audio_data)
-                        if speaker_name is not None:
+                        match = await self.identity.identify_voice(audio_data)
+                        if match is not None:
+                            speaker_name = match.name
+                            ambig = " (ambiguous)" if match.is_ambiguous else ""
                             logger.info(
-                                f"[SpeakerID] Identified as '{speaker_name}' (sim={speaker_sim:.2f})"
+                                f"[Identity/voice] '{match.name}' "
+                                f"(sim={match.similarity:.2f}){ambig}"
                             )
+                            self._last_wake_audio = audio_data
                         else:
-                            logger.debug(
-                                f"[SpeakerID] No match (best similarity={speaker_sim:.2f})"
-                            )
+                            logger.debug("[Identity/voice] no match — sample queued in pending")
                     except Exception as e:
-                        logger.debug(f"[SpeakerID] identify failed: {e}")
+                        logger.debug(f"[Identity/voice] identify failed: {e}")
 
                 await self._process_user_text(transcript, room, speaker=speaker_name)
 
@@ -1200,37 +1213,100 @@ class Orchestrator:
                         if self.posture:
                             posture_result = await self.posture.analyze_async(frame)
 
-                        # Face recognition — only bother if YOLO actually saw a person
+                        # Face recognition — only bother if YOLO actually saw a person.
+                        # Goes through IdentityManager so unknown faces feed the
+                        # pending-cluster persona builder rather than being dropped.
                         recognized_name: Optional[str] = None
+                        recognized_pid: Optional[int] = None
                         if (
                             person_present
-                            and self.face_recognizer is not None
-                            and self.face_recognizer.is_loaded
-                            and self.face_recognizer.enrolled_count > 0
+                            and self.identity is not None
                         ):
                             try:
-                                name, sim = await self.face_recognizer.identify(frame)
-                                if name is not None:
-                                    recognized_name = name
+                                match = await self.identity.identify_face(frame)
+                                if match is not None:
+                                    recognized_name = match.name
+                                    recognized_pid = match.person_id
+                                    ambig = " (ambiguous)" if match.is_ambiguous else ""
                                     logger.info(
-                                        f"[FaceRec] '{room_id}' → {name} (sim={sim:.2f})"
+                                        f"[Identity/face] '{room_id}' → {match.name} "
+                                        f"(sim={match.similarity:.2f}){ambig}"
                                     )
                                     await self._broadcast({
                                         "type":       "person_recognized",
                                         "room":       room_id,
-                                        "name":       name,
-                                        "similarity": sim,
+                                        "name":       match.name,
+                                        "similarity": match.similarity,
+                                        "ambiguous":  match.is_ambiguous,
                                     })
                                     # Presence signal — Cole moved rooms.
                                     # Future proactive speech follows him here.
                                     if room_id != self._active_user_room:
                                         logger.info(
                                             f"[Presence] active room: "
-                                            f"{self._active_user_room} → {room_id} (face: {name})"
+                                            f"{self._active_user_room} → {room_id} "
+                                            f"(face: {match.name})"
                                         )
                                         self._active_user_room = room_id
                             except Exception as e:
-                                logger.debug(f"[FaceRec] identify failed: {e}")
+                                logger.debug(f"[Identity/face] identify failed: {e}")
+
+                        # Drift verify (passive): if a recent wake matched
+                        # someone via voice, opportunistically save the face
+                        # captured here as a sample for that person.
+                        if self.identity is not None:
+                            for pid_to_verify, modality in list(
+                                self.identity._verify_pending.items()
+                            ):
+                                if modality != "face":
+                                    continue
+                                # Only verify in the active user room; if the
+                                # camera in this room saw a person, refresh.
+                                if room_id != self._active_user_room or not person_present:
+                                    continue
+                                try:
+                                    outcome = await self.identity.verify_face(
+                                        pid_to_verify, frame
+                                    )
+                                    logger.debug(
+                                        f"[Identity/drift] verify_face for pid={pid_to_verify}: {outcome}"
+                                    )
+                                    self.identity._verify_pending.pop(pid_to_verify, None)
+                                    if outcome in ("pending_drift", "pending_conflict"):
+                                        await self._broadcast({
+                                            "type": "identity_pending_added",
+                                            "modality": "face",
+                                            "outcome": outcome,
+                                        })
+                                except Exception as e:
+                                    logger.debug(f"[Identity/drift] verify_face failed: {e}")
+
+                        # Drift verify reverse direction: if a face was just
+                        # matched and we have a recent wake audio buffer
+                        # cached, verify the voice matches the same person.
+                        if (
+                            recognized_pid is not None
+                            and self.identity is not None
+                            and self._last_wake_audio is not None
+                            and self.identity._verify_pending.get(recognized_pid) == "voice"
+                        ):
+                            try:
+                                outcome = await self.identity.verify_voice(
+                                    recognized_pid, self._last_wake_audio
+                                )
+                                logger.debug(
+                                    f"[Identity/drift] verify_voice for pid={recognized_pid}: {outcome}"
+                                )
+                                self.identity._verify_pending.pop(recognized_pid, None)
+                                self._last_wake_audio = None
+                                if outcome in ("pending_drift", "pending_conflict"):
+                                    await self._broadcast({
+                                        "type": "identity_pending_added",
+                                        "modality": "voice",
+                                        "outcome": outcome,
+                                    })
+                            except Exception as e:
+                                logger.debug(f"[Identity/drift] verify_voice failed: {e}")
 
                         # Scene description — SceneAnalyzer self-gates on local
                         # frame-change detection, so we always call it and let
@@ -1808,6 +1884,22 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"[Init] Vision init failed (continuing without): {e}")
 
+        # Identity v2 manager — wraps speaker_id + face_recognizer with the
+        # cross-modal Person abstraction. Migrates legacy speakers/faces rows
+        # on first boot, no-op after that.
+        if self.db is not None:
+            self.identity = IdentityManager(
+                db=self.db,
+                speaker_identifier=self.speaker_id,
+                face_recognizer=self.face_recognizer,
+                config=self.config,
+            )
+            try:
+                await self.identity.init()
+            except Exception as e:
+                logger.warning(f"[Init] Identity manager init failed: {e}")
+                self.identity = None
+
         try:
             await self._init_network()
         except Exception as e:
@@ -1858,6 +1950,10 @@ class Orchestrator:
                 self.dashboard.register_speaker_id(self.speaker_id)
             if self.face_recognizer:
                 self.dashboard.register_face_recognizer(self.face_recognizer)
+            if self.identity is not None:
+                # Idempotent — register only if dashboard supports the new manager
+                if hasattr(self.dashboard, "register_identity"):
+                    self.dashboard.register_identity(self.identity)
             if self.webhooks:
                 self.dashboard.register_webhook_manager(self.webhooks)
 

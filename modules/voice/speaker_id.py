@@ -176,6 +176,19 @@ class SpeakerIdentifier:
             return best_name, best_sim
         return None, best_sim
 
+    async def embed_audio(self, audio: np.ndarray) -> Optional[np.ndarray]:
+        """Public wrapper: embed audio for callers that manage their own enrollment
+        (e.g. IdentityManager). Returns None if encoder unavailable or audio too short."""
+        if not self.is_loaded:
+            return None
+        if audio is None or len(audio) < RESEMBLYZER_SAMPLE_RATE // 2:
+            return None
+        try:
+            return await asyncio.to_thread(self._embed, audio)
+        except Exception as e:
+            logger.debug(f"[SpeakerID] embed_audio failed: {e}")
+            return None
+
     async def list_enrolled(self) -> list[dict]:
         """Return a JSON-friendly list of enrolled speakers + sample counts."""
         try:

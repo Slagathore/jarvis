@@ -155,19 +155,36 @@ function applyEvent(event) {
       break;
     case "face_enrolled":
     case "face_deleted":
-      loadFaces();
-      break;
-    case "speaker_enrolled":
-      const hint = document.getElementById("speaker-hint");
-      if (hint) hint.textContent = `enrolled ${event.name} (${event.sample_count || 1})`;
-      loadSpeakers();
-      break;
-    case "speaker_enrollment_armed":
-      const armed = document.getElementById("speaker-hint");
-      if (armed) armed.textContent = `say something now → ${event.name}`;
-      break;
     case "speaker_deleted":
-      loadSpeakers();
+      // Legacy WHO card events — no-op now that the v2 People card has replaced it.
+      break;
+    case "speaker_enrolled": {
+      const hint = document.getElementById("enroll-hint");
+      if (hint) {
+        hint.textContent = event.ok
+          ? `voice sample saved (${event.prompt_id || "wake"}) for ${event.name}`
+          : `voice sample failed for ${event.name}`;
+      }
+      loadPersons();
+      break;
+    }
+    case "speaker_enrollment_armed":
+    case "identity_voice_armed": {
+      const hint = document.getElementById("enroll-hint");
+      if (hint) {
+        hint.textContent = `armed ${event.prompt_id || "wake"} for ${event.name} — wake + say the sentence`;
+      }
+      break;
+    }
+    case "identity_face_enrolled":
+    case "identity_person_deleted":
+    case "identity_person_renamed":
+      loadPersons();
+      break;
+    case "identity_pending_added":
+    case "identity_pending_resolved":
+      loadPending();
+      loadPersons();
       break;
   }
 }
@@ -855,97 +872,212 @@ if (dndOnBtn) {
 if (dndOffBtn) dndOffBtn.addEventListener("click", () => setDnd(0));
 loadDndStatus();
 
-// ── WHO (face + voice enrollment) ─────────────────────────────────────────
+// ── PEOPLE (Identity v2) ──────────────────────────────────────────────────
 
-function renderEnrollList(elementId, items, kind) {
-  const el = document.getElementById(elementId);
+function renderPersons(persons) {
+  const el = document.getElementById("persons-list");
   if (!el) return;
-  if (!items || items.length === 0) {
-    el.innerHTML = `<div class="who-empty">No ${kind} enrolled.</div>`;
+  if (!persons || persons.length === 0) {
+    el.innerHTML = `<div class="who-empty">No people enrolled.</div>`;
     return;
   }
   el.innerHTML = "";
-  items.forEach((it) => {
+  persons.forEach((p) => {
     const row = document.createElement("div");
-    row.className = "who-row";
+    row.className = "person-row";
     row.innerHTML = `
-      <span class="who-name">${escapeHtml(it.name)}</span>
-      <span class="who-samples">${it.sample_count || 1}</span>
-      <button class="who-delete" data-name="${escapeHtml(it.name)}">×</button>
+      <span class="who-name">${escapeHtml(p.name)}</span>
+      <span class="person-counts">
+        <span title="Face samples">F${p.face_sample_count || 0}</span>
+        <span title="Voice samples">V${p.voice_sample_count || 0}</span>
+      </span>
+      <button class="who-delete" data-id="${p.id}" title="Delete person + all samples">×</button>
     `;
     row.querySelector(".who-delete").addEventListener("click", () => {
-      const url = kind === "faces" ? `/api/faces/${encodeURIComponent(it.name)}`
-                                   : `/api/speakers/${encodeURIComponent(it.name)}`;
-      fetch(url, { method: "DELETE" }).catch(() => {});
+      if (!confirm(`Delete '${p.name}' and all their samples?`)) return;
+      fetch(`/api/identity/persons/${p.id}`, { method: "DELETE" }).catch(() => {});
     });
     el.appendChild(row);
   });
 }
 
-function loadFaces() {
-  fetch("/api/faces")
+function loadPersons() {
+  fetch("/api/identity/persons")
     .then((r) => r.json())
-    .then(({ faces }) => renderEnrollList("faces-list", faces, "faces"))
+    .then(({ persons }) => renderPersons(persons || []))
     .catch(() => {});
 }
 
-function loadSpeakers() {
-  fetch("/api/speakers")
-    .then((r) => r.json())
-    .then(({ speakers }) => renderEnrollList("speakers-list", speakers, "voices"))
-    .catch(() => {});
+function _enrollHint(text, isError = false) {
+  const hint = document.getElementById("enroll-hint");
+  if (!hint) return;
+  hint.textContent = text;
+  hint.style.color = isError ? "var(--accent-warn, #ff7a59)" : "";
 }
 
-function enrollFace() {
-  const nameEl = document.getElementById("face-name");
-  if (!nameEl) return;
+function _enrollGetName() {
+  const nameEl = document.getElementById("person-name");
+  if (!nameEl) return null;
   const name = nameEl.value.trim();
+  if (!name) {
+    _enrollHint("enter a name first", true);
+    return null;
+  }
+  return name;
+}
+
+function _enrollGetRoom() {
+  const sel = document.getElementById("person-room");
+  return sel ? sel.value : "office";
+}
+
+function snapPose(pose) {
+  const name = _enrollGetName();
   if (!name) return;
-  fetch("/api/faces/enroll", {
+  const room = _enrollGetRoom();
+  _enrollHint(`capturing ${pose}…`);
+  fetch("/api/identity/face/enroll", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, pose, room }),
   })
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (r.ok) {
-        nameEl.value = "";
-        loadFaces();
+        _enrollHint(`captured ${pose} for ${name}`);
+        loadPersons();
       } else {
-        alert(body.detail || "Face enroll failed");
+        _enrollHint(body.detail || `${pose} failed`, true);
       }
     })
-    .catch((e) => console.warn("[JARVIS] face enroll failed:", e));
+    .catch(() => _enrollHint(`${pose} failed`, true));
 }
 
-function armSpeaker() {
-  const nameEl = document.getElementById("speaker-name");
-  if (!nameEl) return;
-  const name = nameEl.value.trim();
+function armVoice(promptId) {
+  const name = _enrollGetName();
   if (!name) return;
-  fetch("/api/speakers/enroll", {
+  fetch("/api/identity/voice/arm", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, prompt_id: promptId }),
   })
-    .then(() => {
-      nameEl.value = "";
-      const hint = document.getElementById("speaker-hint");
-      if (hint) hint.textContent = `armed for ${name} — say "Hey Jarvis" + a sentence`;
+    .then((r) => {
+      if (r.ok) _enrollHint(`armed ${promptId} for ${name} — say wake word, then the sentence`);
     })
-    .catch((e) => console.warn("[JARVIS] speaker arm failed:", e));
+    .catch(() => _enrollHint("arm failed", true));
 }
 
-const faceBtn = document.getElementById("face-enroll");
-const speakerBtn = document.getElementById("speaker-arm");
-if (faceBtn) faceBtn.addEventListener("click", enrollFace);
-if (speakerBtn) speakerBtn.addEventListener("click", armSpeaker);
-const faceNameEl = document.getElementById("face-name");
-const speakerNameEl = document.getElementById("speaker-name");
-if (faceNameEl) faceNameEl.addEventListener("keydown", (e) => { if (e.key === "Enter") enrollFace(); });
-if (speakerNameEl) speakerNameEl.addEventListener("keydown", (e) => { if (e.key === "Enter") armSpeaker(); });
-loadFaces();
-loadSpeakers();
+document.querySelectorAll(".pose-btn").forEach((btn) => {
+  btn.addEventListener("click", () => snapPose(btn.dataset.pose));
+});
+document.querySelectorAll(".voice-arm-btn").forEach((btn) => {
+  btn.addEventListener("click", () => armVoice(btn.dataset.promptId));
+});
+
+// Populate the room selector from /api/cameras (or fall back to the rooms in state)
+function populatePersonRoomSelect() {
+  const sel = document.getElementById("person-room");
+  if (!sel) return;
+  fetch("/api/state")
+    .then((r) => r.json())
+    .then((state) => {
+      const rooms = Object.keys(state.rooms || {});
+      if (rooms.length === 0) return;
+      sel.innerHTML = "";
+      rooms.forEach((rid) => {
+        const opt = document.createElement("option");
+        opt.value = rid;
+        opt.textContent = rid;
+        if (rid === "office") opt.selected = true;
+        sel.appendChild(opt);
+      });
+    })
+    .catch(() => {});
+}
+
+// ── PENDING REVIEW ────────────────────────────────────────────────────────
+
+function renderPending(items) {
+  const el = document.getElementById("pending-list");
+  if (!el) return;
+  if (!items || items.length === 0) {
+    el.innerHTML = `<div class="who-empty">No pending review items.</div>`;
+    return;
+  }
+  el.innerHTML = "";
+  items.forEach((p) => {
+    const row = document.createElement("div");
+    row.className = "pending-row";
+    const isCluster = p.kind && p.kind.startsWith("pending_cluster_");
+    const modality = p.kind && p.kind.includes("voice") ? "voice" : "face";
+    const hint = isCluster
+      ? `Unknown ${modality} cluster #${p.cluster_id || "?"} — best match ${(p.similarity || 0).toFixed(2)}`
+      : `Drift on ${escapeHtml(p.person_name || "unknown")} — sim ${(p.similarity || 0).toFixed(2)} (anchored via ${p.anchored_via || "?"})`;
+    let preview = "";
+    if (p.has_image) {
+      preview = `<img class="pending-thumb" src="/api/identity/pending/${p.id}/image.jpg" alt="capture" />`;
+    } else if (p.has_audio) {
+      preview = `<audio controls class="pending-audio" src="/api/identity/pending/${p.id}/audio.wav"></audio>`;
+    }
+    row.innerHTML = `
+      ${preview}
+      <div class="pending-meta">
+        <div class="pending-hint">${hint}</div>
+        <div class="pending-actions">
+          ${
+            !isCluster
+              ? `<button class="dev-btn pending-confirm" data-id="${p.id}">YES, IT'S ${escapeHtml(p.person_name || "")}</button>`
+              : ""
+          }
+          <input type="text" class="reminder-input pending-name" placeholder="${isCluster ? "Name this person" : "Reassign to…"}" />
+          <button class="dev-btn pending-assign" data-id="${p.id}">${isCluster ? "ASSIGN" : "REASSIGN"}</button>
+          <button class="dev-btn pending-reject" data-id="${p.id}">REJECT</button>
+        </div>
+      </div>
+    `;
+    const confirmBtn = row.querySelector(".pending-confirm");
+    if (confirmBtn) {
+      confirmBtn.addEventListener("click", () => resolvePending(p.id, "confirm"));
+    }
+    row.querySelector(".pending-assign").addEventListener("click", () => {
+      const nameInput = row.querySelector(".pending-name");
+      const target = nameInput ? nameInput.value.trim() : "";
+      if (!target) {
+        nameInput.focus();
+        return;
+      }
+      resolvePending(p.id, "assign", target);
+    });
+    row.querySelector(".pending-reject").addEventListener("click", () => resolvePending(p.id, "reject"));
+    el.appendChild(row);
+  });
+}
+
+function loadPending() {
+  fetch("/api/identity/pending")
+    .then((r) => r.json())
+    .then(({ pending }) => renderPending(pending || []))
+    .catch(() => {});
+}
+
+function resolvePending(id, action, targetName) {
+  const body = { action };
+  if (targetName) body.target_name = targetName;
+  fetch(`/api/identity/pending/${id}/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then(() => {
+      loadPending();
+      loadPersons();
+    })
+    .catch(() => {});
+}
+
+populatePersonRoomSelect();
+loadPersons();
+loadPending();
 
 // ── Init ──────────────────────────────────────────────────────────────────
 

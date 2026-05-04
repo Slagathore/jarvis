@@ -160,6 +160,13 @@ class FaceRecognizer:
             return best_name, best_sim
         return None, best_sim
 
+    async def embed_frame(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Public wrapper: extract+embed the largest face. Returns None if no
+        face detected or embedding fails."""
+        if not self._loaded:
+            return None
+        return await asyncio.to_thread(self._embed_frame, frame)
+
     async def list_enrolled(self) -> list[dict]:
         try:
             rows = await self._db.fetchall(

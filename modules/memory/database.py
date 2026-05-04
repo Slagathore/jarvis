@@ -85,6 +85,9 @@ CREATE TABLE IF NOT EXISTS reminders (
     last_triggered     TEXT
 );
 
+-- Legacy single-centroid identity tables. Identity v2 (persons + face_samples
+-- + voice_samples) supersedes these; rows here are migrated forward on first
+-- boot of v2 and the tables are kept read-only for one release cycle.
 CREATE TABLE IF NOT EXISTS speakers (
     name           TEXT PRIMARY KEY,
     embedding      BLOB NOT NULL,    -- 256-dim float32 centroid from resemblyzer
@@ -93,9 +96,64 @@ CREATE TABLE IF NOT EXISTS speakers (
 
 CREATE TABLE IF NOT EXISTS faces (
     name           TEXT PRIMARY KEY,
-    embedding      BLOB NOT NULL,    -- 512-dim float32 centroid from insightface
+    embedding      BLOB NOT NULL,    -- 128-dim float32 centroid from deepface (Facenet)
     sample_count   INTEGER DEFAULT 1
 );
+
+-- ── Identity v2 ──────────────────────────────────────────────────────────────
+-- A `person` is a single human identity. Each person can have many face_samples
+-- and many voice_samples (never deleted). Match across modalities is by
+-- person_id, so voice ID and face ID are anchored to the same person regardless
+-- of modality drift (cold, haircut, glasses, etc.).
+CREATE TABLE IF NOT EXISTS persons (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL UNIQUE,
+    created_at  TEXT    NOT NULL,
+    notes       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS face_samples (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id    INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+    embedding    BLOB    NOT NULL,    -- 128-dim float32 (Facenet)
+    pose         TEXT,                -- center | left | right | up | down | candid
+    captured_at  TEXT    NOT NULL,
+    source       TEXT    NOT NULL     -- enroll | drift_capture | live_question | migration
+);
+
+CREATE TABLE IF NOT EXISTS voice_samples (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id    INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+    embedding    BLOB    NOT NULL,    -- 256-dim float32 (Resemblyzer)
+    prompt_id    TEXT,                -- 'sentence_1' | 'sentence_2' | 'sentence_3' | 'wake'
+    captured_at  TEXT    NOT NULL,
+    source       TEXT    NOT NULL     -- enroll | drift_capture | live_question | migration
+);
+
+-- Pending captures that the dashboard surfaces for human review.
+-- kind: 'face_drift' or 'voice_drift' = anchor said this is person X but the
+--       captured sample didn't match X loosely. Reviewer confirms or rejects.
+-- kind: 'pending_cluster' = sample matched no enrolled person; clusters with
+--       similar pending samples form a candidate persona that the reviewer
+--       can name.
+CREATE TABLE IF NOT EXISTS identity_pending (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT    NOT NULL,    -- face_drift | voice_drift | pending_cluster_face | pending_cluster_voice
+    person_id       INTEGER REFERENCES persons(id) ON DELETE SET NULL,
+    cluster_id      INTEGER,             -- groups pending samples of the same modality
+    embedding       BLOB    NOT NULL,
+    image_jpeg      BLOB,                -- preview JPEG for face captures
+    audio_pcm16     BLOB,                -- preview PCM (16-bit, 16kHz) for voice captures (~3s)
+    similarity      REAL,                -- best cosine score against enrolled persons
+    anchored_via    TEXT,                -- 'voice' | 'face' | NULL for cold pending clusters
+    captured_at     TEXT    NOT NULL,
+    resolved        INTEGER DEFAULT 0    -- 0 = needs review, 1 = applied, 2 = rejected
+);
+
+CREATE INDEX IF NOT EXISTS idx_face_samples_person ON face_samples (person_id);
+CREATE INDEX IF NOT EXISTS idx_voice_samples_person ON voice_samples (person_id);
+CREATE INDEX IF NOT EXISTS idx_pending_resolved ON identity_pending (resolved);
+CREATE INDEX IF NOT EXISTS idx_pending_cluster ON identity_pending (cluster_id);
 
 -- Per-activity transition log used for predicted-duration + routine learning.
 -- A row is open (ended_at NULL) while the activity is current; closed when the
