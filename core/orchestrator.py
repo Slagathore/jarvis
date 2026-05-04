@@ -179,6 +179,12 @@ class Orchestrator:
         # Last seen pet classes per room — used to dedup pet_seen events so a
         # cat camped on Cole's desk doesn't fire once per minute forever.
         self._last_pets_per_room: dict[str, list[str]] = {}
+        # Where Cole most recently demonstrated presence — set by wake events,
+        # face recognition, and dashboard chat. Proactive speech (reminders,
+        # curiosity, calendar alerts, EOD summary, startup) targets this room
+        # so Jarvis follows Cole around instead of always speaking from the
+        # office PC. Defaults to "office" because that's where startup happens.
+        self._active_user_room: str = "office"
         self._wake_lock = asyncio.Lock()
         self._audio_io_active: bool = False
         self.dashboard: Optional[DashboardServer]
@@ -370,7 +376,7 @@ class Orchestrator:
             ),
             fallback=f"Heads up — {message}.",
         )
-        await self._speak(text, room="office", priority="notification")
+        await self._speak(text, priority="notification")
         await self._broadcast({
             "type": "reminder_fired",
             "id": event.get("id"),
@@ -403,18 +409,10 @@ class Orchestrator:
         return fallback
 
     async def _on_audio_level(self, event: dict) -> None:
-        """
-        Forward periodic mic dBFS readings from wake_word to the dashboard.
-        The PC mic lives at Cole's desk (next to the USB webcam), so we render
-        the meter on the office_cam card rather than the ESP32 office card.
-        Other room IDs pass through unchanged for future per-room mics.
-        """
-        room = event.get("room", "office")
-        if room == "office":
-            room = "office_cam"
+        """Forward periodic mic dBFS readings from wake_word to the dashboard."""
         await self._broadcast({
             "type": "audio_level",
-            "room": room,
+            "room": event.get("room", "office"),
             "db": event.get("db", -100.0),
         })
 
@@ -437,6 +435,9 @@ class Orchestrator:
             return
 
         logger.info(f"[Wake] Detected in {room}")
+        # Wake event = strong presence signal. Update the active room so
+        # downstream proactive speech follows Cole.
+        self._active_user_room = room
 
         # Check interruptibility before responding
         # Guard self.interruptibility (Optional) before member access
@@ -983,6 +984,8 @@ class Orchestrator:
         return True
 
     async def _on_text_chat(self, text: str, room: str = "office") -> None:
+        # Dashboard chat = presence signal too — update active room.
+        self._active_user_room = room
         """Handle typed messages sent from the dashboard chat input."""
         text = text.strip()
         if not text:
@@ -1008,7 +1011,7 @@ class Orchestrator:
                 ),
                 fallback=f"Voice switched to {voice_name}.",
             )
-            await self._speak(text, room="office", priority="ambient")
+            await self._speak(text, priority="ambient")
 
     # ── Background Loops ───────────────────────────────────────────────────
 
@@ -1062,8 +1065,8 @@ class Orchestrator:
                     # Posture / sleep observations come from the camera pointed at Cole's
                     # desk (the USB webcam), not the ESP32 node camera which may be aimed
                     # elsewhere in the room.
-                    if "office_cam" in rooms:
-                        frame = await self.cameras.capture_frame_async("office_cam")
+                    if "office" in rooms:
+                        frame = await self.cameras.capture_frame_async("office")
                         if frame is not None:
                             posture_result = await self.posture.analyze_async(frame)
                             # Posture is context-only — sitting/standing/lying
@@ -1079,14 +1082,14 @@ class Orchestrator:
                             sleep_tracker = self.sleep_tracker
                             if sleep_tracker is not None:
                                 lights_on = (
-                                    self.light_detector.last_state("office_cam")
+                                    self.light_detector.last_state("office")
                                     if self.light_detector
                                     else None
                                 )
                                 sleep_tracker.update(
                                     posture=posture_result,
                                     lights_on=lights_on,
-                                    room="office_cam",
+                                    room="office",
                                 )
                                 sleep_signal = sleep_tracker.get_sleep_signal()
                                 if sleep_signal:
@@ -1218,6 +1221,14 @@ class Orchestrator:
                                         "name":       name,
                                         "similarity": sim,
                                     })
+                                    # Presence signal — Cole moved rooms.
+                                    # Future proactive speech follows him here.
+                                    if room_id != self._active_user_room:
+                                        logger.info(
+                                            f"[Presence] active room: "
+                                            f"{self._active_user_room} → {room_id} (face: {name})"
+                                        )
+                                        self._active_user_room = room_id
                             except Exception as e:
                                 logger.debug(f"[FaceRec] identify failed: {e}")
 
@@ -1342,7 +1353,7 @@ class Orchestrator:
                     logger.debug("[Curiosity] Blocked by interruptibility gate")
                     continue
 
-                await self._speak(utterance, room="office", priority="ambient")
+                await self._speak(utterance, priority="ambient")
 
             except Exception as e:
                 logger.error(f"[Curiosity] Loop error: {e}")
@@ -1394,7 +1405,7 @@ class Orchestrator:
                         ),
                         fallback=f"Heads up — {title} in {minutes_away} minutes.",
                     )
-                    await self._speak(line, room="office", priority="notification")
+                    await self._speak(line, priority="notification")
                     logger.info(f"[Calendar] Alerted on '{title}' (id={eid})")
 
                 # Garbage-collect alerted IDs that have already started so the
@@ -1497,7 +1508,7 @@ class Orchestrator:
             "summary": summary,
         })
         if speak:
-            await self._speak(summary, room="office", priority="ambient")
+            await self._speak(summary, priority="ambient")
 
     async def _health_broadcast_loop(self) -> None:
         """
@@ -1587,7 +1598,7 @@ class Orchestrator:
             urgency = urgency_map.get(f"{appliance}_done_urgency", 0.5)
             priority = "urgent" if urgency >= 0.7 else "notification"
 
-            await self._speak(text, room="office", priority=priority)
+            await self._speak(text, priority=priority)
 
     async def _on_node_status(self, event: dict) -> None:
         """Handle ESP32 node coming online or going offline."""
@@ -1658,39 +1669,54 @@ class Orchestrator:
             )
         return sent
 
+    def _speaker_sink_for(self, room: str) -> str:
+        """
+        Return the configured speaker_sink ("local" | "node") for a room.
+        Defaults to "local" when no entry or no explicit sink is configured.
+        """
+        for room_cfg in self.config.get("rooms", []):
+            if room_cfg.get("id") == room:
+                sink = str(room_cfg.get("speaker_sink", "local")).lower()
+                return sink if sink in ("local", "node") else "local"
+        return "local"
+
     # ── TTS Helper ─────────────────────────────────────────────────────────
 
-    async def _speak(self, text: str, room: str = "office", priority: str = "ambient") -> None:
+    async def _speak(
+        self,
+        text: str,
+        room: Optional[str] = None,
+        priority: str = "ambient",
+    ) -> None:
         """
         Full speak pipeline: TTS → audio playback → log → broadcast.
 
-        Routes audio to the room's ESP node speaker via MQTT when:
-          - room has has_node=true in config
-          - that node is currently online
-          - the node has reported has_microphone (we use this as a proxy for
-            "audio path configured" since speakers ride the same I2S bus)
+        Room resolution:
+          - If `room` is None, target Cole's currently-active room (set by
+            wake events / face recognition / dashboard chat). Lets proactive
+            speech (curiosity, reminders, calendar alerts, EOD summary) follow
+            Cole around the house instead of always blasting the office PC.
+          - If explicit `room` is passed (e.g. wake response), it overrides.
 
-        Otherwise falls back to local PC playback. Streaming sentence-level
-        synthesis is used either way so multi-sentence replies don't pause.
+        Routing:
+          - Per-room speaker_sink config drives where audio plays:
+              "local"  → PC sound device (the machine running this script)
+              "node"   → MQTT to the room's ESP node speaker (falls back to
+                         local if node offline or firmware can't play)
+          - Default for any room without a sink config is "local".
         """
         try:
-            logger.info(f"[TTS] [{priority}] {text!r}")
+            if room is None:
+                room = self._active_user_room
+            logger.info(f"[TTS] [{priority}] (→{room}) {text!r}")
 
             if not self.tts:
                 logger.warning("[TTS] TTS module not initialized — skipping playback")
                 return
 
             routed_to_node = False
-            # Per-room TTS routing is gated behind voice.tts.route_to_nodes
-            # because the ESP firmware doesn't play received audio_out yet —
-            # silently routing TTS to the node = Cole hears nothing. Default
-            # OFF until the firmware speaker path is implemented.
-            tts_cfg = self.config.get("voice", {}).get("tts", {})
-            if (
-                tts_cfg.get("route_to_nodes", False)
-                and self.nodes is not None
-                and self.nodes.is_online(room)
-            ):
+            sink = self._speaker_sink_for(room)
+            if sink == "node" and self.nodes is not None and self.nodes.is_online(room):
                 routed_to_node = await self._speak_via_node(text, room)
 
             if not routed_to_node:
@@ -1881,7 +1907,7 @@ class Orchestrator:
             ),
             fallback="Jarvis online.",
         )
-        await self._speak(startup_line, room="office", priority="ambient")
+        await self._speak(startup_line, priority="ambient")
 
         # Run forever — cancel all tasks cleanly on exit
         gather = asyncio.gather(*tasks, return_exceptions=True)

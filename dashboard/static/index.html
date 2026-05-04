@@ -179,6 +179,44 @@
           </div>
         </div>
 
+        <!-- Who (face + voice enrollments) -->
+        <div class="card" id="who-card">
+          <div class="card-label">WHO</div>
+          <div class="who-section">
+            <div class="who-section-title">FACES</div>
+            <div class="who-list" id="faces-list">
+              <div class="who-empty">No faces enrolled.</div>
+            </div>
+            <div class="who-add">
+              <input
+                type="text"
+                id="face-name"
+                class="reminder-input"
+                placeholder="Name"
+                autocomplete="off"
+              />
+              <button class="dev-btn" id="face-enroll" title="Capture office camera frame as this face">SNAP</button>
+            </div>
+          </div>
+          <div class="who-section">
+            <div class="who-section-title">VOICES</div>
+            <div class="who-list" id="speakers-list">
+              <div class="who-empty">No voices enrolled.</div>
+            </div>
+            <div class="who-add">
+              <input
+                type="text"
+                id="speaker-name"
+                class="reminder-input"
+                placeholder="Name"
+                autocomplete="off"
+              />
+              <button class="dev-btn" id="speaker-arm" title="Arm next wake utterance for enrollment">ARM</button>
+            </div>
+            <div class="who-hint" id="speaker-hint"></div>
+          </div>
+        </div>
+
         <!-- Reminders -->
         <div class="card" id="reminders-card">
           <div class="card-label">REMINDERS</div>
@@ -234,6 +272,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=11"></script>
+    <script src="/static/app.js?v=12"></script>
   </body>
 </html>

@@ -47,11 +47,6 @@ voice:
   tts:
     engine: "piper"
     active_voice: "glados"
-    # Per-room TTS routing — when true AND the room's ESP node is online, send
-    # TTS audio bytes over MQTT to the node's speaker instead of playing locally.
-    # Default OFF because the ESP firmware doesn't yet play received audio_out;
-    # turning it on would mean Jarvis appears silent until the firmware is updated.
-    route_to_nodes: false
     piper_binary: "C:/Users/Cole/CodeStuff/Misc/piper/piper.exe"
     voices:
       glados:   "C:/Users/Cole/CodeStuff/Misc/piper/voices/vits-piper-en_US-glados-high/en_US-glados-high.onnx"
@@ -104,31 +99,34 @@ mqtt:
     state:     "jarvis/system/state"         # Broadcast current activity state
 
 rooms:
-  - id: "office_cam"
-    display_name: "Office Cam"
-    camera_source: 0          # USB webcam (device index 0)
+  # speaker_sink:
+  #   "local"  → TTS plays on the PC's sound device (the machine running this script)
+  #   "node"   → TTS audio is published to MQTT for the room's ESP node speaker.
+  #              Falls back to local if the node isn't online or firmware can't play yet.
+  - id: "office"
+    display_name: "Office"
+    camera_source: 0          # USB webcam (device index 0) at Cole's desk
     has_node: false
     node_ip: null
-  - id: "office"              # ESP32-CAM node — firmware publishes as room_id "office"
-    display_name: "Office"
+    speaker_sink: "local"     # PC mic + PC speakers live here
+  - id: "living_room"
+    display_name: "Living Room"
     camera_source: null
-    has_node: true
+    has_node: true             # ESP32-CAM node (was previously labelled "office")
     node_ip: "192.168.1.101"
+    speaker_sink: "node"
   - id: "bedroom"
     display_name: "Bedroom"
-    camera_source: null        # null until ESP32-CAM deployed
+    camera_source: null
     has_node: false
     node_ip: null
+    speaker_sink: "local"
   - id: "kitchen"
     display_name: "Kitchen"
     camera_source: null
     has_node: false
     node_ip: null
-  - id: "living_room"
-    display_name: "Living Room"
-    camera_source: null
-    has_node: false
-    node_ip: null
+    speaker_sink: "local"
 
 context:
   vision_scan_interval_minutes: 1

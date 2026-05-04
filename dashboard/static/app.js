@@ -153,6 +153,22 @@ function applyEvent(event) {
     case "dnd":
       updateDndStatus(event.active, event.until);
       break;
+    case "face_enrolled":
+    case "face_deleted":
+      loadFaces();
+      break;
+    case "speaker_enrolled":
+      const hint = document.getElementById("speaker-hint");
+      if (hint) hint.textContent = `enrolled ${event.name} (${event.sample_count || 1})`;
+      loadSpeakers();
+      break;
+    case "speaker_enrollment_armed":
+      const armed = document.getElementById("speaker-hint");
+      if (armed) armed.textContent = `say something now → ${event.name}`;
+      break;
+    case "speaker_deleted":
+      loadSpeakers();
+      break;
   }
 }
 
@@ -838,6 +854,98 @@ if (dndOnBtn) {
 }
 if (dndOffBtn) dndOffBtn.addEventListener("click", () => setDnd(0));
 loadDndStatus();
+
+// ── WHO (face + voice enrollment) ─────────────────────────────────────────
+
+function renderEnrollList(elementId, items, kind) {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  if (!items || items.length === 0) {
+    el.innerHTML = `<div class="who-empty">No ${kind} enrolled.</div>`;
+    return;
+  }
+  el.innerHTML = "";
+  items.forEach((it) => {
+    const row = document.createElement("div");
+    row.className = "who-row";
+    row.innerHTML = `
+      <span class="who-name">${escapeHtml(it.name)}</span>
+      <span class="who-samples">${it.sample_count || 1}</span>
+      <button class="who-delete" data-name="${escapeHtml(it.name)}">×</button>
+    `;
+    row.querySelector(".who-delete").addEventListener("click", () => {
+      const url = kind === "faces" ? `/api/faces/${encodeURIComponent(it.name)}`
+                                   : `/api/speakers/${encodeURIComponent(it.name)}`;
+      fetch(url, { method: "DELETE" }).catch(() => {});
+    });
+    el.appendChild(row);
+  });
+}
+
+function loadFaces() {
+  fetch("/api/faces")
+    .then((r) => r.json())
+    .then(({ faces }) => renderEnrollList("faces-list", faces, "faces"))
+    .catch(() => {});
+}
+
+function loadSpeakers() {
+  fetch("/api/speakers")
+    .then((r) => r.json())
+    .then(({ speakers }) => renderEnrollList("speakers-list", speakers, "voices"))
+    .catch(() => {});
+}
+
+function enrollFace() {
+  const nameEl = document.getElementById("face-name");
+  if (!nameEl) return;
+  const name = nameEl.value.trim();
+  if (!name) return;
+  fetch("/api/faces/enroll", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  })
+    .then(async (r) => {
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) {
+        nameEl.value = "";
+        loadFaces();
+      } else {
+        alert(body.detail || "Face enroll failed");
+      }
+    })
+    .catch((e) => console.warn("[JARVIS] face enroll failed:", e));
+}
+
+function armSpeaker() {
+  const nameEl = document.getElementById("speaker-name");
+  if (!nameEl) return;
+  const name = nameEl.value.trim();
+  if (!name) return;
+  fetch("/api/speakers/enroll", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  })
+    .then(() => {
+      nameEl.value = "";
+      const hint = document.getElementById("speaker-hint");
+      if (hint) hint.textContent = `armed for ${name} — say "Hey Jarvis" + a sentence`;
+    })
+    .catch((e) => console.warn("[JARVIS] speaker arm failed:", e));
+}
+
+const faceBtn = document.getElementById("face-enroll");
+const speakerBtn = document.getElementById("speaker-arm");
+if (faceBtn) faceBtn.addEventListener("click", enrollFace);
+if (speakerBtn) speakerBtn.addEventListener("click", armSpeaker);
+const faceNameEl = document.getElementById("face-name");
+const speakerNameEl = document.getElementById("speaker-name");
+if (faceNameEl) faceNameEl.addEventListener("keydown", (e) => { if (e.key === "Enter") enrollFace(); });
+if (speakerNameEl) speakerNameEl.addEventListener("keydown", (e) => { if (e.key === "Enter") armSpeaker(); });
+loadFaces();
+loadSpeakers();
 
 // ── Init ──────────────────────────────────────────────────────────────────
 

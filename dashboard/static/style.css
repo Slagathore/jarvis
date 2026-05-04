@@ -644,6 +644,84 @@ main {
   border-radius: 2px;
 }
 
+/* ── WHO panel (face + voice enrollment) ──────────────────────────────────── */
+.who-section + .who-section { margin-top: 14px; }
+
+.who-section-title {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.who-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.who-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.who-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 12px;
+}
+
+.who-row .who-name {
+  flex: 1;
+  color: var(--text);
+}
+
+.who-row .who-samples {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.who-row .who-delete {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 2px;
+  padding: 1px 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.who-row .who-delete:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.who-add {
+  display: flex;
+  gap: 6px;
+}
+
+.who-hint {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--amber);
+  min-height: 12px;
+}
+
 /* ── Calendar ─────────────────────────────────────────────────────────────── */
 .calendar-list {
   display: flex;
