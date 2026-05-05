@@ -76,7 +76,7 @@ Variables:
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import numpy as np
