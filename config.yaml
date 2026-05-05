@@ -79,9 +79,9 @@ voice:
     # drops cleanly into "silence" so the recorder can terminate.
     silence_threshold_db: -45     # baseline floor; adaptive_noise_floor raises this if room is noisier
     silence_duration_ms: 600       # bail ~600ms after Cole stops talking
-    max_duration_seconds: 8        # hard cap; adaptive floor + 600ms silence usually beats this by a wide margin
+    max_duration_seconds: 60       # ABSOLUTE safety cap only — silence detection terminates normal recordings; this guards against a stuck-open mic, never cuts off live speech
     adaptive_noise_floor: true     # auto-tune threshold to ambient (first 400ms is calibration)
-    follow_up_listen_seconds: 6    # after each TTS reply, listen this long for a continuation without re-wake
+    follow_up_listen_seconds: 6    # speech-start timeout for the post-reply mic window; once Cole starts speaking, recording extends until silence (not capped at 6s)
 
 mqtt:
   broker: "localhost"

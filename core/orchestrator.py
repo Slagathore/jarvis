@@ -207,11 +207,12 @@ class Orchestrator:
         self._active_user_room: str = "office"
         self._wake_lock = asyncio.Lock()
         self._audio_io_active: bool = False
-        # Continuous-conversation follow-up listener: after each conversation
-        # TTS reply, we open a window where the user can speak again without
-        # re-saying the wake word. Depth cap stops runaway chains.
+        # Continuous-conversation follow-up listener: after each TTS reply,
+        # we open a window where the user can speak again without re-saying
+        # the wake word. The depth counter tracks how nested we are; we don't
+        # cap it because natural conversation should keep flowing as long as
+        # the user keeps replying. Used for log scoping only.
         self._followup_depth: int = 0
-        self._followup_max_depth: int = 3
         # Live conversational enrollment state machine. When set, the next
         # follow-up listen captures a name claim (instead of being processed
         # as a normal turn) and seeds a new person from the original audio +
@@ -1642,7 +1643,8 @@ class Orchestrator:
             "summary": summary,
         })
         if speak:
-            await self._speak(summary, priority="ambient")
+            # EOD recap is purely informational — don't open a follow-up window.
+            await self._speak(summary, priority="ambient", expects_response=False)
 
     async def _health_broadcast_loop(self) -> None:
         """
@@ -1830,8 +1832,6 @@ class Orchestrator:
         unknown-speaker audio as their first voice sample, snaps a face
         sample if a person is in frame, and welcomes them.
         """
-        if self._followup_depth >= self._followup_max_depth:
-            return
         recording_cfg = self.config.get("voice", {}).get("recording", {})
         listen_seconds = float(recording_cfg.get("follow_up_listen_seconds", 6.0))
         if listen_seconds <= 0:
@@ -1859,11 +1859,15 @@ class Orchestrator:
                         record_until_silence,
                         silence_threshold_db=recording_cfg.get("silence_threshold_db", -45.0),
                         silence_duration_ms=recording_cfg.get("silence_duration_ms", 600),
-                        # Cap the whole follow-up listen at listen_seconds so
-                        # we exit quickly when nobody replies.
-                        max_duration_seconds=listen_seconds,
-                        # If no speech in the first ~half of the window, bail.
-                        speech_start_timeout_seconds=max(1.5, listen_seconds * 0.6),
+                        # Full recording-length cap (safety net only). Silence
+                        # detection ends normal turns; without this we'd risk
+                        # a stuck-open mic.
+                        max_duration_seconds=recording_cfg.get("max_duration_seconds", 60.0),
+                        # listen_seconds is the SPEECH-START timeout — bail
+                        # the window if the user doesn't begin talking within
+                        # this many seconds. Once they start, recording
+                        # continues until silence (no early cut-off).
+                        speech_start_timeout_seconds=listen_seconds,
                         device=record_device,
                         mode="silence",
                         adaptive_noise_floor=recording_cfg.get("adaptive_noise_floor", True),
@@ -2042,9 +2046,20 @@ class Orchestrator:
         text: str,
         room: Optional[str] = None,
         priority: str = "ambient",
+        expects_response: Optional[bool] = None,
     ) -> None:
         """
-        Full speak pipeline: TTS → audio playback → log → broadcast.
+        Full speak pipeline: TTS → audio playback → log → broadcast → optional
+        follow-up listen window.
+
+        expects_response controls the post-reply mic window:
+          - None (default): infer from priority. 'oneway' suppresses follow-up;
+            everything else (conversation, reminder, curiosity, calendar)
+            opens a listen window. If Jarvis pings Cole proactively, Cole
+            should be able to reply without saying the wake word — that's
+            the default.
+          - True: always open a listen window after speaking.
+          - False: never open one (e.g. EOD summary that's purely informational).
 
         Room resolution:
           - If `room` is None, target Cole's currently-active room (set by
@@ -2107,16 +2122,18 @@ class Orchestrator:
                 "priority": priority,
             })
 
-            # Continuous-conversation: after a conversational reply, open a
-            # short listen window so the user can keep talking without saying
-            # the wake word again. Don't chain past max depth; don't follow-up
-            # on proactive speech (curiosity/reminders/calendar/EOD).
-            if (
-                priority == "conversation"
-                and self._followup_depth < self._followup_max_depth
-            ):
+            # Open a listen window after speaking unless this was an explicit
+            # one-way info dump. Default behavior: ANY speech (conversation
+            # reply, reminder, curiosity ping, calendar alert) lets Cole
+            # respond hands-free. Only oneway/EOD-summary opt out.
+            if expects_response is None:
+                wants_followup = priority not in ("oneway",)
+            else:
+                wants_followup = bool(expects_response)
+            if wants_followup:
                 # Fire-and-forget — _listen_followup acquires the wake lock
-                # internally so it serializes with normal wake captures.
+                # internally so it serializes with normal wake captures and
+                # any other follow-up that's already running.
                 asyncio.create_task(self._listen_followup(room))
 
         except Exception as e:
@@ -2309,7 +2326,9 @@ class Orchestrator:
             ),
             fallback="Jarvis online.",
         )
-        await self._speak(startup_line, priority="ambient")
+        # Startup greeting is one-way — Cole rarely talks back to the boot
+        # ping, and we don't want a stray fan-noise blip to spawn a wake.
+        await self._speak(startup_line, priority="ambient", expects_response=False)
 
         # Run forever — cancel all tasks cleanly on exit
         gather = asyncio.gather(*tasks, return_exceptions=True)
