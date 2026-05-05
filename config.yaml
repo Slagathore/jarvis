@@ -7,8 +7,16 @@ system:
   dashboard_port: 7070
   dashboard_host: 0.0.0.0
 ollama:
-  model: gemini-3-flash-preview:cloud
-  vision_model: gemini-3-flash-preview:cloud
+  model: qwen3.5:4b
+  vision_model: qwen3.5:4b
+  # Action model — used DURING multi-step tool loops once any action tool
+  # (computer control, self-edit, file exploration) gets called. Keeps
+  # rate-limited cloud models like Gemini from burning quota on screenshot/
+  # click/type sequences. The first iteration of every loop still uses the
+  # chat model for planning; once the LLM requests an action tool, subsequent
+  # iterations within the same loop swap to this local model. Leave empty
+  # / null to disable Pattern D and run everything on `model`.
+  action_model: qwen3.5:4b
   base_url: http://localhost:11434
   timeout_seconds: 30
   system_prompt: "You are Jarvis, an ambient home AI assistant.\nYou live in the house\
@@ -52,7 +60,7 @@ voice:
     mode: silence
     fixed_duration_seconds: 7
     silence_threshold_db: -45
-    silence_duration_ms: 2000      # 1s of silence before ending the recording — accommodates brief mid-sentence pauses without cutting off
+    silence_duration_ms: 2000
     max_duration_seconds: 60
     adaptive_noise_floor: true
     follow_up_listen_seconds: 6

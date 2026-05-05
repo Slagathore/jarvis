@@ -957,7 +957,7 @@ class DashboardServer:
             body = await request.json()
             name = str(body.get("name", "")).strip()
             kind = str(body.get("kind", "chat")).strip().lower()
-            if not name or kind not in ("chat", "vision"):
+            if not name or kind not in ("chat", "vision", "action"):
                 raise HTTPException(status_code=400, detail="name + kind required")
             ok = await reg.set_active(name, kind=kind)
             await self.broadcast({"type": "model.activated", "name": name, "kind": kind})

@@ -61,6 +61,9 @@ class OllamaLLM:
         cfg = config["ollama"]
         self._model: str = cfg["model"]
         self._vision_model: str = cfg.get("vision_model", self._model)
+        # Pattern D: action model used mid-loop after any action tool call.
+        # Empty / None disables the swap and the loop stays on self._model.
+        self._action_model: Optional[str] = cfg.get("action_model") or None
         self._base_url: str = cfg.get("base_url", "http://localhost:11434")
         self._timeout: int = cfg.get("timeout_seconds", 30)
         self._system_prompt: str = cfg.get("system_prompt", "You are Jarvis.")
@@ -119,6 +122,19 @@ class OllamaLLM:
     def set_vision_model(self, name: str) -> None:
         self._vision_model = name
         logger.info(f"[LLM] Vision model switched to '{name}'")
+
+    @property
+    def action_model(self) -> Optional[str]:
+        """Local model used mid-loop after any action tool call (Pattern D).
+        Returns None when Pattern D is disabled."""
+        return self._action_model
+
+    def set_action_model(self, name: Optional[str]) -> None:
+        """Hot-swap the action model. Pass None to disable Pattern D
+        entirely (loops stay on the chat model regardless of what tools
+        get called)."""
+        self._action_model = name or None
+        logger.info(f"[LLM] Action model set to '{name or 'disabled'}'")
 
     def set_settings_provider(self, registry: Any) -> None:
         """Wire the ModelRegistry back into the LLM so chat()/vision_query()
@@ -201,6 +217,7 @@ class OllamaLLM:
         tools: list[dict[str, Any]],
         tool_handlers: dict[str, Any],
         max_iterations: int = 200,
+        action_tool_names: Optional[set] = None,
     ) -> str:
         """
         Chat with tool-calling support. Loops: if the LLM emits tool_calls,
@@ -231,8 +248,11 @@ class OllamaLLM:
         """
         import json
 
-        # Dispatch: ':gapi' models route to Gemini direct, with its own tool loop.
-        if self._is_gemini_direct(self._model):
+        # Pattern D needs per-iteration dispatch (so a Gemini chat model can
+        # swap to local Qwen mid-loop). If Pattern D is disabled AND the
+        # chat model is :gapi, fall back to GeminiDirect's one-shot loop —
+        # it's faster and we don't need swapping anyway.
+        if self._is_gemini_direct(self._model) and not self._action_model:
             return await self._get_gemini_direct().chat_with_tools(
                 messages=messages,
                 tools=tools,
@@ -242,30 +262,56 @@ class OllamaLLM:
             )
 
         working_messages = list(messages)
-        options, think = await self._build_options_and_think(self._model)
+        # Pattern D state: start every loop on the chat model (best planner).
+        # Once any tool call lands in `action_tool_names`, swap to the local
+        # action_model for the rest of this loop — that's where the rate-limit-
+        # burning, mechanical execution work happens (screenshot/click/type/
+        # read_file etc.) and the cheap local model handles it fine.
+        action_set = set(action_tool_names or ())
+        active_model = self._model
+        options, think = await self._build_options_and_think(active_model)
+        loop_swapped = False
 
         for iteration in range(max_iterations):
-            chat_kwargs: dict = {
-                "model": self._model,
-                "messages": working_messages,
-                "tools": tools,
-            }
-            if options:
-                chat_kwargs["options"] = options
-            if think is not None:
-                chat_kwargs["think"] = think
-            try:
-                response = await asyncio.wait_for(
-                    self._client.chat(**chat_kwargs),
-                    timeout=self._timeout,
+            # Dispatch this single iteration based on active_model. The
+            # OUTER loop (tool execution + swap decision) is unified;
+            # only the model call differs.
+            if self._is_gemini_direct(active_model):
+                # Gemini direct returns normalized {text, function_calls}
+                gem_result = await self._get_gemini_direct()._generate(
+                    working_messages, active_model, tools=tools,
                 )
-            except asyncio.TimeoutError:
-                raise LLMError(f"Ollama chat (tools) timed out after {self._timeout}s")
-            except Exception as e:
-                raise LLMError(f"Ollama chat (tools) failed: {e}") from e
+                text = gem_result.get("text", "")
+                gemini_calls = gem_result.get("function_calls") or []
+                # Translate Gemini's call shape to Ollama's so the rest of
+                # the loop body stays uniform.
+                tool_calls = [
+                    {"function": {"name": c.get("name"), "arguments": c.get("args") or {}}}
+                    for c in gemini_calls
+                ]
+                message = {"role": "assistant", "content": text}
+            else:
+                chat_kwargs: dict = {
+                    "model": active_model,
+                    "messages": working_messages,
+                    "tools": tools,
+                }
+                if options:
+                    chat_kwargs["options"] = options
+                if think is not None:
+                    chat_kwargs["think"] = think
+                try:
+                    response = await asyncio.wait_for(
+                        self._client.chat(**chat_kwargs),
+                        timeout=self._timeout,
+                    )
+                except asyncio.TimeoutError:
+                    raise LLMError(f"Ollama chat (tools) timed out after {self._timeout}s")
+                except Exception as e:
+                    raise LLMError(f"Ollama chat (tools) failed: {e}") from e
 
-            message = response.get("message", {}) or {}
-            tool_calls = message.get("tool_calls") or []
+                message = response.get("message", {}) or {}
+                tool_calls = message.get("tool_calls") or []
 
             if not tool_calls:
                 text = (message.get("content") or "").strip()
@@ -309,6 +355,24 @@ class OllamaLLM:
                     "name":    name,
                     "content": json.dumps(result, default=str),
                 })
+
+                # Pattern D: as soon as the model uses an action tool, swap
+                # to action_model for all subsequent iterations of THIS loop.
+                # The first call (planning) stays on the smart model; every
+                # follow-up (mechanical execution) hits the local model.
+                if (
+                    not loop_swapped
+                    and self._action_model
+                    and name in action_set
+                    and self._action_model != active_model
+                ):
+                    logger.info(
+                        f"[LLM/Pattern-D] action tool '{name}' triggered — "
+                        f"swapping loop from '{active_model}' to '{self._action_model}'"
+                    )
+                    active_model = self._action_model
+                    options, think = await self._build_options_and_think(active_model)
+                    loop_swapped = True
 
         logger.warning(
             f"[LLM] Tool loop hit max_iterations={max_iterations} without final answer"

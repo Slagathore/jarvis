@@ -417,6 +417,7 @@ class ModelRegistry:
                 "user_notes": note_row.get("user_notes", ""),
                 "active_chat": (caps.name == self._llm.model),
                 "active_vision": (caps.name == self._llm.vision_model),
+                "active_action": (caps.name == self._llm.action_model),
                 "is_api_direct": True,
             })
 
@@ -447,6 +448,7 @@ class ModelRegistry:
                 "user_notes": note_row.get("user_notes", ""),
                 "active_chat": (name == self._llm.model),
                 "active_vision": (name == self._llm.vision_model),
+                "active_action": (name == self._llm.action_model),
                 "is_api_direct": False,
             })
         return out
@@ -494,12 +496,19 @@ class ModelRegistry:
             return False
 
     async def set_active(self, name: str, kind: str = "chat") -> bool:
-        """Hot-swap the active model. kind ∈ {'chat', 'vision'}.
+        """Hot-swap the active model. kind ∈ {'chat', 'vision', 'action'}.
+        - chat:   model used as the LLM brain for normal turns.
+        - vision: model used for vision_query (scene description, etc.).
+        - action: model used by Pattern D — once any action tool fires
+                  inside a chat_with_tools loop, subsequent iterations
+                  swap to this model.
         Caller is responsible for any UI notification — we just flip the
         in-memory pointer and update config.yaml-on-disk so the new value
         survives restart."""
         if kind == "vision":
             self._llm.set_vision_model(name)
+        elif kind == "action":
+            self._llm.set_action_model(name)
         else:
             self._llm.set_active_model(name)
         # Persist to config so a restart picks it up. Best-effort — log on failure.
@@ -509,7 +518,12 @@ class ModelRegistry:
             cfg_path = _Path(__file__).resolve().parents[2] / "config.yaml"
             data = _yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
             if isinstance(data, dict) and "ollama" in data:
-                key = "vision_model" if kind == "vision" else "model"
+                if kind == "vision":
+                    key = "vision_model"
+                elif kind == "action":
+                    key = "action_model"
+                else:
+                    key = "model"
                 data["ollama"][key] = name
                 cfg_path.write_text(_yaml.dump(data, sort_keys=False), encoding="utf-8")
         except Exception as e:

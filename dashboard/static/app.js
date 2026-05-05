@@ -1683,6 +1683,7 @@ function renderModels() {
   const catalog = _modelsCache.catalog || [];
   const chatSel = document.getElementById("model-chat-select");
   const visSel = document.getElementById("model-vision-select");
+  const actSel = document.getElementById("model-action-select");
   const datalist = document.getElementById("model-catalog");
   const list = document.getElementById("model-installed-list");
   const activeCaps = document.getElementById("model-active-caps");
@@ -1691,25 +1692,39 @@ function renderModels() {
   if (installed.length === 0) {
     chatSel.innerHTML = `<option value="">no models installed</option>`;
     visSel.innerHTML = `<option value="">no models installed</option>`;
+    if (actSel) actSel.innerHTML = `<option value="">no models installed</option>`;
     list.innerHTML = `<div class="who-empty">No models installed. Pull one above.</div>`;
   } else {
-    chatSel.innerHTML = installed.map((m) =>
-      `<option value="${escapeHtml(m.name)}" ${m.active_chat ? "selected" : ""}>${escapeHtml(m.name)}</option>`
+    const opts = (active_field) => installed.map((m) =>
+      `<option value="${escapeHtml(m.name)}" ${m[active_field] ? "selected" : ""}>${escapeHtml(m.name)}</option>`
     ).join("");
-    visSel.innerHTML = installed.map((m) =>
-      `<option value="${escapeHtml(m.name)}" ${m.active_vision ? "selected" : ""}>${escapeHtml(m.name)}</option>`
-    ).join("");
+    chatSel.innerHTML = opts("active_chat");
+    visSel.innerHTML = opts("active_vision");
+    if (actSel) actSel.innerHTML = `<option value="">— disabled —</option>` + opts("active_action");
 
     list.innerHTML = "";
     installed.forEach((m) => {
       const row = document.createElement("div");
       row.className = "model-row-installed";
       const sizeMb = m.size_bytes ? `${(m.size_bytes / 1e9).toFixed(1)} GB` : "";
+      // Active-role badges. Per Cole's spec, the tune gear shows ONLY for
+      // models currently active in some role, and sits between the name
+      // and the role labels.
+      const isActive = m.active_chat || m.active_vision || m.active_action;
+      const roleBadges = [
+        m.active_chat   ? `<span class="model-role-badge role-chat">CHAT</span>`     : "",
+        m.active_vision ? `<span class="model-role-badge role-vision">VISION</span>` : "",
+        m.active_action ? `<span class="model-role-badge role-action">ACTION</span>` : "",
+      ].join("");
+      const tuneBtn = isActive
+        ? `<button class="model-tune" data-name="${escapeHtml(m.name)}" title="Tune sampling parameters + thinking mode">⚙</button>`
+        : "";
       row.innerHTML = `
         <div class="model-row-line1">
           <span class="model-name">${escapeHtml(m.name)}</span>
+          ${tuneBtn}
+          <span class="model-roles">${roleBadges}</span>
           <span class="model-size">${sizeMb}</span>
-          <button class="model-tune" data-name="${escapeHtml(m.name)}" title="Tune sampling parameters + thinking mode">⚙</button>
           <button class="model-del" data-name="${escapeHtml(m.name)}" title="Remove">×</button>
         </div>
         <div class="model-row-caps">${_capsBadges(m.capabilities)}</div>
@@ -1721,10 +1736,13 @@ function renderModels() {
         if (!confirm(`Delete '${m.name}' from disk?`)) return;
         fetch(`/api/models/${encodeURIComponent(m.name)}`, { method: "DELETE" }).catch(() => {});
       });
-      row.querySelector(".model-tune").addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        openModelTuneModal(m.name);
-      });
+      const tuneEl = row.querySelector(".model-tune");
+      if (tuneEl) {
+        tuneEl.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          openModelTuneModal(m.name);
+        });
+      }
       list.appendChild(row);
     });
   }
@@ -1754,9 +1772,11 @@ function setActiveModel(kind, name) {
 
 const chatSelEl = document.getElementById("model-chat-select");
 const visSelEl = document.getElementById("model-vision-select");
+const actSelEl = document.getElementById("model-action-select");
 const pullBtnEl = document.getElementById("model-pull-btn");
 if (chatSelEl) chatSelEl.addEventListener("change", (e) => setActiveModel("chat", e.target.value));
 if (visSelEl) visSelEl.addEventListener("change", (e) => setActiveModel("vision", e.target.value));
+if (actSelEl) actSelEl.addEventListener("change", (e) => setActiveModel("action", e.target.value));
 if (pullBtnEl) pullBtnEl.addEventListener("click", () => {
   const inp = document.getElementById("model-pull-name");
   const name = (inp && inp.value || "").trim();
@@ -1815,6 +1835,10 @@ function pullModel(name) {
 }
 
 loadModels();
+// Periodic refresh — picks up models pulled via the Ollama CLI (or by
+// other means outside the dashboard) without needing a page reload.
+// 30s is frequent enough to feel "live" without spamming the daemon.
+setInterval(loadModels, 30000);
 
 // ── MODEL TUNE MODAL (sampling params + thinking) ─────────────────────────
 

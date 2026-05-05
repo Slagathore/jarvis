@@ -839,6 +839,7 @@ class Orchestrator:
                 messages=prompt_context,
                 tools=tools,
                 tool_handlers=handlers,
+                action_tool_names=self._ACTION_TOOL_NAMES,
             )
         else:
             response = await self.llm.chat(messages=prompt_context)
@@ -1478,6 +1479,22 @@ class Orchestrator:
             "edit_file":     s.edit_file,
             "restart_self":  s.restart_self,
         }
+
+    # ── Pattern D: action tools that trigger mid-loop model swap ────────────
+    # When the LLM calls any of these tool names, OllamaLLM.chat_with_tools
+    # swaps the rest of the loop onto the configured action_model (typically
+    # a cheap local model like qwen3.5:4b) so the rate-limit-burning
+    # mechanical execution doesn't keep hitting the cloud chat model.
+    _ACTION_TOOL_NAMES: set = {
+        # Computer control
+        "screenshot", "screen_size",
+        "mouse_click", "mouse_move",
+        "keyboard_type", "keyboard_hotkey",
+        # Self-edit (read tools count too — file exploration was a major
+        # rate-limit burn pattern Cole observed)
+        "read_file", "list_files", "grep_files", "git_log",
+        "write_file", "edit_file", "restart_self",
+    }
 
     def _build_tool_registry(self) -> tuple[list[dict], dict]:
         """Aggregate every tool currently available to the LLM.

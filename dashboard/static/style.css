@@ -1397,6 +1397,19 @@ main {
 }
 .model-tune:hover { color: var(--text); border-color: var(--text-dim); }
 
+.model-roles { display: inline-flex; gap: 3px; }
+.model-role-badge {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  padding: 1px 4px;
+  border-radius: 2px;
+  border: 1px solid var(--border);
+}
+.role-chat   { color: #6ec1ff; border-color: #6ec1ff44; background: #6ec1ff11; }
+.role-vision { color: #f5a14a; border-color: #f5a14a44; background: #f5a14a11; }
+.role-action { color: #8effa1; border-color: #8effa144; background: #8effa111; }
+
 /* Tune modal — reuses .person-modal styles */
 .model-tune-name {
   font-family: var(--mono);
