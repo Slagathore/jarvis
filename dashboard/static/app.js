@@ -1545,6 +1545,7 @@ function renderMemory(items) {
   items.forEach((m) => {
     const row = document.createElement("div");
     row.className = `memory-row mem-${m.kind || "fact"}`;
+    row.dataset.id = String(m.id);
     const subj = m.subject ? `<span class="mem-subject">[${escapeHtml(m.subject)}]</span> ` : "";
     const imp = (m.importance || 0).toFixed(2);
     const ts = (m.created_at || "").slice(0, 16);
@@ -1552,7 +1553,8 @@ function renderMemory(items) {
       <div class="mem-line1">
         <span class="mem-kind">${escapeHtml(m.kind || "fact")}</span>
         <span class="mem-importance">${imp}</span>
-        <button class="mem-del" data-id="${m.id}">×</button>
+        <button class="mem-edit" data-id="${m.id}" title="Edit">✎</button>
+        <button class="mem-del" data-id="${m.id}" title="Delete">×</button>
       </div>
       <div class="mem-content">${subj}${escapeHtml(m.content)}</div>
       <div class="mem-meta">${ts}${typeof m.score === "number" ? ` · score ${m.score.toFixed(2)}` : ""}</div>
@@ -1561,8 +1563,61 @@ function renderMemory(items) {
       if (!confirm("Delete this memory?")) return;
       fetch(`/api/memory/${m.id}`, { method: "DELETE" }).catch(() => {});
     });
+    row.querySelector(".mem-edit").addEventListener("click", () => beginMemoryEdit(row, m));
     el.appendChild(row);
   });
+}
+
+function beginMemoryEdit(row, m) {
+  // Replace the static row with an inline edit form. Saving fires the
+  // existing POST /api/memory/{id} endpoint; cancelling restores the row.
+  const original = row.innerHTML;
+  row.classList.add("mem-editing");
+  row.innerHTML = `
+    <div class="mem-line1">
+      <select class="dev-select mem-edit-kind">
+        ${["fact","preference","event","instruction","thought","question"].map(k =>
+          `<option value="${k}" ${k === (m.kind || "fact") ? "selected" : ""}>${k}</option>`
+        ).join("")}
+      </select>
+      <input type="number" step="0.05" min="0" max="1" class="mem-edit-importance" value="${(m.importance || 0).toFixed(2)}" />
+    </div>
+    <input type="text" class="reminder-input mem-edit-subject" placeholder="subject (optional)" value="${escapeHtml(m.subject || "")}" />
+    <textarea class="reminder-input mem-edit-content" rows="3">${escapeHtml(m.content || "")}</textarea>
+    <div class="mem-edit-actions">
+      <button class="dev-btn mem-edit-save">SAVE</button>
+      <button class="dev-btn mem-edit-cancel">CANCEL</button>
+    </div>
+  `;
+  const cancel = () => { row.innerHTML = original; row.classList.remove("mem-editing"); _attachMemoryRowHandlers(row, m); };
+  row.querySelector(".mem-edit-cancel").addEventListener("click", cancel);
+  row.querySelector(".mem-edit-save").addEventListener("click", () => {
+    const body = {
+      kind:       row.querySelector(".mem-edit-kind").value,
+      importance: parseFloat(row.querySelector(".mem-edit-importance").value),
+      subject:    row.querySelector(".mem-edit-subject").value.trim() || null,
+      content:    row.querySelector(".mem-edit-content").value.trim(),
+    };
+    if (!body.content) return;
+    fetch(`/api/memory/${m.id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(() => {
+      // memory.updated WS event will fire loadMemory; if it doesn't (offline
+      // race), still refresh after a short delay as a fallback.
+      setTimeout(loadMemory, 250);
+    }).catch(() => {});
+  });
+}
+
+function _attachMemoryRowHandlers(row, m) {
+  // Re-attach handlers after a cancelled edit (we did innerHTML replace).
+  row.querySelector(".mem-del")?.addEventListener("click", () => {
+    if (!confirm("Delete this memory?")) return;
+    fetch(`/api/memory/${m.id}`, { method: "DELETE" }).catch(() => {});
+  });
+  row.querySelector(".mem-edit")?.addEventListener("click", () => beginMemoryEdit(row, m));
 }
 
 document.getElementById("memory-kind-filter")?.addEventListener("change", loadMemory);

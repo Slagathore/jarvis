@@ -99,11 +99,16 @@ class IdentityManager:
         face_recognizer: Any,
         config: Optional[dict] = None,
         notifier: Optional[Any] = None,
+        broadcast: Optional[Any] = None,
     ) -> None:
         self._db = db
         self._spk = speaker_identifier
         self._face = face_recognizer
         self._notifier = notifier
+        # Async callback for pushing live events to the dashboard. Fires
+        # 'identity_pending_added' from _write_pending so the pending list
+        # updates in real time without waiting for a manual reload.
+        self._broadcast = broadcast
         cfg = (config or {}).get("identity", {}) if config else {}
         self._th = {
             "voice": {**DEFAULTS["voice"], **(cfg.get("voice") or {})},
@@ -634,6 +639,20 @@ class IdentityManager:
                 _now_iso(),
             ),
         )
+        # Live-refresh the dashboard's pending-review list. Without this the
+        # list only repaints on manual reload.
+        if self._broadcast is not None:
+            try:
+                await self._broadcast({
+                    "type": "identity_pending_added",
+                    "pending_id": int(pending_id),
+                    "kind": kind,
+                    "person_id": person_id,
+                    "cluster_id": cluster_id,
+                })
+            except Exception as e:
+                logger.debug(f"[Identity] pending broadcast failed: {e}")
+
         # Surface in the dashboard bell. Drift conflicts get a warning severity
         # because a person we know hasn't been recognized cleanly; cold
         # clusters are info-level (just "someone new keeps showing up").

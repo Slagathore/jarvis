@@ -572,9 +572,20 @@ class Orchestrator:
                     record_device = (
                         self.wake.device if self.wake else recording_cfg.get("device")
                     )
+                    # Use the pre-wake noise floor measured by wake_word's
+                    # always-on stream — far more reliable than calibrating
+                    # during the first 400ms of recording (which clips the
+                    # user mid-sentence if they start talking immediately).
+                    pre_floor = (
+                        self.wake.get_noise_floor_db(
+                            fallback_db=recording_cfg["silence_threshold_db"]
+                        )
+                        if self.wake else recording_cfg["silence_threshold_db"]
+                    )
+                    logger.debug(f"[Wake] using pre-calibrated floor: {pre_floor:.1f} dBFS")
                     audio_data = await asyncio.to_thread(
                         record_until_silence,
-                        silence_threshold_db=recording_cfg["silence_threshold_db"],
+                        silence_threshold_db=pre_floor,
                         silence_duration_ms=recording_cfg["silence_duration_ms"],
                         max_duration_seconds=recording_cfg["max_duration_seconds"],
                         speech_start_timeout_seconds=recording_cfg.get(
@@ -586,9 +597,8 @@ class Orchestrator:
                         fixed_duration_seconds=float(
                             recording_cfg.get("fixed_duration_seconds", 7.0)
                         ),
-                        adaptive_noise_floor=recording_cfg.get(
-                            "adaptive_noise_floor", True
-                        ),
+                        # Adaptive disabled — pre-wake floor is what we use now.
+                        adaptive_noise_floor=False,
                     )
                 finally:
                     # Always release the mic, even on exception
@@ -2411,10 +2421,21 @@ class Orchestrator:
                     record_device = (
                         self.wake.device if self.wake else recording_cfg.get("device")
                     )
-                    logger.debug(f"[Followup] record_device={record_device}")
+                    # Use the pre-wake noise floor (from wake_word's rolling
+                    # ambient measurement) instead of calibrating mid-recording.
+                    pre_floor = (
+                        self.wake.get_noise_floor_db(
+                            fallback_db=recording_cfg.get("silence_threshold_db", -45.0)
+                        )
+                        if self.wake
+                        else recording_cfg.get("silence_threshold_db", -45.0)
+                    )
+                    logger.debug(
+                        f"[Followup] record_device={record_device}, pre-floor={pre_floor:.1f} dBFS"
+                    )
                     audio_data = await asyncio.to_thread(
                         record_until_silence,
-                        silence_threshold_db=recording_cfg.get("silence_threshold_db", -45.0),
+                        silence_threshold_db=pre_floor,
                         silence_duration_ms=recording_cfg.get("silence_duration_ms", 600),
                         # Full recording-length cap (safety net only). Silence
                         # detection ends normal turns; without this we'd risk
@@ -2427,11 +2448,8 @@ class Orchestrator:
                         speech_start_timeout_seconds=listen_seconds,
                         device=record_device,
                         mode="silence",
-                        # ALWAYS off for follow-up: the user may already be
-                        # mid-sentence when the window opens, which would
-                        # poison adaptive calibration (it'd treat speech as
-                        # ambient and set the threshold above the voice). The
-                        # static -45 dBFS floor is plenty for in-room speech.
+                        # Pre-wake calibration is used; in-recording adaptive
+                        # would re-poison itself if user is mid-sentence.
                         adaptive_noise_floor=False,
                     )
                 finally:
@@ -2862,6 +2880,7 @@ class Orchestrator:
                 face_recognizer=self.face_recognizer,
                 config=self.config,
                 notifier=self.notifications,
+                broadcast=self._broadcast,
             )
             try:
                 await self.identity.init()

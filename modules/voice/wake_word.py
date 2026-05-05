@@ -94,6 +94,15 @@ class WakeWordDetector:
         # 5 seconds at 16kHz / 1280 samples per chunk = ~62 chunks.
         self._audio_buffer: deque = deque(maxlen=80)
         self._audio_buffer_lock = threading.Lock()
+        # Rolling per-block dBFS levels used for pre-wake noise-floor
+        # calibration. The recorder reads get_noise_floor_db() instead of
+        # calibrating from the first 400ms of recording (which clips the user
+        # mid-sentence if they start talking immediately after the wake word).
+        # 50 blocks @ 80ms = ~4 seconds of recent ambient — enough to
+        # characterize the room without lagging on changes (TV turning on,
+        # someone walking up).
+        self._level_history: deque = deque(maxlen=50)
+        self._level_history_lock = threading.Lock()
 
     def load(self) -> None:
         """
@@ -229,8 +238,17 @@ class WakeWordDetector:
                         self._audio_buffer.append(audio_chunk.copy())
 
                     # Audio level meter — track normalized RMS for dashboard
+                    # AND push per-block dB into the rolling level history so
+                    # get_noise_floor_db() can serve a pre-calibrated value to
+                    # the recorder. We do per-block (not the averaged value)
+                    # because percentile-based floor estimation needs the
+                    # variance to distinguish ambient floor from speech bursts.
                     chunk_norm = audio_chunk.astype(np.float32) / 32768.0
-                    level_buffer.append(float(np.sqrt(np.mean(chunk_norm ** 2))))
+                    chunk_rms = float(np.sqrt(np.mean(chunk_norm ** 2)))
+                    chunk_db = 20.0 * float(np.log10(chunk_rms)) if chunk_rms > 1e-10 else -100.0
+                    with self._level_history_lock:
+                        self._level_history.append(chunk_db)
+                    level_buffer.append(chunk_rms)
                     if len(level_buffer) >= level_blocks_per_emit:
                         avg_rms = sum(level_buffer) / len(level_buffer)
                         level_buffer.clear()
@@ -309,6 +327,37 @@ class WakeWordDetector:
         """Signal the stream loop to stop. Non-blocking."""
         self._running = False
         logger.debug("[WakeWord] Stop requested")
+
+    def get_noise_floor_db(
+        self,
+        percentile: float = 25.0,
+        margin_db: float = 8.0,
+        fallback_db: float = -45.0,
+    ) -> float:
+        """
+        Pre-calibrated silence threshold from the recent ambient stream.
+
+        Returns (p25 of last ~4s of per-block dBFS) + margin_db. Using the
+        25th percentile (not min) shrugs off transient quiet dips between
+        words so the floor reflects steady-state ambient. The +8dB margin
+        sits above the noise floor so real speech (typically 15-25dB above
+        ambient at indoor distance) clears it cleanly even at the quiet end
+        of a sentence.
+
+        Falls back to fallback_db if no history has been collected yet
+        (first second of boot, or stream just resumed).
+        """
+        with self._level_history_lock:
+            samples = list(self._level_history)
+        if len(samples) < 5:
+            return fallback_db
+        floor_db = float(np.percentile(samples, percentile))
+        threshold = floor_db + margin_db
+        # Never go ABOVE -25 dBFS — at that level even a normal speaking
+        # voice ~30cm from the mic might fall below the threshold and look
+        # like silence. Caps the room from being so loud that we'd never
+        # detect speech at all.
+        return min(-25.0, threshold)
 
     def get_recent_audio(self, seconds: float) -> Optional[np.ndarray]:
         """
