@@ -555,189 +555,198 @@ class Orchestrator:
             logger.debug("[Wake] Blocked by interruptibility gate")
             return
 
+        # ── CAPTURE PHASE — mic-exclusive, lock held briefly ────────────────
+        # Holding the wake_lock across the LLM tool loop (which can run for
+        # minutes) used to make subsequent wakes silently queue with no chime.
+        # The lock now covers ONLY the chime + record window so a new wake
+        # can fire its own beep + capture in parallel with whatever the prior
+        # turn's LLM is still doing.
+        from modules.voice.audio_utils import (
+            SAMPLE_RATE,
+            db_from_rms,
+            play_chime_async,
+            record_until_silence,
+        )
+        audio_data = None
         async with self._wake_lock:
+            was_audio_active = self._audio_io_active
             self._audio_io_active = True
+            if self.wake:
+                self.wake.suspend()
             try:
-                from modules.voice.audio_utils import (
-                    SAMPLE_RATE,
-                    db_from_rms,
-                    play_chime_async,
+                await play_chime_async()
+                await asyncio.sleep(0.3)
+
+                recording_cfg = self.config["voice"]["recording"]
+                record_device = (
+                    self.wake.device if self.wake else recording_cfg.get("device")
+                )
+                # Use the pre-wake noise floor measured by wake_word's
+                # always-on stream — far more reliable than calibrating
+                # during the first 400ms of recording (which clips the
+                # user mid-sentence if they start talking immediately).
+                pre_floor = (
+                    self.wake.get_noise_floor_db(
+                        fallback_db=recording_cfg["silence_threshold_db"]
+                    )
+                    if self.wake else recording_cfg["silence_threshold_db"]
+                )
+                logger.debug(f"[Wake] using pre-calibrated floor: {pre_floor:.1f} dBFS")
+                audio_data = await asyncio.to_thread(
                     record_until_silence,
+                    silence_threshold_db=pre_floor,
+                    silence_duration_ms=recording_cfg["silence_duration_ms"],
+                    max_duration_seconds=recording_cfg["max_duration_seconds"],
+                    speech_start_timeout_seconds=recording_cfg.get(
+                        "speech_start_timeout_seconds",
+                        5.0,
+                    ),
+                    device=record_device,
+                    mode=recording_cfg.get("mode", "silence"),
+                    fixed_duration_seconds=float(
+                        recording_cfg.get("fixed_duration_seconds", 7.0)
+                    ),
+                    # Adaptive disabled — pre-wake floor is what we use now.
+                    adaptive_noise_floor=False,
                 )
-
-                # Suspend wake word mic — prevents dual-InputStream conflict on Windows WASAPI
-                if self.wake:
-                    self.wake.suspend()
-
-                try:
-                    await play_chime_async()
-                    await asyncio.sleep(0.3)
-
-                    recording_cfg = self.config["voice"]["recording"]
-                    record_device = (
-                        self.wake.device if self.wake else recording_cfg.get("device")
-                    )
-                    # Use the pre-wake noise floor measured by wake_word's
-                    # always-on stream — far more reliable than calibrating
-                    # during the first 400ms of recording (which clips the
-                    # user mid-sentence if they start talking immediately).
-                    pre_floor = (
-                        self.wake.get_noise_floor_db(
-                            fallback_db=recording_cfg["silence_threshold_db"]
-                        )
-                        if self.wake else recording_cfg["silence_threshold_db"]
-                    )
-                    logger.debug(f"[Wake] using pre-calibrated floor: {pre_floor:.1f} dBFS")
-                    audio_data = await asyncio.to_thread(
-                        record_until_silence,
-                        silence_threshold_db=pre_floor,
-                        silence_duration_ms=recording_cfg["silence_duration_ms"],
-                        max_duration_seconds=recording_cfg["max_duration_seconds"],
-                        speech_start_timeout_seconds=recording_cfg.get(
-                            "speech_start_timeout_seconds",
-                            5.0,
-                        ),
-                        device=record_device,
-                        mode=recording_cfg.get("mode", "silence"),
-                        fixed_duration_seconds=float(
-                            recording_cfg.get("fixed_duration_seconds", 7.0)
-                        ),
-                        # Adaptive disabled — pre-wake floor is what we use now.
-                        adaptive_noise_floor=False,
-                    )
-                finally:
-                    # Always release the mic, even on exception
-                    if self.wake:
-                        self.wake.wakeup()
-
-                if audio_data is None or len(audio_data) == 0:
-                    logger.debug("[Wake] No audio recorded")
-                    return
-
-                duration_s = len(audio_data) / SAMPLE_RATE
-                rms = float(np.sqrt(np.mean(audio_data ** 2))) if len(audio_data) else 0.0
-                logger.info(
-                    f"[Wake] Captured {duration_s:.2f}s of audio "
-                    f"(rms={db_from_rms(rms):.1f} dBFS)"
-                )
-
-                # Voice enrollment fast-path: if dashboard armed an enrollment,
-                # route this capture into IdentityManager as a voice_sample for
-                # the given name + prompt_id, instead of running STT/LLM.
-                if (
-                    self._pending_speaker_enrollment is not None
-                    and self.identity is not None
-                ):
-                    name, prompt_id = self._pending_speaker_enrollment
-                    self._pending_speaker_enrollment = None
-                    sample_id = await self.identity.enroll_voice(
-                        name, audio_data, prompt_id=prompt_id
-                    )
-                    ok = sample_id is not None
-                    await self._broadcast({
-                        "type":      "speaker_enrolled",
-                        "name":      name,
-                        "ok":        ok,
-                        "prompt_id": prompt_id,
-                    })
-                    confirmation = await self._compose_in_character(
-                        prompt=(
-                            f"You just successfully recorded a voice sample for '{name}'. "
-                            f"Speak a single short in-character acknowledgement that "
-                            f"you'll recognize them now. No preamble, no quotes."
-                        ) if ok else (
-                            f"You tried to enroll a voice sample for '{name}' but it "
-                            f"failed. Apologize briefly in your usual voice. No "
-                            f"preamble, no quotes."
-                        ),
-                        fallback=(f"Got it, I'll remember your voice as {name}." if ok
-                                  else f"Sorry, I couldn't save your voice sample."),
-                    )
-                    await self._speak(confirmation, room=room, priority="conversation")
-                    return
-
-                stt = self.stt
-                if stt is None:
-                    logger.warning("[Wake] STT module not initialized — skipping transcript")
-                    return
-                transcript = await asyncio.to_thread(stt.transcribe, audio_data)
-                if not transcript or not transcript.strip():
-                    logger.info("[Wake] Empty transcript — nothing heard after chime")
-                    # Dump capture to data/debug/ so we can listen and tell whether
-                    # the mic actually got speech or just noise.
-                    if self.config["voice"]["whisper"].get("debug_save_empty", False):
-                        try:
-                            from pathlib import Path
-                            import soundfile as sf
-                            debug_dir = (
-                                Path(self.config["system"].get("data_dir", "data/")) / "debug"
-                            )
-                            debug_dir.mkdir(parents=True, exist_ok=True)
-                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            wav_path = debug_dir / f"empty_transcript_{ts}.wav"
-                            sf.write(str(wav_path), audio_data, SAMPLE_RATE, subtype="PCM_16")
-                            logger.info(f"[Wake] Saved empty-transcript capture to {wav_path}")
-                        except Exception as save_err:
-                            logger.debug(f"[Wake] Could not save debug capture: {save_err}")
-                    return
-
-                logger.info(f"[STT] Transcript: {transcript!r}")
-
-                # Identify the speaker via the unified IdentityManager. Match on
-                # voice samples across all enrolled persons. Stash the buffer so
-                # the next vision tick can opportunistically verify the face for
-                # this person (drift refresh).
-                speaker_name: Optional[str] = None
-                identified = False
-                if self.identity is not None:
-                    try:
-                        match = await self.identity.identify_voice(audio_data)
-                        if match is not None:
-                            speaker_name = match.name
-                            identified = True
-                            ambig = " (ambiguous)" if match.is_ambiguous else ""
-                            logger.info(
-                                f"[Identity/voice] '{match.name}' "
-                                f"(sim={match.similarity:.2f}){ambig}"
-                            )
-                            self._last_wake_audio = audio_data
-                        else:
-                            logger.debug("[Identity/voice] no match — sample queued in pending")
-                    except Exception as e:
-                        logger.debug(f"[Identity/voice] identify failed: {e}")
-
-                # Live conversational enrollment: voice didn't match anyone but
-                # they actually said something. Ask them who they are; the
-                # follow-up listener will catch the reply, extract the name,
-                # and seed a person row with this original audio + camera face.
-                if (
-                    not identified
-                    and self.identity is not None
-                    and self._pending_live_enroll is None
-                ):
-                    self._pending_live_enroll = {
-                        "audio": audio_data,
-                        "room": room,
-                        "first_transcript": transcript,
-                    }
-                    question = await self._compose_in_character(
-                        prompt=(
-                            "You just heard a voice you don't recognize. They "
-                            "said: " + repr(transcript) + ". Ask, in one short "
-                            "in-character line, what you should call them. No "
-                            "preamble, no quotes."
-                        ),
-                        fallback="I don't think we've met — what should I call you?",
-                    )
-                    await self._speak(question, room=room, priority="conversation")
-                    return
-
-                await self._process_user_text(transcript, room, speaker=speaker_name)
-
-            except Exception as e:
-                logger.error(f"[Wake] Pipeline error: {e}")
             finally:
-                self._audio_io_active = False
+                if self.wake:
+                    self.wake.wakeup()
+                # Restore prior audio-io state. _speak will re-set it during
+                # any TTS playback that follows; the gap between here and
+                # there is fine for audio_classifier to read normally.
+                self._audio_io_active = was_audio_active
+        # ── LOCK RELEASED ──────────────────────────────────────────────────
+        # Subsequent wakes can now beep + capture concurrently with the rest
+        # of this turn's processing.
+
+        if audio_data is None or len(audio_data) == 0:
+            logger.debug("[Wake] No audio recorded")
+            return
+
+        try:
+            duration_s = len(audio_data) / SAMPLE_RATE
+            rms = float(np.sqrt(np.mean(audio_data ** 2))) if len(audio_data) else 0.0
+            logger.info(
+                f"[Wake] Captured {duration_s:.2f}s of audio "
+                f"(rms={db_from_rms(rms):.1f} dBFS)"
+            )
+
+            # Voice enrollment fast-path: if dashboard armed an enrollment,
+            # route this capture into IdentityManager as a voice_sample for
+            # the given name + prompt_id, instead of running STT/LLM.
+            if (
+                self._pending_speaker_enrollment is not None
+                and self.identity is not None
+            ):
+                name, prompt_id = self._pending_speaker_enrollment
+                self._pending_speaker_enrollment = None
+                sample_id = await self.identity.enroll_voice(
+                    name, audio_data, prompt_id=prompt_id
+                )
+                ok = sample_id is not None
+                await self._broadcast({
+                    "type":      "speaker_enrolled",
+                    "name":      name,
+                    "ok":        ok,
+                    "prompt_id": prompt_id,
+                })
+                confirmation = await self._compose_in_character(
+                    prompt=(
+                        f"You just successfully recorded a voice sample for '{name}'. "
+                        f"Speak a single short in-character acknowledgement that "
+                        f"you'll recognize them now. No preamble, no quotes."
+                    ) if ok else (
+                        f"You tried to enroll a voice sample for '{name}' but it "
+                        f"failed. Apologize briefly in your usual voice. No "
+                        f"preamble, no quotes."
+                    ),
+                    fallback=(f"Got it, I'll remember your voice as {name}." if ok
+                              else f"Sorry, I couldn't save your voice sample."),
+                )
+                await self._speak(confirmation, room=room, priority="conversation")
+                return
+
+            stt = self.stt
+            if stt is None:
+                logger.warning("[Wake] STT module not initialized — skipping transcript")
+                return
+            transcript = await asyncio.to_thread(stt.transcribe, audio_data)
+            if not transcript or not transcript.strip():
+                logger.info("[Wake] Empty transcript — nothing heard after chime")
+                # Dump capture to data/debug/ so we can listen and tell whether
+                # the mic actually got speech or just noise.
+                if self.config["voice"]["whisper"].get("debug_save_empty", False):
+                    try:
+                        from pathlib import Path
+                        import soundfile as sf
+                        debug_dir = (
+                            Path(self.config["system"].get("data_dir", "data/")) / "debug"
+                        )
+                        debug_dir.mkdir(parents=True, exist_ok=True)
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        wav_path = debug_dir / f"empty_transcript_{ts}.wav"
+                        sf.write(str(wav_path), audio_data, SAMPLE_RATE, subtype="PCM_16")
+                        logger.info(f"[Wake] Saved empty-transcript capture to {wav_path}")
+                    except Exception as save_err:
+                        logger.debug(f"[Wake] Could not save debug capture: {save_err}")
+                return
+
+            logger.info(f"[STT] Transcript: {transcript!r}")
+
+            # Identify the speaker via the unified IdentityManager. Match on
+            # voice samples across all enrolled persons. Stash the buffer so
+            # the next vision tick can opportunistically verify the face for
+            # this person (drift refresh).
+            speaker_name: Optional[str] = None
+            identified = False
+            if self.identity is not None:
+                try:
+                    match = await self.identity.identify_voice(audio_data)
+                    if match is not None:
+                        speaker_name = match.name
+                        identified = True
+                        ambig = " (ambiguous)" if match.is_ambiguous else ""
+                        logger.info(
+                            f"[Identity/voice] '{match.name}' "
+                            f"(sim={match.similarity:.2f}){ambig}"
+                        )
+                        self._last_wake_audio = audio_data
+                    else:
+                        logger.debug("[Identity/voice] no match — sample queued in pending")
+                except Exception as e:
+                    logger.debug(f"[Identity/voice] identify failed: {e}")
+
+            # Live conversational enrollment: voice didn't match anyone but
+            # they actually said something. Ask them who they are; the
+            # follow-up listener will catch the reply, extract the name,
+            # and seed a person row with this original audio + camera face.
+            if (
+                not identified
+                and self.identity is not None
+                and self._pending_live_enroll is None
+            ):
+                self._pending_live_enroll = {
+                    "audio": audio_data,
+                    "room": room,
+                    "first_transcript": transcript,
+                }
+                question = await self._compose_in_character(
+                    prompt=(
+                        "You just heard a voice you don't recognize. They "
+                        "said: " + repr(transcript) + ". Ask, in one short "
+                        "in-character line, what you should call them. No "
+                        "preamble, no quotes."
+                    ),
+                    fallback="I don't think we've met — what should I call you?",
+                )
+                await self._speak(question, room=room, priority="conversation")
+                return
+
+            await self._process_user_text(transcript, room, speaker=speaker_name)
+
+        except Exception as e:
+            logger.error(f"[Wake] Pipeline error: {e}")
 
     async def _process_user_text(self, text: str, room: str, speaker: Optional[str] = None) -> None:
         """
@@ -2406,122 +2415,117 @@ class Orchestrator:
         # Brief grace so reverb from our own TTS dies before we open the mic.
         await asyncio.sleep(0.4)
 
+        # ── CAPTURE PHASE — mic-exclusive, lock held briefly ────────────────
+        # Same lock-scope discipline as _on_wake_detected: hold the lock only
+        # for the suspend → record → resume window so a real wake event during
+        # processing can fire its own beep + capture in parallel.
+        from modules.voice.audio_utils import (
+            SAMPLE_RATE,
+            record_until_silence,
+            db_from_rms,
+        )
+        audio_data = None
         async with self._wake_lock:
             self._followup_depth += 1
+            was_audio_active = self._audio_io_active
             self._audio_io_active = True
+            if self.wake:
+                self.wake.suspend()
+                # Same dance the wake handler does: give wake's InputStream
+                # time to actually close before we open ours. Without this
+                # WASAPI on Windows can deny the second stream silently or
+                # return zero-filled buffers for the first ~second.
+                await asyncio.sleep(0.3)
             try:
-                from modules.voice.audio_utils import (
-                    SAMPLE_RATE,
+                record_device = (
+                    self.wake.device if self.wake else recording_cfg.get("device")
+                )
+                pre_floor = (
+                    self.wake.get_noise_floor_db(
+                        fallback_db=recording_cfg.get("silence_threshold_db", -45.0)
+                    )
+                    if self.wake
+                    else recording_cfg.get("silence_threshold_db", -45.0)
+                )
+                logger.debug(
+                    f"[Followup] record_device={record_device}, pre-floor={pre_floor:.1f} dBFS"
+                )
+                audio_data = await asyncio.to_thread(
                     record_until_silence,
+                    silence_threshold_db=pre_floor,
+                    silence_duration_ms=recording_cfg.get("silence_duration_ms", 600),
+                    max_duration_seconds=recording_cfg.get("max_duration_seconds", 60.0),
+                    speech_start_timeout_seconds=listen_seconds,
+                    device=record_device,
+                    mode="silence",
+                    adaptive_noise_floor=False,
                 )
-
-                if self.wake:
-                    self.wake.suspend()
-                    # Same dance the wake handler does: give wake's InputStream
-                    # time to actually close before we open ours. Without this
-                    # WASAPI on Windows can deny the second stream silently or
-                    # return zero-filled buffers for the first ~second.
-                    await asyncio.sleep(0.3)
-                try:
-                    record_device = (
-                        self.wake.device if self.wake else recording_cfg.get("device")
-                    )
-                    # Use the pre-wake noise floor (from wake_word's rolling
-                    # ambient measurement) instead of calibrating mid-recording.
-                    pre_floor = (
-                        self.wake.get_noise_floor_db(
-                            fallback_db=recording_cfg.get("silence_threshold_db", -45.0)
-                        )
-                        if self.wake
-                        else recording_cfg.get("silence_threshold_db", -45.0)
-                    )
-                    logger.debug(
-                        f"[Followup] record_device={record_device}, pre-floor={pre_floor:.1f} dBFS"
-                    )
-                    audio_data = await asyncio.to_thread(
-                        record_until_silence,
-                        silence_threshold_db=pre_floor,
-                        silence_duration_ms=recording_cfg.get("silence_duration_ms", 600),
-                        # Full recording-length cap (safety net only). Silence
-                        # detection ends normal turns; without this we'd risk
-                        # a stuck-open mic.
-                        max_duration_seconds=recording_cfg.get("max_duration_seconds", 60.0),
-                        # listen_seconds is the SPEECH-START timeout — bail
-                        # the window if the user doesn't begin talking within
-                        # this many seconds. Once they start, recording
-                        # continues until silence (no early cut-off).
-                        speech_start_timeout_seconds=listen_seconds,
-                        device=record_device,
-                        mode="silence",
-                        # Pre-wake calibration is used; in-recording adaptive
-                        # would re-poison itself if user is mid-sentence.
-                        adaptive_noise_floor=False,
-                    )
-                finally:
-                    if self.wake:
-                        self.wake.wakeup()
-
-                if audio_data is None or len(audio_data) == 0:
-                    logger.info("[Followup] no audio captured — window closed silently")
-                    return
-
-                duration_s = len(audio_data) / SAMPLE_RATE
-                import numpy as _np
-                rms = float(_np.sqrt(_np.mean(audio_data ** 2))) if len(audio_data) else 0.0
-                from modules.voice.audio_utils import db_from_rms
-                logger.info(
-                    f"[Followup] captured {duration_s:.2f}s "
-                    f"(rms={db_from_rms(rms):.1f} dBFS)"
-                )
-
-                # Heuristic: ignore captures that are clearly just our own
-                # TTS tail or pure ambient. We rely on speech_start_timeout
-                # above to bail when there's no real speech, so anything that
-                # gets here had energy in it.
-                if duration_s < 0.5:
-                    logger.info(f"[Followup] Capture too short ({duration_s:.2f}s) — discarding")
-                    return
-
-                stt = self.stt
-                if stt is None:
-                    return
-                transcript = await asyncio.to_thread(stt.transcribe, audio_data)
-                if not transcript or not transcript.strip():
-                    logger.info("[Followup] Empty transcript from Whisper — closing window")
-                    return
-
-                logger.info(f"[Followup] Captured turn: {transcript!r}")
-
-                # Live-enroll branch: this reply is the user telling us their name.
-                if self._pending_live_enroll is not None:
-                    enroll_state = self._pending_live_enroll
-                    self._pending_live_enroll = None
-                    await self._complete_live_enroll(
-                        reply_transcript=transcript,
-                        original_audio=enroll_state["audio"],
-                        room=enroll_state["room"],
-                    )
-                    return
-
-                # Normal continuation — same identification + LLM path as a
-                # wake-driven turn, just no chime / no wake word required.
-                speaker_name: Optional[str] = None
-                if self.identity is not None:
-                    try:
-                        match = await self.identity.identify_voice(audio_data)
-                        if match is not None:
-                            speaker_name = match.name
-                            self._last_wake_audio = audio_data
-                    except Exception as e:
-                        logger.debug(f"[Followup] identify failed: {e}")
-
-                await self._process_user_text(transcript, room, speaker=speaker_name)
-
-            except Exception as e:
-                logger.warning(f"[Followup] Pipeline error: {e}")
             finally:
-                self._audio_io_active = False
-                self._followup_depth -= 1
+                if self.wake:
+                    self.wake.wakeup()
+                self._audio_io_active = was_audio_active
+        # ── LOCK RELEASED ───────────────────────────────────────────────────
+
+        try:
+            if audio_data is None or len(audio_data) == 0:
+                logger.info("[Followup] no audio captured — window closed silently")
+                return
+
+            duration_s = len(audio_data) / SAMPLE_RATE
+            import numpy as _np
+            rms = float(_np.sqrt(_np.mean(audio_data ** 2))) if len(audio_data) else 0.0
+            logger.info(
+                f"[Followup] captured {duration_s:.2f}s "
+                f"(rms={db_from_rms(rms):.1f} dBFS)"
+            )
+
+            # Heuristic: ignore captures that are clearly just our own
+            # TTS tail or pure ambient. We rely on speech_start_timeout
+            # above to bail when there's no real speech, so anything that
+            # gets here had energy in it.
+            if duration_s < 0.5:
+                logger.info(f"[Followup] Capture too short ({duration_s:.2f}s) — discarding")
+                return
+
+            stt = self.stt
+            if stt is None:
+                return
+            transcript = await asyncio.to_thread(stt.transcribe, audio_data)
+            if not transcript or not transcript.strip():
+                logger.info("[Followup] Empty transcript from Whisper — closing window")
+                return
+
+            logger.info(f"[Followup] Captured turn: {transcript!r}")
+
+            # Live-enroll branch: this reply is the user telling us their name.
+            if self._pending_live_enroll is not None:
+                enroll_state = self._pending_live_enroll
+                self._pending_live_enroll = None
+                await self._complete_live_enroll(
+                    reply_transcript=transcript,
+                    original_audio=enroll_state["audio"],
+                    room=enroll_state["room"],
+                )
+                return
+
+            # Normal continuation — same identification + LLM path as a
+            # wake-driven turn, just no chime / no wake word required.
+            speaker_name: Optional[str] = None
+            if self.identity is not None:
+                try:
+                    match = await self.identity.identify_voice(audio_data)
+                    if match is not None:
+                        speaker_name = match.name
+                        self._last_wake_audio = audio_data
+                except Exception as e:
+                    logger.debug(f"[Followup] identify failed: {e}")
+
+            await self._process_user_text(transcript, room, speaker=speaker_name)
+
+        except Exception as e:
+            logger.warning(f"[Followup] Pipeline error: {e}")
+        finally:
+            self._followup_depth -= 1
 
     async def _complete_live_enroll(
         self,

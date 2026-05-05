@@ -1,6 +1,6 @@
 # Jarvis — Ambient Home AI
 
-A local, always-on ambient AI assistant that lives in your house instead of in a cloud.  
+A local, always-on ambient AI assistant that lives in your house instead of in a cloud.
 It watches what you're doing, respects when you're busy, and speaks up when it has something worth saying.
 
 No cloud subscriptions. No wake-word-to-server round trips. Everything runs on your local GPU.
@@ -19,7 +19,8 @@ No cloud subscriptions. No wake-word-to-server round trips. Everything runs on y
 - **Real-time dashboard** at `http://localhost:7070` — activity state, room status, conversation log, appliance tracking
 - **Multi-room support** via ESP32-CAM nodes over MQTT (optional hardware expansion)
 
----
+---https://www.amazon.com/s?k=sd+cards+64gb+high+speed
+
 
 ## Architecture
 
