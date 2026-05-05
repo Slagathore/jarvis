@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS face_samples (
     embedding    BLOB    NOT NULL,    -- 128-dim float32 (Facenet)
     pose         TEXT,                -- center | left | right | up | down | candid
     captured_at  TEXT    NOT NULL,
-    source       TEXT    NOT NULL     -- enroll | drift_capture | live_question | migration
+    source       TEXT    NOT NULL,    -- enroll | drift_capture | live_question | migration
+    image_jpeg   BLOB                 -- preview thumbnail for the dashboard; nullable for legacy/migrated rows
 );
 
 CREATE TABLE IF NOT EXISTS voice_samples (
@@ -154,6 +155,27 @@ CREATE INDEX IF NOT EXISTS idx_face_samples_person ON face_samples (person_id);
 CREATE INDEX IF NOT EXISTS idx_voice_samples_person ON voice_samples (person_id);
 CREATE INDEX IF NOT EXISTS idx_pending_resolved ON identity_pending (resolved);
 CREATE INDEX IF NOT EXISTS idx_pending_cluster ON identity_pending (cluster_id);
+
+-- ── Notifications ────────────────────────────────────────────────────────────
+-- A persistent, dashboard-surfaced inbox for things that need Cole's attention.
+-- Sources include identity drift/conflict captures, system errors that
+-- couldn't be resolved automatically, and any future module that wants to
+-- raise a flag without spamming proactive speech. The dashboard renders a
+-- bell icon with an unread count and a dropdown list; clicking a notification
+-- navigates to the relevant card (pending review, person modal, etc.).
+CREATE TABLE IF NOT EXISTS notifications (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT    NOT NULL,    -- e.g. 'identity.drift', 'identity.cluster', 'system.error'
+    title        TEXT    NOT NULL,
+    message      TEXT,
+    target_type  TEXT,                 -- 'person' | 'pending' | 'room' | NULL
+    target_id    INTEGER,              -- id within target_type
+    action       TEXT,                 -- frontend nav hint: 'open_pending', 'open_person', etc.
+    severity     TEXT    DEFAULT 'info', -- 'info' | 'warning' | 'error'
+    created_at   TEXT    NOT NULL,
+    read         INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications (read, created_at);
 
 -- Per-activity transition log used for predicted-duration + routine learning.
 -- A row is open (ended_at NULL) while the activity is current; closed when the
@@ -221,6 +243,7 @@ class DatabaseManager:
             # "duplicate column" error.
             for migration_sql in (
                 "ALTER TABLE reminders ADD COLUMN recurrence_seconds INTEGER",
+                "ALTER TABLE face_samples ADD COLUMN image_jpeg BLOB",
             ):
                 try:
                     await conn.execute(migration_sql)

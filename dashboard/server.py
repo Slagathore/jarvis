@@ -82,6 +82,7 @@ class DashboardServer:
         self._speaker_id = None       # Set by orchestrator via register_speaker_id()
         self._face_recognizer = None  # Set by orchestrator via register_face_recognizer()
         self._identity = None         # Set by orchestrator via register_identity() — Identity v2
+        self._notifications = None    # Set by orchestrator via register_notifications()
         self._webhook_manager = None  # Set by orchestrator via register_webhook_manager()
 
         self._setup_routes()
@@ -163,6 +164,10 @@ class DashboardServer:
         """Wire the Identity v2 manager so /api/identity endpoints can drive
         cross-modal enrollment and the pending-review queue."""
         self._identity = identity_manager
+
+    def register_notifications(self, manager) -> None:
+        """Wire NotificationManager so /api/notifications endpoints work."""
+        self._notifications = manager
 
     def register_webhook_manager(self, webhooks) -> None:
         """Wire WebhookManager so /api/webhook/{name} endpoints can dispatch inbound calls."""
@@ -581,6 +586,56 @@ class DashboardServer:
             await self.broadcast({"type": "identity_person_deleted", "person_id": person_id})
             return JSONResponse({"ok": ok})
 
+        @app.get("/api/identity/persons/{person_id}/thumbnail.jpg")
+        async def identity_person_thumbnail(person_id: int):
+            from fastapi.responses import Response
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            data = await ident.get_person_thumbnail(person_id)
+            if data is None:
+                raise HTTPException(status_code=404, detail="No thumbnail")
+            return Response(content=data, media_type="image/jpeg")
+
+        @app.get("/api/identity/persons/{person_id}/samples")
+        async def identity_person_samples(person_id: int):
+            ident = self._identity
+            if ident is None:
+                return JSONResponse({"face": [], "voice": []})
+            return JSONResponse({
+                "face":  await ident.list_face_samples(person_id),
+                "voice": await ident.list_voice_samples(person_id),
+            })
+
+        @app.get("/api/identity/face_samples/{sample_id}/image.jpg")
+        async def identity_face_sample_image(sample_id: int):
+            from fastapi.responses import Response
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            data = await ident.get_face_sample_image(sample_id)
+            if data is None:
+                raise HTTPException(status_code=404, detail="No image")
+            return Response(content=data, media_type="image/jpeg")
+
+        @app.delete("/api/identity/face_samples/{sample_id}")
+        async def identity_delete_face_sample(sample_id: int):
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            ok = await ident.delete_face_sample(sample_id)
+            await self.broadcast({"type": "identity_sample_deleted", "modality": "face", "id": sample_id})
+            return JSONResponse({"ok": ok})
+
+        @app.delete("/api/identity/voice_samples/{sample_id}")
+        async def identity_delete_voice_sample(sample_id: int):
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            ok = await ident.delete_voice_sample(sample_id)
+            await self.broadcast({"type": "identity_sample_deleted", "modality": "voice", "id": sample_id})
+            return JSONResponse({"ok": ok})
+
         @app.post("/api/identity/persons/{person_id}/rename")
         async def identity_rename_person(person_id: int, request: Request):
             ident = self._identity
@@ -649,6 +704,41 @@ class DashboardServer:
             await self.broadcast(
                 {"type": "identity_pending_resolved", "pending_id": pending_id, "action": action}
             )
+            return JSONResponse({"ok": ok})
+
+        # ── Notifications (bell + dropdown) ──────────────────────────────────
+
+        @app.get("/api/notifications")
+        async def notifications_list(only_unread: bool = False, limit: int = 50):
+            mgr = self._notifications
+            if mgr is None:
+                return JSONResponse({"items": [], "unread": 0})
+            items = await mgr.list_recent(limit=limit, only_unread=only_unread)
+            unread = await mgr.unread_count()
+            return JSONResponse({"items": items, "unread": unread})
+
+        @app.post("/api/notifications/{notification_id}/read")
+        async def notifications_mark_read(notification_id: int):
+            mgr = self._notifications
+            if mgr is None:
+                raise HTTPException(status_code=503, detail="Notifications not available")
+            ok = await mgr.mark_read(notification_id)
+            return JSONResponse({"ok": ok})
+
+        @app.post("/api/notifications/read_all")
+        async def notifications_mark_all_read():
+            mgr = self._notifications
+            if mgr is None:
+                raise HTTPException(status_code=503, detail="Notifications not available")
+            ok = await mgr.mark_all_read()
+            return JSONResponse({"ok": ok})
+
+        @app.delete("/api/notifications/{notification_id}")
+        async def notifications_delete(notification_id: int):
+            mgr = self._notifications
+            if mgr is None:
+                raise HTTPException(status_code=503, detail="Notifications not available")
+            ok = await mgr.delete(notification_id)
             return JSONResponse({"ok": ok})
 
         @app.post("/api/dnd")

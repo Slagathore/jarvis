@@ -98,10 +98,12 @@ class IdentityManager:
         speaker_identifier: Any,
         face_recognizer: Any,
         config: Optional[dict] = None,
+        notifier: Optional[Any] = None,
     ) -> None:
         self._db = db
         self._spk = speaker_identifier
         self._face = face_recognizer
+        self._notifier = notifier
         cfg = (config or {}).get("identity", {}) if config else {}
         self._th = {
             "voice": {**DEFAULTS["voice"], **(cfg.get("voice") or {})},
@@ -355,9 +357,9 @@ class IdentityManager:
             return None
         pid = await self.ensure_person(name)
         sample_id = await self._db.execute(
-            "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source) "
-            "VALUES (?, ?, ?, ?, 'enroll')",
-            (pid, emb.astype(np.float32).tobytes(), pose, _now_iso()),
+            "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source, image_jpeg) "
+            "VALUES (?, ?, ?, ?, 'enroll', ?)",
+            (pid, emb.astype(np.float32).tobytes(), pose, _now_iso(), _jpeg(frame)),
         )
         self._face_samples.setdefault(pid, []).append(emb.astype(np.float32))
         logger.info(f"[Identity] Enrolled face for '{name}' (pose={pose}, id={sample_id})")
@@ -490,6 +492,7 @@ class IdentityManager:
                 person_id=anchor_person_id,
                 emb=emb,
                 source="drift_capture",
+                image_jpeg=image_jpeg,
             )
             logger.info(
                 f"[Identity] {modality} drift auto-saved for "
@@ -523,6 +526,7 @@ class IdentityManager:
         source: str,
         pose: Optional[str] = None,
         prompt_id: Optional[str] = None,
+        image_jpeg: Optional[bytes] = None,
     ) -> None:
         emb_f32 = emb.astype(np.float32)
         if modality == "voice":
@@ -534,9 +538,9 @@ class IdentityManager:
             self._voice_samples.setdefault(person_id, []).append(emb_f32)
         else:
             await self._db.execute(
-                "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (person_id, emb_f32.tobytes(), pose or "candid", _now_iso(), source),
+                "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source, image_jpeg) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (person_id, emb_f32.tobytes(), pose or "candid", _now_iso(), source, image_jpeg),
             )
             self._face_samples.setdefault(person_id, []).append(emb_f32)
 
@@ -613,7 +617,7 @@ class IdentityManager:
         audio_pcm16: Optional[bytes],
         cluster_id: Optional[int],
     ) -> int:
-        return await self._db.execute(
+        pending_id = await self._db.execute(
             "INSERT INTO identity_pending "
             "(kind, person_id, cluster_id, embedding, image_jpeg, audio_pcm16, "
             " similarity, anchored_via, captured_at, resolved) "
@@ -630,6 +634,43 @@ class IdentityManager:
                 _now_iso(),
             ),
         )
+        # Surface in the dashboard bell. Drift conflicts get a warning severity
+        # because a person we know hasn't been recognized cleanly; cold
+        # clusters are info-level (just "someone new keeps showing up").
+        if self._notifier is not None:
+            try:
+                modality = "voice" if "voice" in kind else "face"
+                if kind.startswith("pending_cluster_"):
+                    title = f"New unknown {modality} captured"
+                    message = (
+                        f"Cluster #{cluster_id} — best match against enrolled people "
+                        f"is sim {similarity:.2f}. Open pending review to assign or reject."
+                    )
+                    severity = "info"
+                else:
+                    person_name = (
+                        self._persons.get(int(person_id))
+                        if person_id is not None else "unknown"
+                    )
+                    title = f"Drift on {person_name} ({modality})"
+                    message = (
+                        f"{modality.capitalize()} sample didn't loosely match "
+                        f"{person_name} (sim {similarity:.2f}, anchored via "
+                        f"{anchored_via}). Confirm or reassign in pending review."
+                    )
+                    severity = "warning"
+                await self._notifier.notify(
+                    kind=f"identity.{'cluster' if 'cluster' in kind else 'drift'}",
+                    title=title,
+                    message=message,
+                    target_type="pending",
+                    target_id=int(pending_id),
+                    action="open_pending",
+                    severity=severity,
+                )
+            except Exception as e:
+                logger.debug(f"[Identity] notification dispatch failed: {e}")
+        return pending_id
 
     # ── public read API for dashboard / orchestrator ────────────────────────
 
@@ -637,6 +678,13 @@ class IdentityManager:
         rows = await self._db.fetchall(
             "SELECT id, name, created_at, notes FROM persons ORDER BY name"
         )
+        # Pre-fetch which persons have a thumbnail-capable image so the
+        # dashboard can decide whether to render an <img> or a placeholder.
+        thumb_rows = await self._db.fetchall(
+            "SELECT person_id FROM face_samples WHERE image_jpeg IS NOT NULL "
+            "GROUP BY person_id"
+        )
+        has_thumb = {int(r["person_id"]) for r in thumb_rows}
         out = []
         for r in rows:
             pid = int(r["id"])
@@ -647,8 +695,105 @@ class IdentityManager:
                 "notes": r["notes"],
                 "face_sample_count": len(self._face_samples.get(pid, [])),
                 "voice_sample_count": len(self._voice_samples.get(pid, [])),
+                "has_thumbnail": pid in has_thumb,
             })
         return out
+
+    async def list_face_samples(self, person_id: int) -> list[dict]:
+        """Per-sample metadata for a person's face_samples, newest first."""
+        rows = await self._db.fetchall(
+            "SELECT id, pose, captured_at, source, image_jpeg IS NOT NULL AS has_image "
+            "FROM face_samples WHERE person_id = ? ORDER BY captured_at DESC",
+            (person_id,),
+        )
+        return [
+            {
+                "id": int(r["id"]),
+                "pose": r["pose"],
+                "captured_at": r["captured_at"],
+                "source": r["source"],
+                "has_image": bool(r["has_image"]),
+            }
+            for r in rows
+        ]
+
+    async def list_voice_samples(self, person_id: int) -> list[dict]:
+        """Per-sample metadata for a person's voice_samples, newest first."""
+        rows = await self._db.fetchall(
+            "SELECT id, prompt_id, captured_at, source FROM voice_samples "
+            "WHERE person_id = ? ORDER BY captured_at DESC",
+            (person_id,),
+        )
+        return [
+            {
+                "id": int(r["id"]),
+                "prompt_id": r["prompt_id"],
+                "captured_at": r["captured_at"],
+                "source": r["source"],
+            }
+            for r in rows
+        ]
+
+    async def get_face_sample_image(self, sample_id: int) -> Optional[bytes]:
+        row = await self._db.fetchone(
+            "SELECT image_jpeg FROM face_samples WHERE id = ?", (sample_id,)
+        )
+        return row["image_jpeg"] if row and row["image_jpeg"] else None
+
+    async def get_person_thumbnail(self, person_id: int) -> Optional[bytes]:
+        """Return the most-recent face_sample JPEG for a person, or None."""
+        row = await self._db.fetchone(
+            "SELECT image_jpeg FROM face_samples WHERE person_id = ? "
+            "AND image_jpeg IS NOT NULL ORDER BY captured_at DESC LIMIT 1",
+            (person_id,),
+        )
+        return row["image_jpeg"] if row and row["image_jpeg"] else None
+
+    async def delete_face_sample(self, sample_id: int) -> bool:
+        row = await self._db.fetchone(
+            "SELECT person_id, embedding FROM face_samples WHERE id = ?", (sample_id,)
+        )
+        if row is None:
+            return False
+        pid = int(row["person_id"])
+        await self._db.execute("DELETE FROM face_samples WHERE id = ?", (sample_id,))
+        # Rebuild this person's in-memory cache from DB to drop the embedding
+        await self._reload_person_samples(pid)
+        return True
+
+    async def delete_voice_sample(self, sample_id: int) -> bool:
+        row = await self._db.fetchone(
+            "SELECT person_id FROM voice_samples WHERE id = ?", (sample_id,)
+        )
+        if row is None:
+            return False
+        pid = int(row["person_id"])
+        await self._db.execute("DELETE FROM voice_samples WHERE id = ?", (sample_id,))
+        await self._reload_person_samples(pid)
+        return True
+
+    async def _reload_person_samples(self, person_id: int) -> None:
+        """Reload the in-memory caches for a single person after a sample delete."""
+        self._face_samples[person_id] = []
+        self._voice_samples[person_id] = []
+        for r in await self._db.fetchall(
+            "SELECT embedding FROM face_samples WHERE person_id = ?", (person_id,)
+        ):
+            try:
+                emb = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+                if emb.size:
+                    self._face_samples[person_id].append(emb)
+            except Exception:
+                continue
+        for r in await self._db.fetchall(
+            "SELECT embedding FROM voice_samples WHERE person_id = ?", (person_id,)
+        ):
+            try:
+                emb = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+                if emb.size:
+                    self._voice_samples[person_id].append(emb)
+            except Exception:
+                continue
 
     async def list_pending(self) -> list[dict]:
         """Pending review items (drift conflicts + unknown clusters)."""
@@ -718,6 +863,14 @@ class IdentityManager:
             )
             return True
 
+        # Image bytes (if any) attached to this pending row — preserved on
+        # the resulting face_sample so dashboard thumbnails work even for
+        # samples that came from the pending queue.
+        try:
+            row_image = row["image_jpeg"]
+        except (IndexError, KeyError):
+            row_image = None
+
         if action == "confirm":
             # Drift confirm: row already has person_id
             pid_raw = row["person_id"]
@@ -729,6 +882,7 @@ class IdentityManager:
                 person_id=pid,
                 emb=emb,
                 source="drift_capture",
+                image_jpeg=row_image,
             )
             await self._db.execute(
                 "UPDATE identity_pending SET resolved = 1 WHERE id = ?", (pending_id,)
@@ -744,12 +898,13 @@ class IdentityManager:
                 person_id=pid,
                 emb=emb,
                 source="live_question",
+                image_jpeg=row_image,
             )
             # Resolve all pending rows in the same cluster as well
             cid = row["cluster_id"]
             if cid is not None:
                 cluster_rows = await self._db.fetchall(
-                    "SELECT id, embedding FROM identity_pending "
+                    "SELECT id, embedding, image_jpeg FROM identity_pending "
                     "WHERE cluster_id = ? AND resolved = 0",
                     (cid,),
                 )
@@ -757,11 +912,16 @@ class IdentityManager:
                     cemb = np.frombuffer(cr["embedding"], dtype=np.float32).copy()
                     if int(cr["id"]) == pending_id:
                         continue
+                    try:
+                        cr_image = cr["image_jpeg"]
+                    except (IndexError, KeyError):
+                        cr_image = None
                     await self._save_sample(
                         modality=modality,
                         person_id=pid,
                         emb=cemb,
                         source="live_question",
+                        image_jpeg=cr_image,
                     )
                 await self._db.execute(
                     "UPDATE identity_pending SET resolved = 1 WHERE cluster_id = ? AND resolved = 0",

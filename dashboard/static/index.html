@@ -21,6 +21,21 @@
       </div>
       <div class="header-status">
         <div class="clock" id="clock">--:--:--</div>
+        <div class="bell-wrap" id="bell-wrap">
+          <button class="bell-btn" id="bell-btn" title="Notifications">
+            <span class="bell-icon">◉</span>
+            <span class="bell-badge" id="bell-badge" hidden>0</span>
+          </button>
+          <div class="bell-dropdown" id="bell-dropdown" hidden>
+            <div class="bell-header">
+              <span>Notifications</span>
+              <button class="bell-mark-all" id="bell-mark-all">mark all read</button>
+            </div>
+            <div class="bell-list" id="bell-list">
+              <div class="who-empty">No notifications.</div>
+            </div>
+          </div>
+        </div>
         <div class="ws-status" id="ws-status">
           <span class="dot offline"></span> OFFLINE
         </div>
@@ -294,6 +309,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=14"></script>
+    <script src="/static/app.js?v=16"></script>
   </body>
 </html>

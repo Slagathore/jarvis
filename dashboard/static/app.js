@@ -179,12 +179,27 @@ function applyEvent(event) {
     case "identity_face_enrolled":
     case "identity_person_deleted":
     case "identity_person_renamed":
+    case "identity_live_enrolled":
+      loadPersons();
+      // Refresh open profile modal too if it's the affected person
+      const openId = getOpenPersonId && getOpenPersonId();
+      if (openId) loadPersonSamples(openId);
+      break;
+    case "identity_sample_deleted": {
+      const id = getOpenPersonId && getOpenPersonId();
+      if (id) loadPersonSamples(id);
       loadPersons();
       break;
+    }
     case "identity_pending_added":
     case "identity_pending_resolved":
       loadPending();
       loadPersons();
+      break;
+    case "notification.added":
+    case "notification.read":
+    case "notification.deleted":
+      loadNotifications();
       break;
   }
 }
@@ -885,7 +900,15 @@ function renderPersons(persons) {
   persons.forEach((p) => {
     const row = document.createElement("div");
     row.className = "person-row";
+    const initial = (p.name || "?").trim().charAt(0).toUpperCase();
+    // Bust thumbnail cache after a new face sample lands so the row updates
+    // without a hard reload. _personsCacheVersion increments on every refresh.
+    const v = _personsCacheVersion;
+    const portrait = p.has_thumbnail
+      ? `<img class="person-portrait" src="/api/identity/persons/${p.id}/thumbnail.jpg?v=${v}" alt="${escapeHtml(p.name)}" />`
+      : `<div class="person-portrait person-portrait-fallback">${escapeHtml(initial)}</div>`;
     row.innerHTML = `
+      ${portrait}
       <span class="who-name">${escapeHtml(p.name)}</span>
       <span class="person-counts">
         <span title="Face samples">F${p.face_sample_count || 0}</span>
@@ -893,7 +916,13 @@ function renderPersons(persons) {
       </span>
       <button class="who-delete" data-id="${p.id}" title="Delete person + all samples">×</button>
     `;
-    row.querySelector(".who-delete").addEventListener("click", () => {
+    // Click portrait or name → open profile modal. Delete button stops propagation.
+    const open = () => openPersonProfile(p);
+    row.querySelector(".person-portrait").addEventListener("click", open);
+    row.querySelector(".who-name").addEventListener("click", open);
+    row.querySelector(".who-name").style.cursor = "pointer";
+    row.querySelector(".who-delete").addEventListener("click", (ev) => {
+      ev.stopPropagation();
       if (!confirm(`Delete '${p.name}' and all their samples?`)) return;
       fetch(`/api/identity/persons/${p.id}`, { method: "DELETE" }).catch(() => {});
     });
@@ -904,12 +933,16 @@ function renderPersons(persons) {
 // Cached persons list — drives the pending-review assign dropdown so it can
 // list everyone already in the system without an extra fetch per row.
 let _personsCache = [];
+// Bumped on every refresh so thumbnail URLs include a cache-busting query
+// param — otherwise browsers serve the stale 404/old image after enroll.
+let _personsCacheVersion = 0;
 
 function loadPersons() {
   return fetch("/api/identity/persons")
     .then((r) => r.json())
     .then(({ persons }) => {
       _personsCache = persons || [];
+      _personsCacheVersion += 1;
       renderPersons(_personsCache);
       // Re-render pending too, since its dropdown reads from _personsCache.
       const pl = document.getElementById("pending-list");
@@ -1007,6 +1040,147 @@ function populatePersonRoomSelect() {
       });
     })
     .catch(() => {});
+}
+
+// ── PERSON PROFILE MODAL ──────────────────────────────────────────────────
+
+function openPersonProfile(person) {
+  let modal = document.getElementById("person-modal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "person-modal";
+    modal.className = "person-modal";
+    modal.innerHTML = `
+      <div class="person-modal-backdrop"></div>
+      <div class="person-modal-body">
+        <div class="person-modal-header">
+          <img class="person-modal-portrait" id="person-modal-portrait" alt="portrait" />
+          <div class="person-modal-title">
+            <input type="text" id="person-modal-name" class="person-modal-name" />
+            <div class="person-modal-meta" id="person-modal-meta"></div>
+          </div>
+          <button class="person-modal-close" id="person-modal-close">×</button>
+        </div>
+        <div class="person-modal-section">
+          <div class="enroll-row-label">FACE SAMPLES</div>
+          <div class="sample-grid" id="person-faces"></div>
+        </div>
+        <div class="person-modal-section">
+          <div class="enroll-row-label">VOICE SAMPLES</div>
+          <div class="sample-list" id="person-voices"></div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+    modal.querySelector(".person-modal-backdrop").addEventListener("click", closePersonProfile);
+    document.getElementById("person-modal-close").addEventListener("click", closePersonProfile);
+  }
+  modal.classList.add("open");
+  modal.dataset.personId = String(person.id);
+
+  const portrait = document.getElementById("person-modal-portrait");
+  if (person.has_thumbnail) {
+    portrait.src = `/api/identity/persons/${person.id}/thumbnail.jpg?v=${_personsCacheVersion}`;
+    portrait.style.display = "";
+  } else {
+    portrait.style.display = "none";
+  }
+
+  const nameInput = document.getElementById("person-modal-name");
+  nameInput.value = person.name;
+  nameInput.onblur = () => {
+    const newName = nameInput.value.trim();
+    if (!newName || newName === person.name) return;
+    fetch(`/api/identity/persons/${person.id}/rename`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: newName }),
+    }).catch(() => {});
+  };
+
+  document.getElementById("person-modal-meta").textContent =
+    `Created ${person.created_at || "—"} · ${person.face_sample_count || 0} face / ${person.voice_sample_count || 0} voice samples`;
+
+  loadPersonSamples(person.id);
+}
+
+function closePersonProfile() {
+  const modal = document.getElementById("person-modal");
+  if (modal) modal.classList.remove("open");
+}
+
+function loadPersonSamples(personId) {
+  fetch(`/api/identity/persons/${personId}/samples`)
+    .then((r) => r.json())
+    .then(({ face, voice }) => {
+      renderFaceSamples(face || []);
+      renderVoiceSamples(voice || []);
+    })
+    .catch(() => {});
+}
+
+function renderFaceSamples(samples) {
+  const el = document.getElementById("person-faces");
+  if (!el) return;
+  if (!samples.length) {
+    el.innerHTML = `<div class="who-empty">No face samples.</div>`;
+    return;
+  }
+  el.innerHTML = "";
+  samples.forEach((s) => {
+    const cell = document.createElement("div");
+    cell.className = "sample-cell";
+    cell.innerHTML = `
+      ${s.has_image
+        ? `<img class="sample-thumb" src="/api/identity/face_samples/${s.id}/image.jpg" alt="sample" />`
+        : `<div class="sample-thumb sample-thumb-empty">no image</div>`}
+      <div class="sample-meta">
+        <div>${escapeHtml(s.pose || "candid")}</div>
+        <div class="sample-source">${escapeHtml(s.source)}</div>
+      </div>
+      <button class="sample-delete" data-id="${s.id}" title="Delete this sample">×</button>
+    `;
+    cell.querySelector(".sample-delete").addEventListener("click", () => {
+      if (!confirm("Delete this face sample?")) return;
+      fetch(`/api/identity/face_samples/${s.id}`, { method: "DELETE" })
+        .then(() => loadPersonSamples(getOpenPersonId()))
+        .catch(() => {});
+    });
+    el.appendChild(cell);
+  });
+}
+
+function renderVoiceSamples(samples) {
+  const el = document.getElementById("person-voices");
+  if (!el) return;
+  if (!samples.length) {
+    el.innerHTML = `<div class="who-empty">No voice samples.</div>`;
+    return;
+  }
+  el.innerHTML = "";
+  samples.forEach((s) => {
+    const row = document.createElement("div");
+    row.className = "sample-row";
+    row.innerHTML = `
+      <div class="sample-meta">
+        <div>${escapeHtml(s.prompt_id || "candid")}</div>
+        <div class="sample-source">${escapeHtml(s.source)} · ${s.captured_at}</div>
+      </div>
+      <button class="sample-delete" data-id="${s.id}" title="Delete this sample">×</button>
+    `;
+    row.querySelector(".sample-delete").addEventListener("click", () => {
+      if (!confirm("Delete this voice sample?")) return;
+      fetch(`/api/identity/voice_samples/${s.id}`, { method: "DELETE" })
+        .then(() => loadPersonSamples(getOpenPersonId()))
+        .catch(() => {});
+    });
+    el.appendChild(row);
+  });
+}
+
+function getOpenPersonId() {
+  const modal = document.getElementById("person-modal");
+  return modal && modal.dataset.personId ? parseInt(modal.dataset.personId, 10) : null;
 }
 
 // ── PENDING REVIEW ────────────────────────────────────────────────────────
@@ -1144,6 +1318,96 @@ function resolvePending(id, action, targetName) {
 populatePersonRoomSelect();
 loadPersons();
 loadPending();
+
+// ── NOTIFICATIONS (header bell) ───────────────────────────────────────────
+
+function loadNotifications() {
+  fetch("/api/notifications")
+    .then((r) => r.json())
+    .then(({ items, unread }) => {
+      renderNotifications(items || []);
+      updateBellBadge(unread || 0);
+    })
+    .catch(() => {});
+}
+
+function renderNotifications(items) {
+  const el = document.getElementById("bell-list");
+  if (!el) return;
+  if (!items.length) {
+    el.innerHTML = `<div class="who-empty">No notifications.</div>`;
+    return;
+  }
+  el.innerHTML = "";
+  items.forEach((n) => {
+    const row = document.createElement("div");
+    row.className = `bell-item bell-${n.severity || "info"}${n.read ? " bell-read" : ""}`;
+    row.innerHTML = `
+      <div class="bell-item-body">
+        <div class="bell-item-title">${escapeHtml(n.title)}</div>
+        ${n.message ? `<div class="bell-item-msg">${escapeHtml(n.message)}</div>` : ""}
+        <div class="bell-item-meta">${escapeHtml(n.created_at || "")}</div>
+      </div>
+      <button class="bell-item-x" data-id="${n.id}" title="Dismiss">×</button>
+    `;
+    row.querySelector(".bell-item-body").addEventListener("click", () => {
+      navigateToNotification(n);
+      fetch(`/api/notifications/${n.id}/read`, { method: "POST" }).catch(() => {});
+    });
+    row.querySelector(".bell-item-x").addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      fetch(`/api/notifications/${n.id}`, { method: "DELETE" }).catch(() => {});
+    });
+    el.appendChild(row);
+  });
+}
+
+function updateBellBadge(unread) {
+  const badge = document.getElementById("bell-badge");
+  if (!badge) return;
+  if (unread > 0) {
+    badge.textContent = String(unread);
+    badge.hidden = false;
+  } else {
+    badge.hidden = true;
+  }
+}
+
+function navigateToNotification(n) {
+  // Close the dropdown first
+  const dd = document.getElementById("bell-dropdown");
+  if (dd) dd.hidden = true;
+  if (n.action === "open_pending") {
+    const card = document.getElementById("pending-card");
+    if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+  } else if (n.action === "open_person" && n.target_id) {
+    const person = _personsCache.find((p) => p.id === n.target_id);
+    if (person) openPersonProfile(person);
+  }
+}
+
+const bellBtn = document.getElementById("bell-btn");
+const bellDropdown = document.getElementById("bell-dropdown");
+const bellMarkAll = document.getElementById("bell-mark-all");
+if (bellBtn && bellDropdown) {
+  bellBtn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    bellDropdown.hidden = !bellDropdown.hidden;
+    if (!bellDropdown.hidden) loadNotifications();
+  });
+  document.addEventListener("click", (ev) => {
+    if (bellDropdown.hidden) return;
+    if (!document.getElementById("bell-wrap").contains(ev.target)) {
+      bellDropdown.hidden = true;
+    }
+  });
+}
+if (bellMarkAll) {
+  bellMarkAll.addEventListener("click", () => {
+    fetch("/api/notifications/read_all", { method: "POST" }).catch(() => {});
+  });
+}
+loadNotifications();
 
 // ── Init ──────────────────────────────────────────────────────────────────
 

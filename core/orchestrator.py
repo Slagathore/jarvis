@@ -99,6 +99,7 @@ from modules.context.state import UNKNOWN_STATE, ActivityState
 from modules.context.state_fusion import StateFusion
 from modules.memory.database import DatabaseManager
 from modules.memory.event_log import EventLogger
+from modules.notifications import NotificationManager
 from modules.memory.room_baselines import RoomBaselines
 from modules.agenda import GoogleCalendar
 from modules.network.mqtt_client import MQTTClient
@@ -132,6 +133,10 @@ class Orchestrator:
         self.db: Optional[DatabaseManager] = None
         self.event_log: Optional[EventLogger] = None
         self.room_baselines: Optional[RoomBaselines] = None
+        # Persistent notification inbox surfaced by the dashboard bell.
+        # Set up after DB init; passed into IdentityManager so drift/cluster
+        # events auto-fire user-visible notifications.
+        self.notifications: Optional[NotificationManager] = None
 
         self.wake: Optional[WakeWordDetector] = None
         # Multi-room wake registry. PC mic continues to flow through `self.wake`
@@ -233,6 +238,7 @@ class Orchestrator:
         self.db = DatabaseManager(self.config)
         await self.db.init()
         self.event_log = EventLogger(self.db)
+        self.notifications = NotificationManager(db=self.db, broadcast=self._broadcast)
         # BUG FIX: RoomBaselines takes (db, config) — was only receiving db
         self.room_baselines = RoomBaselines(db=self.db, config=self.config)
         self.reminders_store = RemindersStore(self.db)
@@ -2176,13 +2182,15 @@ class Orchestrator:
 
         # Identity v2 manager — wraps speaker_id + face_recognizer with the
         # cross-modal Person abstraction. Migrates legacy speakers/faces rows
-        # on first boot, no-op after that.
+        # on first boot, no-op after that. Hooked up to the notification
+        # manager so drift/cluster events show on the dashboard bell.
         if self.db is not None:
             self.identity = IdentityManager(
                 db=self.db,
                 speaker_identifier=self.speaker_id,
                 face_recognizer=self.face_recognizer,
                 config=self.config,
+                notifier=self.notifications,
             )
             try:
                 await self.identity.init()
@@ -2244,6 +2252,8 @@ class Orchestrator:
                 # Idempotent — register only if dashboard supports the new manager
                 if hasattr(self.dashboard, "register_identity"):
                     self.dashboard.register_identity(self.identity)
+            if self.notifications is not None and hasattr(self.dashboard, "register_notifications"):
+                self.dashboard.register_notifications(self.notifications)
             if self.webhooks:
                 self.dashboard.register_webhook_manager(self.webhooks)
 
