@@ -83,6 +83,7 @@ class DashboardServer:
         self._face_recognizer = None  # Set by orchestrator via register_face_recognizer()
         self._identity = None         # Set by orchestrator via register_identity() — Identity v2
         self._notifications = None    # Set by orchestrator via register_notifications()
+        self._model_registry = None   # Set by orchestrator via register_model_registry()
         self._webhook_manager = None  # Set by orchestrator via register_webhook_manager()
 
         self._setup_routes()
@@ -168,6 +169,10 @@ class DashboardServer:
     def register_notifications(self, manager) -> None:
         """Wire NotificationManager so /api/notifications endpoints work."""
         self._notifications = manager
+
+    def register_model_registry(self, registry) -> None:
+        """Wire ModelRegistry so /api/models endpoints work."""
+        self._model_registry = registry
 
     def register_webhook_manager(self, webhooks) -> None:
         """Wire WebhookManager so /api/webhook/{name} endpoints can dispatch inbound calls."""
@@ -740,6 +745,81 @@ class DashboardServer:
                 raise HTTPException(status_code=503, detail="Notifications not available")
             ok = await mgr.delete(notification_id)
             return JSONResponse({"ok": ok})
+
+        # ── LLM model selector ──────────────────────────────────────────────
+
+        @app.get("/api/models")
+        async def models_list():
+            reg = self._model_registry
+            if reg is None:
+                return JSONResponse({"installed": [], "catalog": []})
+            return JSONResponse({
+                "installed": await reg.list_installed(),
+                "catalog":   reg.list_known_recommendations(),
+            })
+
+        @app.post("/api/models/active")
+        async def models_set_active(request: Request):
+            reg = self._model_registry
+            if reg is None:
+                raise HTTPException(status_code=503, detail="Model registry not available")
+            body = await request.json()
+            name = str(body.get("name", "")).strip()
+            kind = str(body.get("kind", "chat")).strip().lower()
+            if not name or kind not in ("chat", "vision"):
+                raise HTTPException(status_code=400, detail="name + kind required")
+            ok = await reg.set_active(name, kind=kind)
+            await self.broadcast({"type": "model.activated", "name": name, "kind": kind})
+            return JSONResponse({"ok": ok, "name": name, "kind": kind})
+
+        @app.post("/api/models/notes")
+        async def models_set_notes(request: Request):
+            reg = self._model_registry
+            if reg is None:
+                raise HTTPException(status_code=503, detail="Model registry not available")
+            body = await request.json()
+            name = str(body.get("name", "")).strip()
+            notes = str(body.get("notes", ""))
+            if not name:
+                raise HTTPException(status_code=400, detail="name required")
+            ok = await reg.set_user_notes(name, notes)
+            return JSONResponse({"ok": ok})
+
+        @app.delete("/api/models/{name:path}")
+        async def models_delete(name: str):
+            reg = self._model_registry
+            if reg is None:
+                raise HTTPException(status_code=503, detail="Model registry not available")
+            ok = await reg.delete(name)
+            await self.broadcast({"type": "model.deleted", "name": name})
+            return JSONResponse({"ok": ok})
+
+        @app.post("/api/models/pull")
+        async def models_pull(request: Request):
+            """Streams Ollama pull progress as Server-Sent Events. The
+            dashboard subscribes via fetch + ReadableStream and re-renders
+            the progress bar per chunk."""
+            from fastapi.responses import StreamingResponse
+            import json as _json
+            reg = self._model_registry
+            if reg is None:
+                raise HTTPException(status_code=503, detail="Model registry not available")
+            body = await request.json()
+            name = str(body.get("name", "")).strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="name required")
+
+            async def _stream():
+                async for chunk in reg.pull(name):
+                    yield f"data: {_json.dumps(chunk)}\n\n"
+                yield "data: {\"status\": \"done\"}\n\n"
+                # Tell the UI to refresh the installed-list once the pull lands
+                try:
+                    await self.broadcast({"type": "model.pulled", "name": name})
+                except Exception:
+                    pass
+
+            return StreamingResponse(_stream(), media_type="text/event-stream")
 
         @app.post("/api/dnd")
         async def dnd_set(request: Request):

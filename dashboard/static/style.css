@@ -1088,6 +1088,118 @@ main {
 .pending-confirm { background: var(--bg-card); border-color: var(--green, #4ade80); }
 .pending-reject:hover { border-color: var(--red); color: var(--red); }
 
+/* ── LLM model selector ───────────────────────────────────────────────── */
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.model-row .dev-select { flex: 1; }
+.model-active-caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0 8px;
+  min-height: 18px;
+}
+.cap-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 2px;
+  letter-spacing: 1px;
+  border: 1px solid var(--border);
+  background: var(--bg-card-alt);
+  color: var(--text-dim);
+}
+.cap-cloud { color: #6ec1ff; border-color: #6ec1ff44; }
+.cap-tools { color: #8effa1; border-color: #8effa144; }
+.cap-vision { color: #f5a14a; border-color: #f5a14a44; }
+.cap-think { color: #c785f5; border-color: #c785f544; }
+.cap-ctx { color: var(--text); }
+
+.model-pull-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.model-progress {
+  margin-top: 6px;
+}
+.model-progress-text {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-bottom: 2px;
+}
+.model-progress-bar {
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  height: 4px;
+  overflow: hidden;
+}
+.model-progress-fill {
+  background: var(--green, #4ade80);
+  height: 100%;
+  width: 0;
+  transition: width 0.3s ease;
+}
+.model-installed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.model-row-installed {
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+}
+.model-row-line1 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.model-name {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+}
+.model-size {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+}
+.model-del {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 2px;
+  padding: 1px 6px;
+  font-size: 10px;
+  cursor: pointer;
+}
+.model-del:hover { color: var(--red); border-color: var(--red); }
+.model-row-caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 4px;
+}
+.model-row-notes {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-style: italic;
+}
+
 /* ── Calendar ─────────────────────────────────────────────────────────────── */
 .calendar-list {
   display: flex;

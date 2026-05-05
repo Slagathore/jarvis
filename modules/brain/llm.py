@@ -71,6 +71,31 @@ class OllamaLLM:
         except ImportError as e:
             raise LLMError("ollama package not installed. Run: pip install ollama") from e
 
+    @property
+    def model(self) -> str:
+        """Current text-chat model name. Read by health checks + dashboard."""
+        return self._model
+
+    @property
+    def vision_model(self) -> str:
+        return self._vision_model
+
+    @property
+    def client(self) -> Any:
+        """Underlying ollama.AsyncClient — exposed so model-management code
+        can call list/pull/delete on the same connection."""
+        return self._client
+
+    def set_active_model(self, name: str) -> None:
+        """Hot-swap the chat model. Takes effect on the next chat() call.
+        Vision model is untouched — set separately via set_vision_model()."""
+        self._model = name
+        logger.info(f"[LLM] Active chat model switched to '{name}'")
+
+    def set_vision_model(self, name: str) -> None:
+        self._vision_model = name
+        logger.info(f"[LLM] Vision model switched to '{name}'")
+
     async def chat(self, messages: list[dict[str, Any]]) -> str:
         """
         Send a list of messages to the LLM and return the response text.

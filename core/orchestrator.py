@@ -89,6 +89,7 @@ from modules.activity.appliance_tracker import ApplianceTracker
 from modules.activity.audio_classifier import AudioClassifier
 from modules.activity.pc_monitor import PCMonitor
 from modules.brain.llm import OllamaLLM
+from modules.brain.model_registry import ModelRegistry
 from modules.brain.prompt_builder import PromptBuilder
 from modules.brain.session import SessionManager
 from modules.context.activity_history import ActivityHistory
@@ -154,6 +155,9 @@ class Orchestrator:
         self.audio_focus: Optional[AudioFocus] = None
 
         self.llm: Optional[OllamaLLM] = None
+        # Model catalog/registry — surfaces installed models, capabilities,
+        # and pull/delete/swap operations to the dashboard.
+        self.model_registry: Optional[ModelRegistry] = None
         self.sessions: Optional[SessionManager] = None
         self.prompts: Optional[PromptBuilder] = None
 
@@ -305,6 +309,20 @@ class Orchestrator:
         self.llm = OllamaLLM(self.config)
         self.sessions = SessionManager(self.config)
         self.prompts = PromptBuilder(config=self.config)
+        # Model registry — wires the dashboard's LLM selector to the live
+        # OllamaLLM. Schema init is idempotent and safe to call before run.
+        if self.db is not None:
+            self.model_registry = ModelRegistry(
+                db=self.db,
+                llm=self.llm,
+                config=self.config,
+                notifier=self.notifications,
+                broadcast=self._broadcast,
+            )
+            try:
+                await self.model_registry.init_schema()
+            except Exception as e:
+                logger.warning(f"[Init] ModelRegistry schema init failed: {e}")
         logger.info("[Init] Brain (LLM + sessions) ready")
 
     async def _init_context(self) -> None:
@@ -1643,8 +1661,10 @@ class Orchestrator:
             "summary": summary,
         })
         if speak:
-            # EOD recap is purely informational — don't open a follow-up window.
-            await self._speak(summary, priority="ambient", expects_response=False)
+            # EOD summary opens the follow-up mic by default — Cole often
+            # wants to riff on the recap (ask about a specific entry, add a
+            # note for tomorrow). Default behavior of _speak handles this.
+            await self._speak(summary, priority="ambient")
 
     async def _health_broadcast_loop(self) -> None:
         """
@@ -2271,6 +2291,8 @@ class Orchestrator:
                     self.dashboard.register_identity(self.identity)
             if self.notifications is not None and hasattr(self.dashboard, "register_notifications"):
                 self.dashboard.register_notifications(self.notifications)
+            if self.model_registry is not None and hasattr(self.dashboard, "register_model_registry"):
+                self.dashboard.register_model_registry(self.model_registry)
             if self.webhooks:
                 self.dashboard.register_webhook_manager(self.webhooks)
 

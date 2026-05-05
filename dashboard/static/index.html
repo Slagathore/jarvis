@@ -122,6 +122,41 @@
             </div>
           </div>
         </div>
+        <!-- LLM Model Selector -->
+        <div class="card" id="model-card">
+          <div class="card-label">LLM</div>
+          <div class="model-row">
+            <span class="dev-label">CHAT</span>
+            <select class="dev-select" id="model-chat-select">
+              <option value="">loading…</option>
+            </select>
+          </div>
+          <div class="model-row">
+            <span class="dev-label">VISION</span>
+            <select class="dev-select" id="model-vision-select">
+              <option value="">loading…</option>
+            </select>
+          </div>
+          <div class="model-active-caps" id="model-active-caps"></div>
+          <div class="model-pull-row">
+            <input
+              type="text"
+              id="model-pull-name"
+              class="reminder-input"
+              placeholder="e.g. qwen2.5-vl:7b"
+              autocomplete="off"
+              list="model-catalog"
+            />
+            <datalist id="model-catalog"></datalist>
+            <button class="dev-btn" id="model-pull-btn">PULL</button>
+          </div>
+          <div class="model-progress" id="model-progress" hidden>
+            <div class="model-progress-text" id="model-progress-text"></div>
+            <div class="model-progress-bar"><div class="model-progress-fill" id="model-progress-fill"></div></div>
+          </div>
+          <div class="model-installed-list" id="model-installed-list"></div>
+        </div>
+
         <!-- Dev Controls Card -->
         <div class="card" id="dev-card">
           <div class="card-label">DEV CONTROLS</div>
@@ -309,6 +344,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=16"></script>
+    <script src="/static/app.js?v=17"></script>
   </body>
 </html>

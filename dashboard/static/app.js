@@ -201,6 +201,11 @@ function applyEvent(event) {
     case "notification.deleted":
       loadNotifications();
       break;
+    case "model.activated":
+    case "model.deleted":
+    case "model.pulled":
+      loadModels();
+      break;
   }
 }
 
@@ -1408,6 +1413,169 @@ if (bellMarkAll) {
   });
 }
 loadNotifications();
+
+// ── LLM MODEL SELECTOR ────────────────────────────────────────────────────
+
+let _modelsCache = { installed: [], catalog: [] };
+
+function loadModels() {
+  fetch("/api/models")
+    .then((r) => r.json())
+    .then((data) => {
+      _modelsCache = data;
+      renderModels();
+    })
+    .catch(() => {});
+}
+
+function _capsBadges(caps) {
+  if (!caps) return "";
+  const items = [];
+  if (caps.is_cloud) items.push(`<span class="cap-badge cap-cloud">CLOUD</span>`);
+  if (caps.tool_use) items.push(`<span class="cap-badge cap-tools">TOOLS</span>`);
+  if (caps.vision) items.push(`<span class="cap-badge cap-vision">VISION</span>`);
+  if (caps.thinking_mode) items.push(`<span class="cap-badge cap-think">CoT</span>`);
+  if (caps.context_window) {
+    const k = caps.context_window >= 1000000
+      ? `${Math.round(caps.context_window / 1000000)}M`
+      : `${Math.round(caps.context_window / 1000)}k`;
+    items.push(`<span class="cap-badge cap-ctx">${k} ctx</span>`);
+  }
+  return items.join(" ");
+}
+
+function renderModels() {
+  const installed = _modelsCache.installed || [];
+  const catalog = _modelsCache.catalog || [];
+  const chatSel = document.getElementById("model-chat-select");
+  const visSel = document.getElementById("model-vision-select");
+  const datalist = document.getElementById("model-catalog");
+  const list = document.getElementById("model-installed-list");
+  const activeCaps = document.getElementById("model-active-caps");
+  if (!chatSel || !visSel || !list) return;
+
+  if (installed.length === 0) {
+    chatSel.innerHTML = `<option value="">no models installed</option>`;
+    visSel.innerHTML = `<option value="">no models installed</option>`;
+    list.innerHTML = `<div class="who-empty">No models installed. Pull one above.</div>`;
+  } else {
+    chatSel.innerHTML = installed.map((m) =>
+      `<option value="${escapeHtml(m.name)}" ${m.active_chat ? "selected" : ""}>${escapeHtml(m.name)}</option>`
+    ).join("");
+    visSel.innerHTML = installed.map((m) =>
+      `<option value="${escapeHtml(m.name)}" ${m.active_vision ? "selected" : ""}>${escapeHtml(m.name)}</option>`
+    ).join("");
+
+    list.innerHTML = "";
+    installed.forEach((m) => {
+      const row = document.createElement("div");
+      row.className = "model-row-installed";
+      const sizeMb = m.size_bytes ? `${(m.size_bytes / 1e9).toFixed(1)} GB` : "";
+      row.innerHTML = `
+        <div class="model-row-line1">
+          <span class="model-name">${escapeHtml(m.name)}</span>
+          <span class="model-size">${sizeMb}</span>
+          <button class="model-del" data-name="${escapeHtml(m.name)}" title="Remove">×</button>
+        </div>
+        <div class="model-row-caps">${_capsBadges(m.capabilities)}</div>
+        <div class="model-row-notes">${escapeHtml((m.capabilities && m.capabilities.notes) || "")}</div>
+      `;
+      row.querySelector(".model-del").addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (m.active_chat) { alert("Can't delete the active chat model — switch first."); return; }
+        if (!confirm(`Delete '${m.name}' from disk?`)) return;
+        fetch(`/api/models/${encodeURIComponent(m.name)}`, { method: "DELETE" }).catch(() => {});
+      });
+      list.appendChild(row);
+    });
+  }
+
+  const activeChat = installed.find((m) => m.active_chat);
+  if (activeChat && activeCaps) {
+    activeCaps.innerHTML = _capsBadges(activeChat.capabilities);
+  } else if (activeCaps) {
+    activeCaps.innerHTML = "";
+  }
+
+  if (datalist) {
+    datalist.innerHTML = catalog.map((c) =>
+      `<option value="${escapeHtml(c.name)}">${escapeHtml(c.notes || "")}</option>`
+    ).join("");
+  }
+}
+
+function setActiveModel(kind, name) {
+  if (!name) return;
+  fetch("/api/models/active", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, kind }),
+  }).catch(() => {});
+}
+
+const chatSelEl = document.getElementById("model-chat-select");
+const visSelEl = document.getElementById("model-vision-select");
+const pullBtnEl = document.getElementById("model-pull-btn");
+if (chatSelEl) chatSelEl.addEventListener("change", (e) => setActiveModel("chat", e.target.value));
+if (visSelEl) visSelEl.addEventListener("change", (e) => setActiveModel("vision", e.target.value));
+if (pullBtnEl) pullBtnEl.addEventListener("click", () => {
+  const inp = document.getElementById("model-pull-name");
+  const name = (inp && inp.value || "").trim();
+  if (!name) return;
+  pullModel(name);
+});
+
+function pullModel(name) {
+  const wrap = document.getElementById("model-progress");
+  const text = document.getElementById("model-progress-text");
+  const fill = document.getElementById("model-progress-fill");
+  if (wrap) wrap.hidden = false;
+  if (text) text.textContent = `pulling ${name}…`;
+  if (fill) fill.style.width = "0%";
+
+  fetch("/api/models/pull", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  })
+    .then(async (resp) => {
+      if (!resp.body) return;
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          try {
+            const evt = JSON.parse(line.slice(5).trim());
+            if (text) text.textContent = `${name}: ${evt.status || "..."}`;
+            if (evt.completed && evt.total && fill) {
+              fill.style.width = `${Math.floor((evt.completed / evt.total) * 100)}%`;
+            }
+            if (evt.status === "done" || evt.status === "success") {
+              if (text) text.textContent = `${name}: complete`;
+              if (fill) fill.style.width = "100%";
+              setTimeout(() => { if (wrap) wrap.hidden = true; }, 1500);
+              loadModels();
+            }
+            if (evt.status === "error") {
+              if (text) text.textContent = `${name}: ${evt.error || "failed"}`;
+            }
+          } catch (_) {}
+        }
+      }
+    })
+    .catch((e) => {
+      if (text) text.textContent = `${name}: ${e}`;
+    });
+}
+
+loadModels();
 
 // ── Init ──────────────────────────────────────────────────────────────────
 
