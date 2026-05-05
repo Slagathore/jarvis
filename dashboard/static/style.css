@@ -1386,6 +1386,67 @@ main {
   cursor: pointer;
 }
 .model-del:hover { color: var(--red); border-color: var(--red); }
+.model-tune {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 2px;
+  padding: 0 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.model-tune:hover { color: var(--text); border-color: var(--text-dim); }
+
+/* Tune modal — reuses .person-modal styles */
+.model-tune-name {
+  font-family: var(--mono);
+  font-size: 14px;
+  color: var(--text);
+}
+.model-tune-row {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.model-tune-row > label { font-size: 11px; color: var(--text-dim); flex-shrink: 0; }
+.model-tune-row .dev-select { flex: 1; }
+.model-tune-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 12px;
+  margin-top: 12px;
+}
+.model-tune-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.model-tune-grid input {
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 4px 6px;
+  border-radius: 2px;
+}
+.model-tune-think {
+  display: flex !important;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text);
+}
+.model-tune-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
 .model-row-caps {
   display: flex;
   flex-wrap: wrap;

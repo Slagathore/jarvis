@@ -268,6 +268,125 @@ class ModelRegistry:
         except Exception as e:
             logger.warning(f"[ModelRegistry] schema init failed: {e}")
 
+    # ── Per-model sampling settings ────────────────────────────────────────
+
+    # Qwen team's recommended sampling parameters per usage mode.
+    # See https://qwen.readthedocs.io for the source. Cole-applicable presets
+    # are exposed to the dashboard so a single click flips the model into the
+    # right sampling regime.
+    PRESETS: dict = {
+        "non_thinking_text": {
+            "label": "Non-thinking · text",
+            "temperature": 1.0, "top_p": 1.00, "top_k": 20, "min_p": 0.0,
+            "presence_penalty": 2.0, "repetition_penalty": 1.0,
+            "thinking_enabled": False,
+        },
+        "non_thinking_vl": {
+            "label": "Non-thinking · vision",
+            "temperature": 0.7, "top_p": 0.80, "top_k": 20, "min_p": 0.0,
+            "presence_penalty": 1.5, "repetition_penalty": 1.0,
+            "thinking_enabled": False,
+        },
+        "thinking_text": {
+            "label": "Thinking · text",
+            "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+            "presence_penalty": 1.5, "repetition_penalty": 1.0,
+            "thinking_enabled": True,
+        },
+        "thinking_vl": {
+            "label": "Thinking · vision / coding",
+            "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+            "presence_penalty": 0.0, "repetition_penalty": 1.0,
+            "thinking_enabled": True,
+        },
+    }
+
+    def list_presets(self) -> list[dict]:
+        return [{"id": pid, **p} for pid, p in self.PRESETS.items()]
+
+    async def get_settings(self, model_name: str) -> Optional[dict]:
+        """Return the saved overrides for this model, or None if defaults."""
+        try:
+            row = await self._db.fetchone(
+                "SELECT * FROM model_settings WHERE model_name = ?", (model_name,)
+            )
+        except Exception:
+            return None
+        if row is None:
+            return None
+        return {
+            "model_name": row["model_name"],
+            "temperature": row["temperature"],
+            "top_p": row["top_p"],
+            "top_k": row["top_k"],
+            "min_p": row["min_p"],
+            "presence_penalty": row["presence_penalty"],
+            "repetition_penalty": row["repetition_penalty"],
+            "thinking_enabled": bool(row["thinking_enabled"]) if row["thinking_enabled"] is not None else None,
+            "preset": row["preset"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def set_settings(self, model_name: str, settings: dict) -> bool:
+        """Persist overrides. Pass None for any field to clear it.
+        preset is a free-form label ('custom', 'non_thinking_text', etc.)."""
+        from datetime import datetime, timezone
+        try:
+            await self._db.execute(
+                """
+                INSERT INTO model_settings
+                  (model_name, temperature, top_p, top_k, min_p,
+                   presence_penalty, repetition_penalty, thinking_enabled,
+                   preset, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(model_name) DO UPDATE SET
+                  temperature        = excluded.temperature,
+                  top_p              = excluded.top_p,
+                  top_k              = excluded.top_k,
+                  min_p              = excluded.min_p,
+                  presence_penalty   = excluded.presence_penalty,
+                  repetition_penalty = excluded.repetition_penalty,
+                  thinking_enabled   = excluded.thinking_enabled,
+                  preset             = excluded.preset,
+                  updated_at         = excluded.updated_at
+                """,
+                (
+                    model_name,
+                    settings.get("temperature"),
+                    settings.get("top_p"),
+                    settings.get("top_k"),
+                    settings.get("min_p"),
+                    settings.get("presence_penalty"),
+                    settings.get("repetition_penalty"),
+                    1 if settings.get("thinking_enabled") else 0
+                        if settings.get("thinking_enabled") is not None else None,
+                    settings.get("preset"),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[ModelRegistry] set_settings failed: {e}")
+            return False
+
+    async def clear_settings(self, model_name: str) -> bool:
+        """Drop the overrides — model reverts to its modelfile defaults."""
+        try:
+            await self._db.execute(
+                "DELETE FROM model_settings WHERE model_name = ?", (model_name,)
+            )
+            return True
+        except Exception:
+            return False
+
+    async def get_active_settings(self) -> Optional[dict]:
+        """Settings for whichever model is currently active. Used by OllamaLLM
+        before each chat() call."""
+        return await self.get_settings(self._llm.model)
+
+    async def get_active_vision_settings(self) -> Optional[dict]:
+        return await self.get_settings(self._llm.vision_model)
+
     # ── Listing ─────────────────────────────────────────────────────────────
 
     async def list_installed(self) -> list[dict]:

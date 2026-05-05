@@ -120,6 +120,43 @@ class OllamaLLM:
         self._vision_model = name
         logger.info(f"[LLM] Vision model switched to '{name}'")
 
+    def set_settings_provider(self, registry: Any) -> None:
+        """Wire the ModelRegistry back into the LLM so chat()/vision_query()
+        can pull per-model sampling overrides + thinking toggle on every call.
+        Without this, defaults from the model's modelfile are used."""
+        self._settings_provider = registry
+
+    async def _build_options_and_think(self, model_name: str) -> tuple[dict, Optional[bool]]:
+        """Translate stored model_settings into Ollama's options dict + think
+        kwarg. Skips fields the user hasn't overridden so the model's
+        defaults remain in effect for everything not explicitly tuned."""
+        if not hasattr(self, "_settings_provider") or self._settings_provider is None:
+            return {}, None
+        try:
+            s = await self._settings_provider.get_settings(model_name)
+        except Exception as e:
+            logger.debug(f"[LLM] settings lookup failed: {e}")
+            return {}, None
+        if not s:
+            return {}, None
+        options: dict = {}
+        # Map our field names to Ollama's option keys (note: repeat_penalty,
+        # not repetition_penalty).
+        mapping = {
+            "temperature":      "temperature",
+            "top_p":            "top_p",
+            "top_k":            "top_k",
+            "min_p":            "min_p",
+            "presence_penalty": "presence_penalty",
+            "repetition_penalty": "repeat_penalty",
+        }
+        for ours, theirs in mapping.items():
+            v = s.get(ours)
+            if v is not None:
+                options[theirs] = v
+        think = s.get("thinking_enabled")
+        return options, think
+
     async def chat(self, messages: list[dict[str, Any]]) -> str:
         """
         Send a list of messages to the LLM and return the response text.
@@ -138,12 +175,15 @@ class OllamaLLM:
         if self._is_gemini_direct(self._model):
             return await self._get_gemini_direct().chat(messages, model=self._model)
 
+        options, think = await self._build_options_and_think(self._model)
+        chat_kwargs: dict = {"model": self._model, "messages": messages}
+        if options:
+            chat_kwargs["options"] = options
+        if think is not None:
+            chat_kwargs["think"] = think
         try:
             response = await asyncio.wait_for(
-                self._client.chat(
-                    model=self._model,
-                    messages=messages,
-                ),
+                self._client.chat(**chat_kwargs),
                 timeout=self._timeout,
             )
             text = response["message"]["content"].strip()
@@ -202,15 +242,21 @@ class OllamaLLM:
             )
 
         working_messages = list(messages)
+        options, think = await self._build_options_and_think(self._model)
 
         for iteration in range(max_iterations):
+            chat_kwargs: dict = {
+                "model": self._model,
+                "messages": working_messages,
+                "tools": tools,
+            }
+            if options:
+                chat_kwargs["options"] = options
+            if think is not None:
+                chat_kwargs["think"] = think
             try:
                 response = await asyncio.wait_for(
-                    self._client.chat(
-                        model=self._model,
-                        messages=working_messages,
-                        tools=tools,
-                    ),
+                    self._client.chat(**chat_kwargs),
                     timeout=self._timeout,
                 )
             except asyncio.TimeoutError:
@@ -306,16 +352,22 @@ class OllamaLLM:
 
         img_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
 
+        options, think = await self._build_options_and_think(self._vision_model)
+        chat_kwargs: dict = {
+            "model": self._vision_model,
+            "messages": [{
+                "role": "user",
+                "content": prompt,
+                "images": [img_b64],
+            }],
+        }
+        if options:
+            chat_kwargs["options"] = options
+        if think is not None:
+            chat_kwargs["think"] = think
         try:
             response = await asyncio.wait_for(
-                self._client.chat(
-                    model=self._vision_model,
-                    messages=[{
-                        "role": "user",
-                        "content": prompt,
-                        "images": [img_b64],
-                    }],
-                ),
+                self._client.chat(**chat_kwargs),
                 timeout=self._timeout,
             )
             description = response["message"]["content"].strip()

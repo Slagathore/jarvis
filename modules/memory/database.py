@@ -208,6 +208,24 @@ CREATE INDEX IF NOT EXISTS idx_memories_subject ON memories (subject);
 CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories (importance);
 CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories (archived);
 
+-- ── Per-model sampling settings ─────────────────────────────────────────────
+-- When a row exists for a given model_name, the OllamaLLM dispatcher injects
+-- those values into ollama.chat()'s options dict (and uses thinking_enabled
+-- for the `think` parameter). When no row exists, the model's modelfile
+-- defaults are used. The dashboard's tune-model UI writes here.
+CREATE TABLE IF NOT EXISTS model_settings (
+    model_name          TEXT PRIMARY KEY,
+    temperature         REAL,
+    top_p               REAL,
+    top_k               INTEGER,
+    min_p               REAL,
+    presence_penalty    REAL,
+    repetition_penalty  REAL,                 -- maps to Ollama's 'repeat_penalty'
+    thinking_enabled    INTEGER DEFAULT 1,    -- 0 = explicit no-think, 1 = think (when model supports it)
+    preset              TEXT,                  -- 'non_thinking_text' | 'non_thinking_vl' | 'thinking_text' | 'thinking_vl' | 'custom' | NULL
+    updated_at          TEXT
+);
+
 -- Per-activity transition log used for predicted-duration + routine learning.
 -- A row is open (ended_at NULL) while the activity is current; closed when the
 -- activity changes.

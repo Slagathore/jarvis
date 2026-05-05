@@ -963,6 +963,39 @@ class DashboardServer:
             await self.broadcast({"type": "model.activated", "name": name, "kind": kind})
             return JSONResponse({"ok": ok, "name": name, "kind": kind})
 
+        @app.get("/api/models/presets")
+        async def models_presets():
+            reg = self._model_registry
+            if reg is None:
+                return JSONResponse({"presets": []})
+            return JSONResponse({"presets": reg.list_presets()})
+
+        @app.get("/api/models/{name:path}/settings")
+        async def models_get_settings(name: str):
+            reg = self._model_registry
+            if reg is None:
+                raise HTTPException(status_code=503, detail="Model registry not available")
+            return JSONResponse({"settings": await reg.get_settings(name)})
+
+        @app.post("/api/models/{name:path}/settings")
+        async def models_set_settings(name: str, request: Request):
+            reg = self._model_registry
+            if reg is None:
+                raise HTTPException(status_code=503, detail="Model registry not available")
+            body = await request.json()
+            ok = await reg.set_settings(name, body or {})
+            await self.broadcast({"type": "model.settings_updated", "name": name})
+            return JSONResponse({"ok": ok})
+
+        @app.delete("/api/models/{name:path}/settings")
+        async def models_clear_settings(name: str):
+            reg = self._model_registry
+            if reg is None:
+                raise HTTPException(status_code=503, detail="Model registry not available")
+            ok = await reg.clear_settings(name)
+            await self.broadcast({"type": "model.settings_updated", "name": name})
+            return JSONResponse({"ok": ok})
+
         @app.post("/api/models/notes")
         async def models_set_notes(request: Request):
             reg = self._model_registry

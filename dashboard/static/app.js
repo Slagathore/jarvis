@@ -1709,6 +1709,7 @@ function renderModels() {
         <div class="model-row-line1">
           <span class="model-name">${escapeHtml(m.name)}</span>
           <span class="model-size">${sizeMb}</span>
+          <button class="model-tune" data-name="${escapeHtml(m.name)}" title="Tune sampling parameters + thinking mode">⚙</button>
           <button class="model-del" data-name="${escapeHtml(m.name)}" title="Remove">×</button>
         </div>
         <div class="model-row-caps">${_capsBadges(m.capabilities)}</div>
@@ -1719,6 +1720,10 @@ function renderModels() {
         if (m.active_chat) { alert("Can't delete the active chat model — switch first."); return; }
         if (!confirm(`Delete '${m.name}' from disk?`)) return;
         fetch(`/api/models/${encodeURIComponent(m.name)}`, { method: "DELETE" }).catch(() => {});
+      });
+      row.querySelector(".model-tune").addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openModelTuneModal(m.name);
       });
       list.appendChild(row);
     });
@@ -1810,6 +1815,128 @@ function pullModel(name) {
 }
 
 loadModels();
+
+// ── MODEL TUNE MODAL (sampling params + thinking) ─────────────────────────
+
+let _modelPresetsCache = [];
+
+function _loadPresetsOnce() {
+  if (_modelPresetsCache.length) return Promise.resolve(_modelPresetsCache);
+  return fetch("/api/models/presets")
+    .then((r) => r.json())
+    .then(({ presets }) => { _modelPresetsCache = presets || []; return _modelPresetsCache; })
+    .catch(() => []);
+}
+
+async function openModelTuneModal(name) {
+  await _loadPresetsOnce();
+  const settingsResp = await fetch(`/api/models/${encodeURIComponent(name)}/settings`).then((r) => r.json()).catch(() => ({ settings: null }));
+  const s = settingsResp.settings || {};
+
+  let modal = document.getElementById("model-tune-modal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "model-tune-modal";
+    modal.className = "person-modal";
+    modal.innerHTML = `
+      <div class="person-modal-backdrop"></div>
+      <div class="person-modal-body">
+        <div class="person-modal-header">
+          <div class="person-modal-title">
+            <div class="model-tune-name" id="model-tune-name"></div>
+            <div class="person-modal-meta">Sampling parameters + thinking mode. Empty fields = use the model's defaults.</div>
+          </div>
+          <button class="person-modal-close" id="model-tune-close">×</button>
+        </div>
+
+        <div class="model-tune-row">
+          <label>Preset</label>
+          <select class="dev-select" id="model-tune-preset">
+            <option value="">— custom —</option>
+          </select>
+        </div>
+
+        <div class="model-tune-grid">
+          <label>temperature <input type="number" step="0.05" id="t-temperature" /></label>
+          <label>top_p       <input type="number" step="0.05" id="t-top_p" /></label>
+          <label>top_k       <input type="number" step="1"    id="t-top_k" /></label>
+          <label>min_p       <input type="number" step="0.05" id="t-min_p" /></label>
+          <label>presence_penalty   <input type="number" step="0.1" id="t-presence_penalty" /></label>
+          <label>repetition_penalty <input type="number" step="0.05" id="t-repetition_penalty" /></label>
+        </div>
+
+        <div class="model-tune-row">
+          <label class="model-tune-think">
+            <input type="checkbox" id="t-thinking_enabled" />
+            Thinking enabled (CoT mode for qwen3.x / deepseek-r1)
+          </label>
+        </div>
+
+        <div class="model-tune-actions">
+          <button class="dev-btn" id="model-tune-save">SAVE</button>
+          <button class="dev-btn" id="model-tune-reset" title="Drop overrides; use modelfile defaults">RESET</button>
+          <button class="dev-btn" id="model-tune-cancel">CANCEL</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+    modal.querySelector(".person-modal-backdrop").addEventListener("click", () => modal.classList.remove("open"));
+    document.getElementById("model-tune-close").addEventListener("click", () => modal.classList.remove("open"));
+    document.getElementById("model-tune-cancel").addEventListener("click", () => modal.classList.remove("open"));
+
+    const presetSel = document.getElementById("model-tune-preset");
+    _modelPresetsCache.forEach((p) => {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.label || p.id;
+      presetSel.appendChild(opt);
+    });
+    presetSel.addEventListener("change", () => {
+      const sel = _modelPresetsCache.find((p) => p.id === presetSel.value);
+      if (!sel) return;
+      ["temperature","top_p","top_k","min_p","presence_penalty","repetition_penalty"].forEach((k) => {
+        const el = document.getElementById(`t-${k}`);
+        if (el && sel[k] !== undefined) el.value = sel[k];
+      });
+      const t = document.getElementById("t-thinking_enabled");
+      if (t) t.checked = !!sel.thinking_enabled;
+    });
+  }
+
+  document.getElementById("model-tune-name").textContent = name;
+  modal.dataset.modelName = name;
+  ["temperature","top_p","top_k","min_p","presence_penalty","repetition_penalty"].forEach((k) => {
+    const el = document.getElementById(`t-${k}`);
+    if (el) el.value = (s[k] !== null && s[k] !== undefined) ? s[k] : "";
+  });
+  const t = document.getElementById("t-thinking_enabled");
+  if (t) t.checked = (s.thinking_enabled === undefined || s.thinking_enabled === null) ? true : !!s.thinking_enabled;
+  const presetSel = document.getElementById("model-tune-preset");
+  if (presetSel) presetSel.value = s.preset || "";
+
+  const saveBtn = document.getElementById("model-tune-save");
+  const resetBtn = document.getElementById("model-tune-reset");
+  saveBtn.onclick = () => {
+    const body = { preset: document.getElementById("model-tune-preset").value || "custom" };
+    ["temperature","top_p","top_k","min_p","presence_penalty","repetition_penalty"].forEach((k) => {
+      const v = document.getElementById(`t-${k}`).value;
+      body[k] = (v === "" ? null : (k === "top_k" ? parseInt(v, 10) : parseFloat(v)));
+    });
+    body.thinking_enabled = document.getElementById("t-thinking_enabled").checked;
+    fetch(`/api/models/${encodeURIComponent(name)}/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(() => modal.classList.remove("open"));
+  };
+  resetBtn.onclick = () => {
+    if (!confirm(`Drop sampling overrides for '${name}'? It'll fall back to the model's modelfile defaults.`)) return;
+    fetch(`/api/models/${encodeURIComponent(name)}/settings`, { method: "DELETE" })
+      .then(() => modal.classList.remove("open"));
+  };
+
+  modal.classList.add("open");
+}
 
 // ── Init ──────────────────────────────────────────────────────────────────
 

@@ -376,6 +376,13 @@ class Orchestrator:
                 await self.model_registry.init_schema()
             except Exception as e:
                 logger.warning(f"[Init] ModelRegistry schema init failed: {e}")
+            # Back-reference: lets OllamaLLM look up per-model sampling
+            # overrides (temperature, top_k, presence_penalty, etc.) and
+            # the thinking-mode toggle on every chat() / chat_with_tools()
+            # / vision_query() call. Without this, only modelfile defaults
+            # are used.
+            if hasattr(self.llm, "set_settings_provider"):
+                self.llm.set_settings_provider(self.model_registry)
         logger.info("[Init] Brain (LLM + sessions) ready")
 
     async def _init_context(self) -> None:
