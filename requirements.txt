@@ -19,7 +19,16 @@ pycaw==20240210
 comtypes==1.4.5
 
 # ── LLM / Brain ────────────────────────────────────────────────────────────
-ollama==0.3.3
+# 0.6.x is required for the `think` kwarg on AsyncClient.chat used by the
+# per-model thinking-mode toggle (qwen3.x / deepseek-r1). 0.3.x silently
+# accepted the kwarg as **kwargs and would crash at call time.
+ollama>=0.6.2
+# ask_claude tool wraps Anthropic's SDK
+anthropic>=0.98.0
+# Memory v2 — semantic embeddings for long-term memory (~80 MB model on first run)
+sentence-transformers>=5.0.0
+# Computer control (mouse + keyboard) — used by Jarvis when the kill switch is on
+pyautogui>=0.9.54
 
 # ── Vision ─────────────────────────────────────────────────────────────────
 ultralytics==8.3.0
