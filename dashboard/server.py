@@ -805,15 +805,17 @@ class DashboardServer:
 
         @app.post("/api/system/restart")
         async def system_restart():
-            """Exit with code 42 — supervisor (if running) will relaunch.
-            If you started Jarvis via plain `python main.py`, the process
-            just exits and you'll have to restart manually."""
+            """Exit with code 43 — supervisor (if running) will relaunch
+            with NO heartbeat enforcement and NO git-revert path. This is
+            distinct from self-edit's restart_self (exit 42), which DOES
+            enable the heartbeat-or-revert dance. Dashboard restart is
+            unconditionally safe for any commit Cole authored."""
             import asyncio as _asyncio, os as _os
             await self.broadcast({"type": "system.restarting"})
             async def _exit():
                 await _asyncio.sleep(0.5)
-                logger.warning("[System] Restart requested via dashboard — exiting 42")
-                _os._exit(42)
+                logger.warning("[System] Restart requested via dashboard — exiting 43 (plain relaunch)")
+                _os._exit(43)
             _asyncio.create_task(_exit())
             return JSONResponse({"ok": True, "action": "restart"})
 

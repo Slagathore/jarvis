@@ -96,8 +96,18 @@ while ($true) {
     $exitCode = $process.ExitCode
 
     if ($exitCode -eq 42) {
+        # Self-edit's restart_self — engage the heartbeat-or-revert dance.
         Write-Host "[Supervisor] self-edit restart requested; relaunching with heartbeat watch..." -ForegroundColor Cyan
         $justSelfEdited = $true
+        continue
+    }
+
+    if ($exitCode -eq 43) {
+        # Dashboard-triggered restart — plain relaunch. NO heartbeat
+        # enforcement, NO revert path. The user explicitly asked Jarvis to
+        # restart; nothing about that should ever touch git.
+        Write-Host "[Supervisor] dashboard restart requested; plain relaunch (no heartbeat watch, no revert)..." -ForegroundColor Cyan
+        $justSelfEdited = $false
         continue
     }
 

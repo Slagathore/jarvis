@@ -1465,7 +1465,7 @@ loadSelfEditStatus();
 
 // ── SYSTEM (restart / shutdown) ───────────────────────────────────────────
 document.getElementById("system-restart")?.addEventListener("click", () => {
-  if (!confirm("Restart Jarvis?\n\nIf you started via the supervisor wrapper it'll come back up automatically.\nIf you started via plain `python main.py`, it'll just exit and stay off.")) return;
+  if (!confirm("Restart Jarvis?\n\nIf you started via the supervisor wrapper it'll come back up automatically (plain relaunch — no heartbeat watch, no git changes).\nIf you started via plain `python main.py`, it'll just exit and stay off.")) return;
   fetch("/api/system/restart", { method: "POST" }).catch(() => {});
 });
 document.getElementById("system-shutdown")?.addEventListener("click", () => {
