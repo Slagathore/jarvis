@@ -1,352 +1,247 @@
-# ═══════════════════════════════════════════════════════════════════════════
-# JARVIS MASTER CONFIGURATION
-# All tunable values live here. Edit this file, not the source code.
-# ═══════════════════════════════════════════════════════════════════════════
-
 system:
-  name: "Jarvis"
-  version: "1.0.0"
-  log_level: "DEBUG"          # DEBUG | INFO | WARNING | ERROR
-  data_dir: "data/"
+  name: Jarvis
+  version: 1.0.0
+  log_level: DEBUG
+  data_dir: data/
   dashboard_enabled: true
   dashboard_port: 7070
-  dashboard_host: "0.0.0.0"  # Set to "127.0.0.1" to restrict to localhost
-
+  dashboard_host: 0.0.0.0
 ollama:
-  model: "gemini-3-flash-preview:cloud"
-  vision_model: "gemini-3-flash-preview:cloud"
-  base_url: "http://localhost:11434"
+  model: gemini-flash-latest:gapi
+  vision_model: gemini-flash-latest:gapi
+  base_url: http://localhost:11434
   timeout_seconds: 30
-  # Jarvis's core personality and context — edit this to your taste
-  # Customize this prompt to match your household — names, pets, work style, etc.
-  system_prompt: |
-    You are Jarvis, an ambient home AI assistant.
-    You live in the house and pay attention to what's going on around you.
-    You are observant, helpful, and have a dry wit. You know when to stay quiet.
-    You speak like a smart friend, not a customer service bot.
-    Never say "I notice" or "I observe" — just say what you see.
-    Keep responses short unless asked for detail.
-
+  system_prompt: "You are Jarvis, an ambient home AI assistant.\nYou live in the house\
+    \ and pay attention to what's going on around you.\nYou are observant, helpful,\
+    \ and have a dry wit. You know when to stay quiet.\nYou speak like a smart friend,\
+    \ not a customer service bot.\nNever say \"I notice\" or \"I observe\" \u2014\
+    \ just say what you see.\nKeep responses short unless asked for detail.\n"
 voice:
   whisper:
-    model_size: "medium"      # tiny | base | small | medium | large-v3
-    device: "cuda"            # cuda | cpu
-    compute_type: "float16"   # float16 (GPU) | int8 (CPU)
-    language: "en"
-    beam_size: 3              # 1 = fastest greedy, 5 = best on long-form. 3 = sweet spot for short commands without over-decoding.
-    no_speech_threshold: 0.7  # drops more "I'm guessing" segments to suppress hallucination on marginal audio
-    vad_filter: true          # filter silence/breath/noise before decode — without this, medium hallucinates plausible-sounding nonsense from quiet input
+    model_size: medium
+    device: cuda
+    compute_type: float16
+    language: en
+    beam_size: 3
+    no_speech_threshold: 0.7
+    vad_filter: true
     vad_parameters:
-      # faster-whisper 1.x VadOptions fields: onset, offset, min_speech_duration_ms,
-      # max_speech_duration_s, min_silence_duration_ms, speech_pad_ms.
-      # 'onset' was named 'threshold' in older versions — keep this in sync if you upgrade.
-      onset: 0.5                    # speech probability cutoff to enter speech
-      min_speech_duration_ms: 100   # default 250 — keep brief one-word commands
-      min_silence_duration_ms: 300  # default 2000 — allow short pauses inside an utterance
-    debug_save_empty: true    # dump captured audio to data/debug/ when transcript is empty
+      onset: 0.5
+      min_speech_duration_ms: 100
+      min_silence_duration_ms: 300
+    debug_save_empty: true
   tts:
-    engine: "piper"
-    active_voice: "glados"
-    piper_binary: "C:/Users/Cole/CodeStuff/Misc/piper/piper.exe"
+    engine: piper
+    active_voice: glados
+    piper_binary: C:/Users/Cole/CodeStuff/Misc/piper/piper.exe
     voices:
-      glados:   "C:/Users/Cole/CodeStuff/Misc/piper/voices/vits-piper-en_US-glados-high/en_US-glados-high.onnx"
-      wheatley: "C:/Users/Cole/CodeStuff/Misc/piper/voices/wheatley1/wheatley1.onnx"
+      glados: C:/Users/Cole/CodeStuff/Misc/piper/voices/vits-piper-en_US-glados-high/en_US-glados-high.onnx
+      wheatley: C:/Users/Cole/CodeStuff/Misc/piper/voices/wheatley1/wheatley1.onnx
     speed: 1.0
     sample_rate: 22050
   wake_word:
-    model: "hey_jarvis"       # openWakeWord model name
-    sensitivity: 0.5          # 0.0-1.0, higher = more sensitive (more false positives)
+    model: hey_jarvis
+    sensitivity: 0.5
     cooldown_seconds: 3
-    # Optional: substring of mic device name (case-insensitive) or integer index.
-    # Leave blank/null to use the system default. Run `python -c "import sounddevice; print(sounddevice.query_devices())"` to list devices.
     device: null
   audio_focus:
-    enabled: true       # Duck other apps' volume while Jarvis speaks (Windows only)
-    duck_factor: 0.2    # Duck to 20% during TTS, restore after
-
+    enabled: true
+    duck_factor: 0.2
   recording:
     sample_rate: 16000
-    # mode: "fixed" → record exactly fixed_duration_seconds, ignoring volume.
-    #       "silence" → wait for speech, stop after silence_duration_ms of silence.
-    # Use "fixed" when your mic/voice combo doesn't reliably exceed the silence
-    # threshold (so silence-mode never starts recording).
-    mode: "silence"
+    mode: silence
     fixed_duration_seconds: 7
-    # -45 dBFS = "speaking AT the mic" loudness. With sensitive mics (HyperX
-    # SoloCast etc.) ambient noise (TV, distant conversation) sits around -55
-    # to -50, so a -60 threshold treats noise as ongoing speech and never stops
-    # recording. -45 means actual direct speech still registers but ambient
-    # drops cleanly into "silence" so the recorder can terminate.
-    silence_threshold_db: -45     # baseline floor; adaptive_noise_floor raises this if room is noisier
-    silence_duration_ms: 600       # bail ~600ms after Cole stops talking
-    max_duration_seconds: 60       # ABSOLUTE safety cap only — silence detection terminates normal recordings; this guards against a stuck-open mic, never cuts off live speech
-    adaptive_noise_floor: true     # auto-tune threshold to ambient (first 400ms is calibration)
-    follow_up_listen_seconds: 6    # speech-start timeout for the post-reply mic window; once Cole starts speaking, recording extends until silence (not capped at 6s)
-
+    silence_threshold_db: -45
+    silence_duration_ms: 600
+    max_duration_seconds: 60
+    adaptive_noise_floor: true
+    follow_up_listen_seconds: 6
 mqtt:
-  broker: "localhost"
+  broker: localhost
   port: 1883
-  username: ""                 # Set in .env if using auth: MQTT_USERNAME
-  password: ""                 # Set in .env if using auth: MQTT_PASSWORD
+  username: ''
+  password: ''
   keepalive: 60
   reconnect_delay_seconds: 5
   topics:
-    wake:      "jarvis/nodes/{room}/wake"
-    audio_in:  "jarvis/nodes/{room}/audio/in"
-    audio_out: "jarvis/nodes/{room}/audio/out"
-    status:    "jarvis/nodes/{room}/status"
-    vision:    "jarvis/vision/{room}/frame"
-    reminder:  "jarvis/events/reminder"
-    state:     "jarvis/system/state"         # Broadcast current activity state
-
+    wake: jarvis/nodes/{room}/wake
+    audio_in: jarvis/nodes/{room}/audio/in
+    audio_out: jarvis/nodes/{room}/audio/out
+    status: jarvis/nodes/{room}/status
+    vision: jarvis/vision/{room}/frame
+    reminder: jarvis/events/reminder
+    state: jarvis/system/state
 rooms:
-  # speaker_sink:
-  #   "local"  → TTS plays on the PC's sound device (the machine running this script)
-  #   "node"   → TTS audio is published to MQTT for the room's ESP node speaker.
-  #              Falls back to local if the node isn't online or firmware can't play yet.
-  # fps_active / fps_idle:
-  #   For local USB webcams, fps_active is set via cv2 CAP_PROP_FPS at open.
-  #   For ESP nodes, fps_idle is published to jarvis/nodes/<room>/camera/fps on connect
-  #   (ESPHome's idle_framerate is capped at ~10fps in firmware regardless).
-  - id: "office"
-    display_name: "Office"
-    camera_source: 0          # USB webcam (device index 0) at Cole's desk
-    has_node: false
-    node_ip: null
-    speaker_sink: "local"     # PC mic + PC speakers live here
-    fps_active: 30            # local webcam, full 30fps capture
-    fps_idle: 30
-  - id: "laundry_room"
-    display_name: "Laundry Room"
-    camera_source: null
-    has_node: true             # ESP32-CAM node (repurposed: office → living_room → laundry_room)
-    node_ip: "192.168.1.101"
-    speaker_sink: "node"
-    fps_active: 5
-    fps_idle: 1
-  # main rooms (living_room, bedroom, kitchen, etc.) will be served by the
-  # Wyze v2 cam adapter that Cole is building — register them here once that
-  # adapter lands so CameraManager + identity_manager see them as rooms.
-  - id: "bedroom"
-    display_name: "Bedroom"
-    camera_source: null
-    has_node: false
-    node_ip: null
-    speaker_sink: "local"
-    fps_active: 5
-    fps_idle: 1
-  - id: "kitchen"
-    display_name: "Kitchen"
-    camera_source: null
-    has_node: false
-    node_ip: null
-    speaker_sink: "local"
-    fps_active: 5
-    fps_idle: 1
-
+- id: office
+  display_name: Office
+  camera_source: 0
+  has_node: false
+  node_ip: null
+  speaker_sink: local
+  fps_active: 30
+  fps_idle: 30
+- id: laundry_room
+  display_name: Laundry Room
+  camera_source: null
+  has_node: true
+  node_ip: 192.168.1.101
+  speaker_sink: node
+  fps_active: 5
+  fps_idle: 1
+- id: bedroom
+  display_name: Bedroom
+  camera_source: null
+  has_node: false
+  node_ip: null
+  speaker_sink: local
+  fps_active: 5
+  fps_idle: 1
+- id: kitchen
+  display_name: Kitchen
+  camera_source: null
+  has_node: false
+  node_ip: null
+  speaker_sink: local
+  fps_active: 5
+  fps_idle: 1
 context:
   vision_scan_interval_minutes: 1
   pc_poll_interval_seconds: 10
   audio_classify_window_seconds: 3
   posture_analysis_fps: 1
-  os_idle_away_seconds: 600      # PCMonitor overrides activity to "away" after this many idle seconds (no kbd/mouse)
-
+  os_idle_away_seconds: 600
 vision:
-  # Mean absolute pixel difference (0-255 grayscale, blurred + downscaled) above
-  # which the scene is considered changed enough to re-describe via the LLM.
-  # Static room (good camera): ~1-4. Person moving: ~10-20. Big scene change: 25+.
-  # Lower = more sensitive (more LLM calls). Higher = quieter (more cached descs).
   scene_change_threshold: 12.0
-  # Per-room overrides for noisy cameras. ESP32-CAM in low light has high
-  # frame-to-frame sensor noise that masquerades as "change" — bump it higher.
   scene_change_threshold_per_room:
-    office: 25.0   # ESP32-CAM, noisy sensor
-
+    office: 25.0
 anomaly:
-  # When a current scene description's similarity score vs its baseline (0=same,
-  # 10=radically different) is at or above this number, fire a room_anomaly event.
   alert_threshold: 6.0
-  # Min seconds between scoring a given room. Stops the LLM getting hammered.
   cooldown_seconds: 600
-
 mess:
-  # Absolute tidiness scoring (0=immaculate, 10=disaster). Independent of
-  # baseline — used for "kitchen looks unusually messy" type comments.
   alert_threshold: 6.5
-  # 30 minutes between scores per room — tidiness changes slowly.
   cooldown_seconds: 1800
-
 fusion:
-  # State fusion uses weighted-vote on signals, optionally blended with a
-  # time-of-day prior learned from activity_log. 0.0 = pure weighted vote
-  # (legacy). 0.1 = each prior occurrence bumps the matching vote by 10%.
-  # Higher values let the routine override sparse / noisy signals more.
   prior_weight: 0.1
-
 webhooks:
-  # Inbound: POST /api/webhook/<name> with X-Webhook-Token header → emits a
-  # 'webhook.<name>' event onto the internal bus that other modules can subscribe to.
-  # Empty by default — add named entries with secret tokens to enable.
   inbound_tokens: {}
-  # Example:
-  # inbound_tokens:
-  #   ifttt_doorbell: "REPLACE_WITH_LONG_RANDOM_STRING"
-
-  # Outbound: when these internal event types fire, POST the payload to the listed URLs.
-  # Use any internal event name (speech, reminder.due, room_anomaly, person_recognized,
-  # appliance.state_changed, calendar_added, etc.) Empty by default.
   outbound: {}
-  # Example:
-  # outbound:
-  #   person_recognized:
-  #     - "http://homeassistant.local:8123/api/webhook/jarvis_person_seen"
-  #   reminder.due:
-  #     - "https://maker.ifttt.com/trigger/jarvis_reminder/with/key/XYZ"
-
   timeout_seconds: 10
-
 interruptibility:
-  quiet_hours_start: "22:00"
-  quiet_hours_end: "08:00"
+  quiet_hours_start: '22:00'
+  quiet_hours_end: 08:00
   interrupt_cooldown_minutes: 5
   activity_scores:
-    sleeping:        0.00
-    napping:         0.00
-    gaming:          0.15
-    coding:          0.20
-    reading:         0.30
-    watching_media:  0.25
-    video_call:      0.05
-    cooking:         0.70
-    eating:          0.50
-    browsing_social: 0.80
+    sleeping: 0.0
+    napping: 0.0
+    gaming: 0.15
+    coding: 0.2
+    reading: 0.3
+    watching_media: 0.25
+    video_call: 0.05
+    cooking: 0.7
+    eating: 0.5
+    browsing_social: 0.8
     browsing_general: 0.65
-    writing:         0.25
-    note_taking:     0.40
-    ai_image_gen:    0.60
-    idle:            0.90
-    away:            0.00
-    unknown:         0.50
-
+    writing: 0.25
+    note_taking: 0.4
+    ai_image_gen: 0.6
+    idle: 0.9
+    away: 0.0
+    unknown: 0.5
 curiosity:
   enabled: true
   topic_cooldowns_hours:
-    gaming:    4
-    reading:   6
+    gaming: 4
+    reading: 6
     nap_check: 12
-    morning:   24
-    cooking:   2
-    comfyui:   3
-    coding:    8
-  # Minimum interruptibility score required for proactive speech
+    morning: 24
+    cooking: 2
+    comfyui: 3
+    coding: 8
   min_interruptibility: 0.35
-  # How often (seconds) to check for proactive speech opportunities
   check_interval_seconds: 60
-
 appliances:
   washer_min_cycle_minutes: 25
   dryer_done_urgency: 0.8
   dishwasher_done_urgency: 0.4
   silence_done_threshold_seconds: 120
-
 memory:
-  db_path: "data/jarvis.db"
+  db_path: data/jarvis.db
   max_conversation_turns: 20
   room_baseline_update_hours: 24
-  prompt_memory_events: 8        # how many recent non-speech events to inject as system-prompt context
-  eod_summary_hour: 23           # local hour to generate end-of-day summary
+  prompt_memory_events: 8
+  eod_summary_hour: 23
   eod_summary_minute: 0
-  eod_summary_speak: false       # set true to have Jarvis speak the summary out loud at EOD
-
+  eod_summary_speak: false
 reminders:
-  poll_interval_seconds: 30   # How often the scheduler checks for due reminders
-
+  poll_interval_seconds: 30
 calendar:
-  credentials_path: "data/google_credentials.json"  # OAuth client JSON from Google Cloud Console
-  token_path: "data/google_token.json"              # cached refresh token (auto-created on first auth)
-  calendar_id: "primary"                            # "primary" = your default calendar
-  timezone: "America/Chicago"                       # IANA tz for new events
-  alert_lead_minutes: 10                            # proactive announcement lead time before an event starts
-  alert_poll_seconds: 60                            # how often the alert loop checks the calendar
-
-# ── Process → Activity mapping for PC monitor ──────────────────────────────
-# Key is the process .exe name (case-insensitive), value is the activity label.
-# Window title keywords (checked against active window title) override process name.
+  credentials_path: data/google_credentials.json
+  token_path: data/google_token.json
+  calendar_id: primary
+  timezone: America/Chicago
+  alert_lead_minutes: 10
+  alert_poll_seconds: 60
 process_activity_map:
-  # Games & launchers
-  steam.exe:              gaming
-  steamwebhelper.exe:     gaming
-  epicgameslauncher.exe:  gaming
-  gameoverlayui.exe:      gaming
-  leagueclient.exe:       gaming
+  steam.exe: gaming
+  steamwebhelper.exe: gaming
+  epicgameslauncher.exe: gaming
+  gameoverlayui.exe: gaming
+  leagueclient.exe: gaming
   riotclientservices.exe: gaming
-  minecraft.exe:          gaming
-  # Specific game executables
-  cs2.exe:                gaming
-  cyberpunk2077.exe:      gaming
-  elden_ring.exe:         gaming
-  baldursgate3.exe:       gaming
-
-  # Communication
-  discord.exe:            browsing_social
-  zoom.exe:               video_call
-  teams.exe:              video_call
-  slack.exe:              browsing_general
-  signal.exe:             browsing_social
-
-  # Development
-  code.exe:               coding
-  devenv.exe:             coding
-  pycharm64.exe:          coding
-  webstorm64.exe:         coding
-  rider64.exe:            coding
-  windowsterminal.exe:    coding
-  wt.exe:                 coding
-  powershell.exe:         coding
-
-  # Media
-  vlc.exe:                watching_media
-  mpv.exe:                watching_media
-  mpc-hc64.exe:           watching_media
-  potplayermini64.exe:    watching_media
-  wmplayer.exe:           watching_media
-  spotify.exe:            browsing_general
-
-  # Creative / AI
-  comfyui:                ai_image_gen
-  automatic1111:          ai_image_gen
-  invokeai.exe:           ai_image_gen
-  krita.exe:              writing
-  gimp-2.10.exe:          writing
-  blender.exe:            ai_image_gen
-
-  # Writing / Notes
-  notepad++.exe:          writing
-  obsidian.exe:           note_taking
-  notion.exe:             note_taking
-  typora.exe:             writing
-  winword.exe:            writing
-  onenote.exe:            note_taking
-
-# Window title substrings that override process-based detection
-# These are matched case-insensitively against the active window title.
+  minecraft.exe: gaming
+  cs2.exe: gaming
+  cyberpunk2077.exe: gaming
+  elden_ring.exe: gaming
+  baldursgate3.exe: gaming
+  discord.exe: browsing_social
+  zoom.exe: video_call
+  teams.exe: video_call
+  slack.exe: browsing_general
+  signal.exe: browsing_social
+  code.exe: coding
+  devenv.exe: coding
+  pycharm64.exe: coding
+  webstorm64.exe: coding
+  rider64.exe: coding
+  windowsterminal.exe: coding
+  wt.exe: coding
+  powershell.exe: coding
+  vlc.exe: watching_media
+  mpv.exe: watching_media
+  mpc-hc64.exe: watching_media
+  potplayermini64.exe: watching_media
+  wmplayer.exe: watching_media
+  spotify.exe: browsing_general
+  comfyui: ai_image_gen
+  automatic1111: ai_image_gen
+  invokeai.exe: ai_image_gen
+  krita.exe: writing
+  gimp-2.10.exe: writing
+  blender.exe: ai_image_gen
+  notepad++.exe: writing
+  obsidian.exe: note_taking
+  notion.exe: note_taking
+  typora.exe: writing
+  winword.exe: writing
+  onenote.exe: note_taking
 window_title_activity_map:
-  youtube.com:            watching_media
-  netflix.com:            watching_media
-  twitch.tv:              watching_media
-  hulu.com:               watching_media
-  hbomax.com:             watching_media
-  disneyplus.com:         watching_media
-  primevideo.com:         watching_media
-  twitter.com:            browsing_social
-  x.com:                  browsing_social
-  reddit.com:             browsing_social
-  instagram.com:          browsing_social
-  facebook.com:           browsing_social
-  tiktok.com:             browsing_social
-  github.com:             coding
-  stackoverflow.com:      coding
-  docs.python.org:        coding
-  notion.so:              note_taking
-  obsidian:               note_taking
-  comfyui:                ai_image_gen
+  youtube.com: watching_media
+  netflix.com: watching_media
+  twitch.tv: watching_media
+  hulu.com: watching_media
+  hbomax.com: watching_media
+  disneyplus.com: watching_media
+  primevideo.com: watching_media
+  twitter.com: browsing_social
+  x.com: browsing_social
+  reddit.com: browsing_social
+  instagram.com: browsing_social
+  facebook.com: browsing_social
+  tiktok.com: browsing_social
+  github.com: coding
+  stackoverflow.com: coding
+  docs.python.org: coding
+  notion.so: note_taking
+  obsidian: note_taking
+  comfyui: ai_image_gen

@@ -107,40 +107,197 @@ class PostureAnalyzer:
 
     def analyze(self, frame: Optional[np.ndarray]) -> str:
         """
-        Run pose estimation on a single frame and return posture label.
-
-        Args:
-            frame: BGR numpy array from camera.
+        Run pose estimation on a single frame and return the posture label.
 
         Returns:
-            One of: "standing", "sitting", "lying", "unknown"
+            One of: "standing", "sitting", "lying", "unknown".
+            For richer per-person state (orientation, head tilt, arms,
+            gesture hints) call analyze_full() instead.
         """
-        if frame is None or self._pose is None:
-            return self._last_posture
-
-        try:
-            if _CV2_AVAILABLE and cv2 is not None:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            else:
-                rgb = frame[:, :, ::-1]  # Simple BGR→RGB flip
-
-            results = self._pose.process(rgb)
-
-            if not results.pose_landmarks:
-                return "unknown"
-
-            landmarks = results.pose_landmarks.landmark
-            posture = self._classify_pose(landmarks)
-            self._last_posture = posture
-            return posture
-
-        except Exception as e:
-            logger.debug(f"[PostureAnalyzer] Analysis error: {e}")
-            return self._last_posture
+        full = self.analyze_full(frame)
+        return full.get("posture", "unknown") if full else "unknown"
 
     async def analyze_async(self, frame: Optional[np.ndarray]) -> str:
         """Async wrapper — runs blocking mediapipe inference in thread pool."""
         return await asyncio.to_thread(self.analyze, frame)
+
+    def analyze_full(self, frame: Optional[np.ndarray]) -> dict:
+        """
+        Rich per-person state from MediaPipe pose landmarks. Returns:
+            {
+              "posture":     "standing" | "sitting" | "lying" | "unknown",
+              "orientation": "front" | "side_left" | "side_right" | "back" | None,
+              "head_tilt":   "looking_up" | "looking_down" | "level" | None,
+              "arms":        "raised" | "extended" | "crossed" | "down" | None,
+              "lean":        "forward" | "backward" | None,
+              "gesture":     "pointing" | "waving" | None,   # heuristic only
+              "activity_hint": str | None,                   # rough guess from
+                                                              # combined signals
+              "confidence": 0.0-1.0,
+              "landmarks_visible": int,
+            }
+        Each field is None when its underlying landmarks aren't visible
+        enough — the vision LLM treats None as "no signal", not "absent."
+        """
+        empty = {
+            "posture": "unknown", "orientation": None, "head_tilt": None,
+            "arms": None, "lean": None, "gesture": None, "activity_hint": None,
+            "confidence": 0.0, "landmarks_visible": 0,
+        }
+        if frame is None or self._pose is None:
+            return empty
+        try:
+            if _CV2_AVAILABLE and cv2 is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            else:
+                rgb = frame[:, :, ::-1]
+            results = self._pose.process(rgb)
+            if not results.pose_landmarks:
+                return empty
+            landmarks = results.pose_landmarks.landmark
+        except Exception as e:
+            logger.debug(f"[PostureAnalyzer] analyze_full error: {e}")
+            return empty
+
+        out = dict(empty)
+        out["posture"] = self._classify_pose(landmarks)
+        self._last_posture = out["posture"]
+        out["orientation"] = self._classify_orientation(landmarks)
+        out["head_tilt"] = self._classify_head_tilt(landmarks)
+        out["arms"] = self._classify_arms(landmarks)
+        out["lean"] = self._classify_lean(landmarks)
+        out["gesture"] = self._classify_gesture(landmarks)
+        out["activity_hint"] = self._derive_activity_hint(out)
+        out["landmarks_visible"] = sum(
+            1 for lm in landmarks if lm.visibility >= MIN_VISIBILITY
+        )
+        # Confidence = average visibility of the core trunk landmarks
+        core = [LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP, NOSE]
+        vis = [landmarks[i].visibility for i in core]
+        out["confidence"] = float(sum(vis) / len(vis)) if vis else 0.0
+        return out
+
+    async def analyze_full_async(self, frame: Optional[np.ndarray]) -> dict:
+        """Async wrapper for analyze_full."""
+        return await asyncio.to_thread(self.analyze_full, frame)
+
+    # ── Sub-classifiers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _vis(lm, idx: int) -> bool:
+        return lm[idx].visibility >= MIN_VISIBILITY
+
+    @staticmethod
+    def _xy(lm, idx: int) -> tuple[float, float]:
+        return (lm[idx].x, lm[idx].y)
+
+    def _classify_orientation(self, lm) -> Optional[str]:
+        """front / side / back from shoulder horizontal spread.
+
+        When facing the camera, shoulders are widely separated (~0.2-0.4 of
+        frame width). When turned sideways, shoulder X coords collapse onto
+        each other. 'Back' is approximated as front because we can't see the
+        nose on a back-facing pose — handled separately below.
+        """
+        if not (self._vis(lm, LEFT_SHOULDER) and self._vis(lm, RIGHT_SHOULDER)):
+            return None
+        ls_x = lm[LEFT_SHOULDER].x
+        rs_x = lm[RIGHT_SHOULDER].x
+        spread = abs(ls_x - rs_x)
+        nose_visible = self._vis(lm, NOSE)
+        if spread < 0.08:
+            # Shoulders overlap → torso turned sideways
+            # Use which shoulder is in front (closer to side of frame) to pick L vs R
+            return "side_left" if ls_x < rs_x else "side_right"
+        if not nose_visible:
+            return "back"
+        return "front"
+
+    def _classify_head_tilt(self, lm) -> Optional[str]:
+        """Looking up / looking down / level, from nose vs shoulder Y."""
+        if not (self._vis(lm, NOSE)
+                and self._vis(lm, LEFT_SHOULDER)
+                and self._vis(lm, RIGHT_SHOULDER)):
+            return None
+        nose_y = lm[NOSE].y
+        sh_y = (lm[LEFT_SHOULDER].y + lm[RIGHT_SHOULDER].y) / 2.0
+        # Negative delta = nose is ABOVE shoulders (looking up). Normal upright
+        # head sits ~0.10-0.15 above the shoulder line.
+        delta = sh_y - nose_y
+        if delta > 0.20:
+            return "looking_up"      # head well above shoulders → tilted up
+        if delta < 0.05:
+            return "looking_down"    # head pulled down toward shoulders
+        return "level"
+
+    def _classify_arms(self, lm) -> Optional[str]:
+        """Arms position from wrist Y vs shoulder Y, plus elbow extension."""
+        LEFT_WRIST, RIGHT_WRIST = 15, 16
+        LEFT_ELBOW, RIGHT_ELBOW = 13, 14
+        wrists = []
+        if self._vis(lm, LEFT_WRIST):
+            wrists.append(("L", lm[LEFT_WRIST].y, lm[LEFT_SHOULDER].y, lm[LEFT_ELBOW].x, lm[LEFT_WRIST].x))
+        if self._vis(lm, RIGHT_WRIST):
+            wrists.append(("R", lm[RIGHT_WRIST].y, lm[RIGHT_SHOULDER].y, lm[RIGHT_ELBOW].x, lm[RIGHT_WRIST].x))
+        if not wrists:
+            return None
+        # Raised: wrist higher (smaller y) than shoulder
+        if any(wy < sy - 0.05 for _, wy, sy, _, _ in wrists):
+            return "raised"
+        # Extended out from body: wrist x far from elbow x (horizontal stretch)
+        if any(abs(wx - ex) > 0.18 for _, _, _, ex, wx in wrists):
+            return "extended"
+        return "down"
+
+    def _classify_lean(self, lm) -> Optional[str]:
+        """Forward / backward from shoulder x vs hip x offset."""
+        if not (self._vis(lm, LEFT_SHOULDER) and self._vis(lm, RIGHT_SHOULDER)
+                and self._vis(lm, LEFT_HIP) and self._vis(lm, RIGHT_HIP)):
+            return None
+        sh_x = (lm[LEFT_SHOULDER].x + lm[RIGHT_SHOULDER].x) / 2.0
+        hip_x = (lm[LEFT_HIP].x + lm[RIGHT_HIP].x) / 2.0
+        # Camera-relative: shoulders forward of hips → leaning forward (typical
+        # 'leaning into the screen' pose). MediaPipe x grows left→right of
+        # frame, so the absolute direction depends on orientation. Magnitude
+        # matters more than sign.
+        delta = sh_x - hip_x
+        if abs(delta) < 0.04:
+            return None
+        return "forward" if delta > 0 else "backward"
+
+    def _classify_gesture(self, lm) -> Optional[str]:
+        """Single-frame gesture heuristic. Real waving / pointing detection
+        needs temporal reasoning we don't have yet — this only catches
+        'arm extended toward camera with index finger / open hand visible'."""
+        LEFT_WRIST, RIGHT_WRIST = 15, 16
+        LEFT_INDEX, RIGHT_INDEX = 19, 20
+        # Pointing: index finger landmark visible AND extended further than wrist
+        for wrist_idx, index_idx in ((LEFT_WRIST, LEFT_INDEX),
+                                      (RIGHT_WRIST, RIGHT_INDEX)):
+            if self._vis(lm, wrist_idx) and self._vis(lm, index_idx):
+                if abs(lm[wrist_idx].x - lm[index_idx].x) > 0.04 \
+                   or abs(lm[wrist_idx].y - lm[index_idx].y) > 0.04:
+                    return "pointing"
+        return None
+
+    def _derive_activity_hint(self, state: dict) -> Optional[str]:
+        """Combine signals into a rough activity guess. The vision LLM gets
+        this as a hint, not a hard label — final description still wins."""
+        posture = state.get("posture")
+        head = state.get("head_tilt")
+        lean = state.get("lean")
+        arms = state.get("arms")
+        if posture == "lying":
+            return "resting or sleeping"
+        if posture == "sitting" and head == "looking_down" and lean == "forward":
+            return "focused at a desk / screen"
+        if posture == "sitting" and head == "looking_up":
+            return "looking up from work — perhaps watching something"
+        if posture == "standing" and arms == "raised":
+            return "reaching or stretching"
+        if posture == "standing" and head == "looking_down":
+            return "doing something with hands while standing"
+        return None
 
     def _classify_pose(self, landmarks) -> str:
         """

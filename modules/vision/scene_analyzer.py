@@ -77,6 +77,8 @@ class SceneAnalyzer:
         frame: Optional[np.ndarray],
         room: str,
         objects: Optional[list[dict[str, Any]]] = None,
+        persons: Optional[list[str]] = None,
+        person_states: Optional[list[dict[str, Any]]] = None,
     ) -> Optional[str]:
         """
         Generate a natural-language description of a room from a camera frame.
@@ -105,7 +107,7 @@ class SceneAnalyzer:
             logger.debug(f"[SceneAnalyzer] Skipping '{room}' — scene unchanged")
             return self._descriptions.get(room)
 
-        prompt = self._build_prompt(room, objects)
+        prompt = self._build_prompt(room, objects, persons=persons, person_states=person_states)
 
         try:
             description = await self._llm.vision_query(frame, prompt)
@@ -190,16 +192,63 @@ class SceneAnalyzer:
         self,
         room: str,
         objects: Optional[list[dict[str, Any]]] = None,
+        persons: Optional[list[str]] = None,
+        person_states: Optional[list[dict[str, Any]]] = None,
     ) -> str:
         """
         Build the vision query prompt for the configured vision model.
-        Includes room context and optional object detection pre-ground.
+        Includes room context, identified persons, and optional object detection.
         """
+        # When we know who's in frame, refer to them by name in the description
+        # — 'Cole sits in the chair' instead of 'a shirtless man sits in the
+        # chair'. The vision model can't recognize identity on its own, so we
+        # have to tell it.
+        if persons:
+            unique = list(dict.fromkeys(persons))
+            if len(unique) == 1:
+                person_clause = f"The person visible in this frame is {unique[0]}. Refer to them by name."
+            else:
+                names = ", ".join(unique[:-1]) + f" and {unique[-1]}"
+                person_clause = f"The people visible in this frame are {names}. Refer to them by name."
+        else:
+            person_clause = (
+                "If a person is visible but you don't have their name, just say "
+                "'someone' rather than describing their physical appearance — "
+                "Jarvis already handles identity separately."
+            )
+
         base = (
-            f"Describe what you see in this {room} in 2-3 sentences. "
-            "Focus on: what the person is doing, the state of the room (tidy/messy), "
-            "any notable objects or activities. Be specific and factual."
+            f"Describe what you see in this {room} in 2-3 sentences. {person_clause} "
+            "Focus on: what they appear to be doing, what they're holding or "
+            "interacting with, their posture/orientation, the state of the room "
+            "(tidy/messy), and any notable activities or changes. Be specific "
+            "and factual; avoid commenting on physical appearance unless it's "
+            "task-relevant."
         )
+
+        # Person-state hints (gaze, expression, posture, etc.) from upstream
+        # detectors. Pre-grounding these keeps the vision model from making
+        # them up.
+        if person_states:
+            state_lines = []
+            for ps in person_states:
+                bits = []
+                if ps.get("name"):
+                    bits.append(str(ps["name"]))
+                if ps.get("posture"):
+                    bits.append(f"posture: {ps['posture']}")
+                if ps.get("orientation"):
+                    bits.append(f"facing: {ps['orientation']}")
+                if ps.get("expression"):
+                    bits.append(f"expression: {ps['expression']}")
+                if ps.get("holding"):
+                    bits.append(f"holding: {ps['holding']}")
+                if ps.get("activity_hint"):
+                    bits.append(f"likely doing: {ps['activity_hint']}")
+                if bits:
+                    state_lines.append(" — ".join(bits))
+            if state_lines:
+                base += " Per-person observations: " + "; ".join(state_lines) + "."
 
         if objects:
             from modules.vision.object_detector import ObjectDetector

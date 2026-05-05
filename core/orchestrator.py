@@ -1782,10 +1782,14 @@ class Orchestrator:
                                     f"[Vision] '{room_id}' pets: {', '.join(pet_classes_now)}"
                                 )
 
-                        # Posture (for person pose context)
-                        posture_result = None
+                        # Posture + richer per-person state. analyze_full_async
+                        # returns a dict with posture, orientation, head_tilt,
+                        # arms, lean, gesture, and an activity_hint. The vision
+                        # LLM receives this as pre-grounding so its description
+                        # benefits from local skeleton data.
+                        posture_result: Any = None
                         if self.posture:
-                            posture_result = await self.posture.analyze_async(frame)
+                            posture_result = await self.posture.analyze_full_async(frame)
 
                         # Face recognition — only bother if YOLO actually saw a person.
                         # Goes through IdentityManager so unknown faces feed the
@@ -1887,8 +1891,29 @@ class Orchestrator:
                         # it decide whether to invoke the vision LLM.
                         if not self.scene_analyzer:
                             continue
+                        # Pass identity + posture into the prompt so the vision
+                        # model says 'Cole' instead of describing him as 'a
+                        # shirtless man', and so the room description benefits
+                        # from local pose / activity hints.
+                        scene_persons = [recognized_name] if recognized_name else None
+                        scene_person_states: Optional[list[dict[str, Any]]] = None
+                        if person_present and posture_result is not None:
+                            ps_entry: dict[str, Any] = {}
+                            if recognized_name:
+                                ps_entry["name"] = recognized_name
+                            if isinstance(posture_result, dict):
+                                for k in ("posture", "orientation", "expression",
+                                          "holding", "activity_hint", "gesture"):
+                                    if posture_result.get(k):
+                                        ps_entry[k] = posture_result[k]
+                            elif posture_result:
+                                ps_entry["posture"] = str(posture_result)
+                            if ps_entry:
+                                scene_person_states = [ps_entry]
                         last_desc = await self.scene_analyzer.describe_async(
-                            frame, room=room_id, objects=detections
+                            frame, room=room_id, objects=detections,
+                            persons=scene_persons,
+                            person_states=scene_person_states,
                         )
 
                         # BUG FIX: update_if_due() doesn't exist on RoomBaselines.
@@ -1962,12 +1987,19 @@ class Orchestrator:
                             "description": last_desc,
                         })
 
-                        # Pass vision signal to state fusion — lights_on is already a bool
+                        # Pass vision signal to state fusion — state_fusion still
+                        # consumes posture as a string label, so unwrap from the
+                        # rich dict if that's what we got.
+                        posture_label: Optional[str] = None
+                        if isinstance(posture_result, dict):
+                            posture_label = posture_result.get("posture")
+                        elif isinstance(posture_result, str):
+                            posture_label = posture_result
                         if self.state_fusion:
                             self.state_fusion.inject_vision(room_id, {
                                 "lights_on": lights_on,
                                 "person_present": person_present,
-                                "posture": posture_result,
+                                "posture": posture_label,
                             })
 
                     except Exception as room_err:
@@ -2354,8 +2386,10 @@ class Orchestrator:
         if listen_seconds <= 0:
             return
 
+        logger.info(f"[Followup] opening listen window ({listen_seconds}s) for room '{room}'")
+
         # Brief grace so reverb from our own TTS dies before we open the mic.
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.4)
 
         async with self._wake_lock:
             self._followup_depth += 1
@@ -2368,10 +2402,16 @@ class Orchestrator:
 
                 if self.wake:
                     self.wake.suspend()
+                    # Same dance the wake handler does: give wake's InputStream
+                    # time to actually close before we open ours. Without this
+                    # WASAPI on Windows can deny the second stream silently or
+                    # return zero-filled buffers for the first ~second.
+                    await asyncio.sleep(0.3)
                 try:
                     record_device = (
                         self.wake.device if self.wake else recording_cfg.get("device")
                     )
+                    logger.debug(f"[Followup] record_device={record_device}")
                     audio_data = await asyncio.to_thread(
                         record_until_silence,
                         silence_threshold_db=recording_cfg.get("silence_threshold_db", -45.0),
@@ -2387,22 +2427,36 @@ class Orchestrator:
                         speech_start_timeout_seconds=listen_seconds,
                         device=record_device,
                         mode="silence",
-                        adaptive_noise_floor=recording_cfg.get("adaptive_noise_floor", True),
+                        # ALWAYS off for follow-up: the user may already be
+                        # mid-sentence when the window opens, which would
+                        # poison adaptive calibration (it'd treat speech as
+                        # ambient and set the threshold above the voice). The
+                        # static -45 dBFS floor is plenty for in-room speech.
+                        adaptive_noise_floor=False,
                     )
                 finally:
                     if self.wake:
                         self.wake.wakeup()
 
                 if audio_data is None or len(audio_data) == 0:
+                    logger.info("[Followup] no audio captured — window closed silently")
                     return
+
+                duration_s = len(audio_data) / SAMPLE_RATE
+                import numpy as _np
+                rms = float(_np.sqrt(_np.mean(audio_data ** 2))) if len(audio_data) else 0.0
+                from modules.voice.audio_utils import db_from_rms
+                logger.info(
+                    f"[Followup] captured {duration_s:.2f}s "
+                    f"(rms={db_from_rms(rms):.1f} dBFS)"
+                )
 
                 # Heuristic: ignore captures that are clearly just our own
                 # TTS tail or pure ambient. We rely on speech_start_timeout
                 # above to bail when there's no real speech, so anything that
                 # gets here had energy in it.
-                duration_s = len(audio_data) / SAMPLE_RATE
                 if duration_s < 0.5:
-                    logger.debug(f"[Followup] Capture too short ({duration_s:.2f}s) — discarding")
+                    logger.info(f"[Followup] Capture too short ({duration_s:.2f}s) — discarding")
                     return
 
                 stt = self.stt
@@ -2410,7 +2464,7 @@ class Orchestrator:
                     return
                 transcript = await asyncio.to_thread(stt.transcribe, audio_data)
                 if not transcript or not transcript.strip():
-                    logger.debug("[Followup] Empty transcript — closing window")
+                    logger.info("[Followup] Empty transcript from Whisper — closing window")
                     return
 
                 logger.info(f"[Followup] Captured turn: {transcript!r}")

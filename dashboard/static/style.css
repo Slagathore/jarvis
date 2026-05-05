@@ -221,13 +221,17 @@ main {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  overflow: hidden;
-}
-.col-center {
+  /* Each column gets its own scrollbar so cards added below the fold (LLM
+     selector below DEV CONTROLS, conversation log below chat input, etc.)
+     remain reachable. min-height:0 is required for flex children to shrink
+     past their natural content height inside a fixed-height grid cell. */
   overflow-y: auto;
+  min-height: 0;
 }
-.col-right {
-  overflow: hidden;
+.col-center,
+.col-right,
+.col-left {
+  overflow-y: auto;
 }
 
 /* ── Cards ────────────────────────────────────────────────────────────────── */
