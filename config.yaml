@@ -52,7 +52,7 @@ voice:
     mode: silence
     fixed_duration_seconds: 7
     silence_threshold_db: -45
-    silence_duration_ms: 1000      # 1s of silence before ending the recording — accommodates brief mid-sentence pauses without cutting off
+    silence_duration_ms: 2000      # 1s of silence before ending the recording — accommodates brief mid-sentence pauses without cutting off
     max_duration_seconds: 60
     adaptive_noise_floor: true
     follow_up_listen_seconds: 6

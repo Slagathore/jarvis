@@ -96,9 +96,21 @@ class MemoryStore:
     first-time download, then cached locally). All DB writes are async.
     """
 
-    def __init__(self, db: Any, llm: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        db: Any,
+        llm: Optional[Any] = None,
+        broadcast: Optional[Any] = None,
+    ) -> None:
         self._db = db
         self._llm = llm
+        # Async dashboard-broadcast callback. When set, every add/update/delete
+        # fires the corresponding 'memory.*' event so the dashboard memory
+        # card hot-reloads without waiting for a manual refresh. Without
+        # this, auto-extracted memories (the conversation-curator pass after
+        # every turn, plus the self-thought loop) silently land in the DB
+        # and never appear until the next dashboard reload.
+        self._broadcast = broadcast
         self._encoder: Optional[Any] = None
         # In-process cache of (id, embedding) so retrieve() doesn't pay
         # blob deserialization on every call. Rebuilt on add/delete.
@@ -192,6 +204,20 @@ class MemoryStore:
         if emb is not None:
             self._cache.append((int(mid), emb))
         logger.debug(f"[MemoryV2] +{kind} (imp={importance:.2f}): {content[:80]}")
+        # Hot-load the dashboard's memory card. Fires for ALL writes:
+        # auto-extraction after each turn, the LLM's explicit remember/
+        # record_thought/record_question tools, and the self-thought loop.
+        if self._broadcast is not None:
+            try:
+                await self._broadcast({
+                    "type": "memory.added",
+                    "id": int(mid),
+                    "kind": kind,
+                    "importance": float(importance),
+                    "subject": subject,
+                })
+            except Exception as e:
+                logger.debug(f"[MemoryV2] broadcast failed: {e}")
         return int(mid)
 
     async def update(
@@ -228,19 +254,29 @@ class MemoryStore:
                 f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", tuple(params)
             )
             await self._reload_cache()
-            return True
         except Exception as e:
             logger.warning(f"[MemoryV2] update failed: {e}")
             return False
+        if self._broadcast is not None:
+            try:
+                await self._broadcast({"type": "memory.updated", "id": int(memory_id)})
+            except Exception:
+                pass
+        return True
 
     async def delete(self, memory_id: int) -> bool:
         try:
             await self._db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
             await self._reload_cache()
-            return True
         except Exception as e:
             logger.warning(f"[MemoryV2] delete failed: {e}")
             return False
+        if self._broadcast is not None:
+            try:
+                await self._broadcast({"type": "memory.deleted", "id": int(memory_id)})
+            except Exception:
+                pass
+        return True
 
     async def archive(self, memory_id: int) -> bool:
         try:
@@ -248,9 +284,14 @@ class MemoryStore:
                 "UPDATE memories SET archived = 1 WHERE id = ?", (memory_id,)
             )
             await self._reload_cache()
-            return True
         except Exception:
             return False
+        if self._broadcast is not None:
+            try:
+                await self._broadcast({"type": "memory.deleted", "id": int(memory_id)})
+            except Exception:
+                pass
+        return True
 
     # ── Retrieval ───────────────────────────────────────────────────────────
 

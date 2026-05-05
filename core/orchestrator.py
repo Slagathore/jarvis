@@ -350,8 +350,13 @@ class Orchestrator:
         )
 
         # Memory v2 — semantic store + extraction. Init schema is idempotent.
+        # Broadcast callback is wired so auto-extracted memories (background
+        # curator after every turn + self-thought loop + explicit LLM tools)
+        # all hot-load the dashboard memory card via 'memory.added' events.
         if self.db is not None:
-            self.memory = MemoryStore(db=self.db, llm=self.llm)
+            self.memory = MemoryStore(
+                db=self.db, llm=self.llm, broadcast=self._broadcast,
+            )
             try:
                 await self.memory.init()
             except Exception as e:

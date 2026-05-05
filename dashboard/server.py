@@ -906,7 +906,8 @@ class DashboardServer:
                 importance=float(body.get("importance", 0.5)),
                 source_kind="manual",
             )
-            await self.broadcast({"type": "memory.added", "id": mid})
+            # MemoryStore.add() handles the broadcast internally now —
+            # don't double-fire from here.
             return JSONResponse({"ok": mid is not None, "id": mid})
 
         @app.post("/api/memory/{memory_id}")
@@ -922,7 +923,7 @@ class DashboardServer:
                 kind=body.get("kind"),
                 subject=body.get("subject"),
             )
-            await self.broadcast({"type": "memory.updated", "id": memory_id})
+            # mem.update() broadcasts memory.updated internally on success.
             return JSONResponse({"ok": ok})
 
         @app.delete("/api/memory/{memory_id}")
@@ -931,7 +932,7 @@ class DashboardServer:
             if mem is None:
                 raise HTTPException(status_code=503, detail="Memory store not available")
             ok = await mem.delete(memory_id)
-            await self.broadcast({"type": "memory.deleted", "id": memory_id})
+            # mem.delete() broadcasts memory.deleted internally on success.
             return JSONResponse({"ok": ok})
 
         # ── LLM model selector ──────────────────────────────────────────────

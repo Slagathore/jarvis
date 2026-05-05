@@ -160,7 +160,7 @@ class OllamaLLM:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         tool_handlers: dict[str, Any],
-        max_iterations: int = 20,
+        max_iterations: int = 200,
     ) -> str:
         """
         Chat with tool-calling support. Loops: if the LLM emits tool_calls,

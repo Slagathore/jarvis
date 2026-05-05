@@ -55,7 +55,7 @@ class ClaudeClient:
         question: str,
         context: Optional[str] = None,
         model: str = DEFAULT_CLAUDE_MODEL,
-        max_tokens: int = 2048,
+        max_tokens: int = 5048,
     ) -> str:
         """Single-turn ask. Returns Claude's text response.
 
