@@ -160,7 +160,7 @@ class OllamaLLM:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         tool_handlers: dict[str, Any],
-        max_iterations: int = 5,
+        max_iterations: int = 20,
     ) -> str:
         """
         Chat with tool-calling support. Loops: if the LLM emits tool_calls,
@@ -174,7 +174,14 @@ class OllamaLLM:
             tool_handlers:  {function_name: async_callable(**args) → result}
                             Result is JSON-serialized and fed back to the LLM.
             max_iterations: Cap on tool-call loops so a misbehaving model can't
-                            burn budget forever.
+                            burn budget forever. 20 covers realistic
+                            code-exploration AND computer-control sequences
+                            (e.g. list_files → read_file → grep → edit_file →
+                            restart_self, or screenshot → click → screenshot →
+                            type → screenshot → click). The same cap applies
+                            to all tools — calendar, memory, ask_claude,
+                            computer, self-edit. A persistent 20-tool runaway
+                            still gets the warning + empty-response fallback.
 
         Returns:
             The assistant's final text response.

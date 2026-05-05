@@ -7,8 +7,8 @@ system:
   dashboard_port: 7070
   dashboard_host: 0.0.0.0
 ollama:
-  model: gemini-flash-latest:gapi
-  vision_model: gemini-flash-latest:gapi
+  model: gemini-3-flash-preview:cloud
+  vision_model: gemini-3-flash-preview:cloud
   base_url: http://localhost:11434
   timeout_seconds: 30
   system_prompt: "You are Jarvis, an ambient home AI assistant.\nYou live in the house\
@@ -52,7 +52,7 @@ voice:
     mode: silence
     fixed_duration_seconds: 7
     silence_threshold_db: -45
-    silence_duration_ms: 600
+    silence_duration_ms: 1000      # 1s of silence before ending the recording — accommodates brief mid-sentence pauses without cutting off
     max_duration_seconds: 60
     adaptive_noise_floor: true
     follow_up_listen_seconds: 6

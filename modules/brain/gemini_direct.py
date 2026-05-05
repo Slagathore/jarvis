@@ -144,7 +144,7 @@ class GeminiDirectClient:
         tools: list[dict],
         model: str,
         tool_dispatcher: Any,
-        max_iterations: int = 5,
+        max_iterations: int = 20,
     ) -> str:
         """Tool-loop chat. Mirrors OllamaLLM.chat_with_tools semantics:
         passes tool defs, executes any tool calls the model emits via
