@@ -1143,6 +1143,23 @@ main {
   background: white;
 }
 .control-pending { margin-top: 8px; }
+.control-system-row {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.system-btn {
+  font-size: 10px;
+  flex: 1;
+}
+.system-btn-danger {
+  border-color: #f59e0b66;
+  color: #f59e0b;
+}
+.system-btn-danger:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
 .control-pending-title {
   font-family: var(--mono);
   font-size: 9px;

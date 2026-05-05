@@ -103,12 +103,11 @@ i2s_audio:
   - id: i2s_bus
     i2s_lrclk_pin: GPIO14    # INMP441 WS + MAX98357A LRC (shared pin)
     i2s_bclk_pin: GPIO2      # INMP441 SCK + MAX98357A BCLK (shared pin)
-    # ESP32-CAM uses I2S0 internally for parallel camera DMA. Pinning audio to
-    # I2S1 stops the audio pipeline fighting the camera for DMA channels —
-    # this is the dominant cause of the static/buzz on the speaker amp.
-    # GPIOs above are unchanged; i2s_port only changes which I2S peripheral
-    # the controller routes them to internally.
-    i2s_port: 1
+    # NOTE: ESPHome's i2s_audio component doesn't expose i2s_port selection
+    # in the current release; the camera DMA contention discussed earlier
+    # has to be addressed through other means (GAIN pin pulldown on the
+    # MAX98357A, separate power supply for the amp, or idle-mute via SD
+    # pin). Revisit once we have hands on the laundry node.
 
 # ── INMP441 Microphone ────────────────────────────────────────────────────
 # IMPORTANT: Tie GPIO12 LOW at boot via 10kΩ resistor to GND.

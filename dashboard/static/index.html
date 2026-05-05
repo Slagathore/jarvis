@@ -177,6 +177,11 @@
             <span class="control-status" id="selfedit-status">disabled</span>
           </div>
           <div class="control-pending" id="computer-pending"></div>
+          <div class="control-row control-system-row">
+            <span class="dev-label">SYSTEM</span>
+            <button class="dev-btn system-btn" id="system-restart" title="Exit with code 42 — supervisor relaunches if running">RESTART</button>
+            <button class="dev-btn system-btn system-btn-danger" id="system-shutdown" title="Clean exit — Jarvis stays off until you start it again">SHUTDOWN</button>
+          </div>
         </div>
 
         <!-- Dev Controls Card -->
@@ -386,6 +391,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=19"></script>
+    <script src="/static/app.js?v=20"></script>
   </body>
 </html>

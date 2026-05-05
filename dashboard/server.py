@@ -801,6 +801,34 @@ class DashboardServer:
             ok = await c.reject(action_id)
             return JSONResponse({"ok": ok})
 
+        # ── System (restart / shutdown) ─────────────────────────────────────
+
+        @app.post("/api/system/restart")
+        async def system_restart():
+            """Exit with code 42 — supervisor (if running) will relaunch.
+            If you started Jarvis via plain `python main.py`, the process
+            just exits and you'll have to restart manually."""
+            import asyncio as _asyncio, os as _os
+            await self.broadcast({"type": "system.restarting"})
+            async def _exit():
+                await _asyncio.sleep(0.5)
+                logger.warning("[System] Restart requested via dashboard — exiting 42")
+                _os._exit(42)
+            _asyncio.create_task(_exit())
+            return JSONResponse({"ok": True, "action": "restart"})
+
+        @app.post("/api/system/shutdown")
+        async def system_shutdown():
+            """Clean exit — supervisor will stop the loop on a non-42 exit."""
+            import asyncio as _asyncio, os as _os
+            await self.broadcast({"type": "system.shutting_down"})
+            async def _exit():
+                await _asyncio.sleep(0.5)
+                logger.warning("[System] Shutdown requested via dashboard — exiting 0")
+                _os._exit(0)
+            _asyncio.create_task(_exit())
+            return JSONResponse({"ok": True, "action": "shutdown"})
+
         # ── Self-edit (kill switch + pending review + revert) ───────────────
 
         @app.get("/api/selfedit/status")

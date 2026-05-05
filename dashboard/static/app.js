@@ -358,7 +358,13 @@ function refreshRoomFeeds() {
   });
 }
 
-setInterval(refreshRoomFeeds, 2000);
+// 250ms = ~4 fps in the dashboard. Smooth enough for "is something
+// happening in this room" without thrashing the JPEG encoder. Capture-side
+// rate is independent (config: rooms[].fps_active); for the office webcam
+// at 30fps capture, this gives ~4fps in the browser because the snapshot
+// endpoint takes a fresh frame per request and the network round trip
+// dominates. Bump if you want a smoother feed.
+setInterval(refreshRoomFeeds, 250);
 
 function updateRoomVision(roomId, data) {
   // Vision events imply the room has a camera, so make sure has_camera sticks
@@ -1456,6 +1462,16 @@ document.getElementById("selfedit-toggle")?.addEventListener("change", (e) => {
   }).then(loadSelfEditStatus).catch(() => {});
 });
 loadSelfEditStatus();
+
+// ── SYSTEM (restart / shutdown) ───────────────────────────────────────────
+document.getElementById("system-restart")?.addEventListener("click", () => {
+  if (!confirm("Restart Jarvis?\n\nIf you started via the supervisor wrapper it'll come back up automatically.\nIf you started via plain `python main.py`, it'll just exit and stay off.")) return;
+  fetch("/api/system/restart", { method: "POST" }).catch(() => {});
+});
+document.getElementById("system-shutdown")?.addEventListener("click", () => {
+  if (!confirm("Shutdown Jarvis?\n\nThis exits the process cleanly. Even with the supervisor, Jarvis WILL stay off until you start it again manually.")) return;
+  fetch("/api/system/shutdown", { method: "POST" }).catch(() => {});
+});
 
 // ── COMPUTER CONTROL (kill switch + pending action queue) ────────────────
 
