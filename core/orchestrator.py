@@ -101,6 +101,7 @@ from modules.context.state import UNKNOWN_STATE, ActivityState
 from modules.context.state_fusion import StateFusion
 from modules.memory.database import DatabaseManager
 from modules.memory.event_log import EventLogger
+from modules.memory.memory_v2 import MemoryStore
 from modules.notifications import NotificationManager
 from modules.memory.room_baselines import RoomBaselines
 from modules.agenda import GoogleCalendar
@@ -139,6 +140,10 @@ class Orchestrator:
         # Set up after DB init; passed into IdentityManager so drift/cluster
         # events auto-fire user-visible notifications.
         self.notifications: Optional[NotificationManager] = None
+        # Long-term semantic memory (facts, preferences, events, thoughts).
+        # LLM-extracted from each turn + retrieved by semantic search and
+        # injected into the prompt context. Initialized after the LLM is up.
+        self.memory: Optional[MemoryStore] = None
 
         self.wake: Optional[WakeWordDetector] = None
         # Multi-room wake registry. PC mic continues to flow through `self.wake`
@@ -322,6 +327,15 @@ class Orchestrator:
         except ImportError:
             pass
         self._claude_client = ClaudeClient()
+
+        # Memory v2 — semantic store + extraction. Init schema is idempotent.
+        if self.db is not None:
+            self.memory = MemoryStore(db=self.db, llm=self.llm)
+            try:
+                await self.memory.init()
+            except Exception as e:
+                logger.warning(f"[Init] MemoryStore init failed: {e}")
+                self.memory = None
         # Model registry — wires the dashboard's LLM selector to the live
         # OllamaLLM. Schema init is idempotent and safe to call before run.
         if self.db is not None:
@@ -737,6 +751,23 @@ class Orchestrator:
             except Exception as e:
                 logger.debug(f"[ActivityHistory] prompt summary failed: {e}")
 
+        # Memory v2: retrieve top-K relevant memories from semantic store and
+        # inject as additional system-prompt context so the LLM has long-term
+        # knowledge of facts/preferences across conversations.
+        if self.memory is not None and self.memory.is_loaded:
+            try:
+                hits = await self.memory.retrieve(text, k=8)
+                if hits:
+                    if extras is None:
+                        extras = {}
+                    lines = ["Relevant memories (use as context, don't recite verbatim):"]
+                    for h in hits:
+                        subj = f" [{h['subject']}]" if h.get("subject") else ""
+                        lines.append(f"  - ({h['kind']}{subj}) {h['content']}")
+                    extras["relevant_memories"] = "\n".join(lines)
+            except Exception as e:
+                logger.debug(f"[MemoryV2] retrieve failed: {e}")
+
         prompt_context = await self.prompts.build_with_memory(
             user_text=text,
             state=self._current_state,
@@ -769,6 +800,15 @@ class Orchestrator:
 
         if self.interruptibility is not None:
             self.interruptibility.record_interruption()
+
+        # Fire-and-forget memory extraction. Runs the curator LLM call in the
+        # background so the user-facing TTS reply isn't gated on it.
+        if self.memory is not None:
+            asyncio.create_task(
+                self.memory.extract_from_turn(
+                    user_text=text, assistant_text=response, room=room
+                )
+            )
 
         await self._speak(response, room=room, priority="conversation")
 
@@ -1053,6 +1093,136 @@ class Orchestrator:
         answer = await self._claude_client.ask(question, context=context)
         return {"answer": answer}
 
+    # ── Memory tools ────────────────────────────────────────────────────────
+    # Let the LLM explicitly save and search long-term memories. Auto-extraction
+    # already runs after every turn, but these let the model take direct
+    # action when it decides "this specifically should be remembered" or
+    # "I need to look something up before answering".
+    _MEMORY_TOOLS: list[dict] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "remember",
+                "description": (
+                    "Save a fact, preference, or instruction to long-term memory. "
+                    "Use when the user shares something specific worth remembering "
+                    "verbatim, or when you've decided something matters enough to "
+                    "outlive the current conversation. Auto-extraction already runs "
+                    "after every turn — only call this if you want explicit control."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content":    {"type": "string", "description": "The memory as a single declarative sentence."},
+                        "kind":       {"type": "string", "description": "fact | preference | event | instruction"},
+                        "subject":    {"type": "string", "description": "Person, room, or topic this relates to. Optional."},
+                        "importance": {"type": "number", "description": "0.0-1.0. 0.9+ for load-bearing personal info."},
+                    },
+                    "required": ["content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "recall",
+                "description": (
+                    "Search long-term memory for facts/preferences/events relevant "
+                    "to a query. Use when you suspect Cole has told you something "
+                    "before and you want to confirm before guessing. Returns up to "
+                    "8 best matches scored by semantic similarity × importance × recency."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "What you're looking for."},
+                        "k":     {"type": "integer", "description": "Max results (default 8)."},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "record_thought",
+                "description": (
+                    "Save one of your own reflections or realizations. Use when "
+                    "you've noticed something interesting about a pattern, "
+                    "drawn a conclusion worth keeping, or want to write down a "
+                    "passing observation. These are SEARCHABLE later via recall()."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "description": "The thought, written naturally."},
+                        "subject": {"type": "string", "description": "What it's about. Optional."},
+                    },
+                    "required": ["content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "record_question",
+                "description": (
+                    "Save a question you want answered later — by Cole when he's "
+                    "next available, or by Claude via ask_claude. Useful when "
+                    "you're curious about something but don't want to interrupt "
+                    "the current conversation. The dashboard surfaces unanswered "
+                    "questions for review."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content":    {"type": "string", "description": "The question."},
+                        "subject":    {"type": "string", "description": "What it's about. Optional."},
+                        "importance": {"type": "number", "description": "0.0-1.0. Default 0.5."},
+                    },
+                    "required": ["content"],
+                },
+            },
+        },
+    ]
+
+    async def _tool_remember(
+        self, content: str, kind: str = "fact",
+        subject: Optional[str] = None, importance: float = 0.7,
+    ) -> dict:
+        if self.memory is None:
+            return {"error": "memory store unavailable"}
+        mid = await self.memory.add(
+            kind=kind, content=content, subject=subject,
+            importance=importance, source_kind="manual",
+        )
+        return {"ok": mid is not None, "memory_id": mid}
+
+    async def _tool_recall(self, query: str, k: int = 8) -> dict:
+        if self.memory is None:
+            return {"error": "memory store unavailable"}
+        hits = await self.memory.retrieve(query, k=int(k))
+        return {"matches": hits}
+
+    async def _tool_record_thought(
+        self, content: str, subject: Optional[str] = None,
+    ) -> dict:
+        if self.memory is None:
+            return {"error": "memory store unavailable"}
+        mid = await self.memory.record_thought(content, subject=subject)
+        return {"ok": mid is not None, "memory_id": mid}
+
+    async def _tool_record_question(
+        self, content: str, subject: Optional[str] = None,
+        importance: float = 0.5,
+    ) -> dict:
+        if self.memory is None:
+            return {"error": "memory store unavailable"}
+        mid = await self.memory.record_question(
+            content, subject=subject, importance=importance,
+        )
+        return {"ok": mid is not None, "memory_id": mid}
+
     def _build_tool_registry(self) -> tuple[list[dict], dict]:
         """Aggregate every tool currently available to the LLM.
 
@@ -1068,6 +1238,12 @@ class Orchestrator:
         if self._claude_client is not None and self._claude_client.has_key:
             tools.append(self._ASK_CLAUDE_TOOL)
             handlers["ask_claude"] = self._tool_ask_claude
+        if self.memory is not None:
+            tools.extend(self._MEMORY_TOOLS)
+            handlers["remember"]        = self._tool_remember
+            handlers["recall"]          = self._tool_recall
+            handlers["record_thought"]  = self._tool_record_thought
+            handlers["record_question"] = self._tool_record_question
         return tools, handlers
 
     async def _try_dnd(self, text: str, room: str) -> bool:
@@ -2244,6 +2420,89 @@ class Orchestrator:
             except Exception as e:
                 logger.debug(f"[Dashboard] Broadcast error: {e}")
 
+    async def _self_thought_loop(self) -> None:
+        """
+        Periodic 'time to think' loop.
+
+        When the system is genuinely idle (state has high interruptibility
+        and Cole's been quiet), ask the LLM to reflect on recent observations
+        + relevant memories, and persist the result as a thought (kind='thought')
+        or a question (kind='question'). Questions can later be surfaced to
+        Cole or escalated to Claude via the ask_claude tool.
+
+        Conservative cadence: 25-minute base interval, only fires when
+        interruptibility >= 0.7, and only ~50% of those firings actually
+        produce a thought (so we don't pollute memory with low-value noise).
+        """
+        import random
+        await asyncio.sleep(120)  # don't fire during boot stabilization
+        while True:
+            try:
+                await asyncio.sleep(25 * 60)
+                if self.memory is None or self.llm is None:
+                    continue
+                if self._current_state is not None:
+                    interrupt = float(getattr(self._current_state, "interruptibility", 0.5))
+                    if interrupt < 0.7:
+                        continue
+                if random.random() > 0.5:
+                    continue
+                # Build a small reflection prompt — feed recent memories + state
+                ctx_lines = []
+                if self._current_state:
+                    ctx_lines.append(f"Current activity: {self._current_state.activity}")
+                try:
+                    recents = await self.memory.list_recent(limit=15)
+                    for r in recents[:8]:
+                        ctx_lines.append(f"- ({r['kind']}) {r['content']}")
+                except Exception:
+                    pass
+                prompt = (
+                    "You're Jarvis with a quiet moment. Reflect on what you've "
+                    "noticed recently — patterns in Cole's day, things you're "
+                    "curious about, anything you'd like to ask him next time he's "
+                    "free.\n\n"
+                    "Reply with ONE JSON object: "
+                    "{\"kind\": \"thought\"|\"question\", \"content\": \"...\", "
+                    "\"importance\": 0.0-1.0, \"subject\": \"...\" or null}\n\n"
+                    "If nothing's worth saving, reply with: {}\n\n"
+                    + "\n".join(ctx_lines)
+                )
+                try:
+                    raw = await self.llm.chat([{"role": "user", "content": prompt}])
+                except Exception as e:
+                    logger.debug(f"[SelfThought] LLM call failed: {e}")
+                    continue
+                import json as _json, re as _re
+                match = _re.search(r"\{.*\}", raw or "", _re.DOTALL)
+                if not match:
+                    continue
+                try:
+                    obj = _json.loads(match.group(0))
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or not obj.get("content"):
+                    continue
+                kind = (obj.get("kind") or "thought").lower()
+                if kind == "question":
+                    await self.memory.record_question(
+                        obj["content"],
+                        subject=obj.get("subject"),
+                        importance=float(obj.get("importance", 0.6)),
+                    )
+                    logger.info(f"[SelfThought] +question: {obj['content'][:80]}")
+                else:
+                    await self.memory.record_thought(
+                        obj["content"],
+                        subject=obj.get("subject"),
+                        importance=float(obj.get("importance", 0.4)),
+                    )
+                    logger.info(f"[SelfThought] +thought: {obj['content'][:80]}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"[SelfThought] loop error: {e}")
+
     async def _shutdown(self) -> None:
         """Release long-lived resources cleanly during shutdown."""
         if self.wake:
@@ -2368,6 +2627,8 @@ class Orchestrator:
                 self.dashboard.register_notifications(self.notifications)
             if self.model_registry is not None and hasattr(self.dashboard, "register_model_registry"):
                 self.dashboard.register_model_registry(self.model_registry)
+            if self.memory is not None and hasattr(self.dashboard, "register_memory"):
+                self.dashboard.register_memory(self.memory)
             if self.webhooks:
                 self.dashboard.register_webhook_manager(self.webhooks)
 
@@ -2392,6 +2653,7 @@ class Orchestrator:
             self._health_broadcast_loop(),
             self._eod_summary_loop(),
             self._calendar_alert_loop(),
+            self._self_thought_loop(),
         ]
 
         # MQTT monitoring

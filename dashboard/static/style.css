@@ -1088,6 +1088,72 @@ main {
 .pending-confirm { background: var(--bg-card); border-color: var(--green, #4ade80); }
 .pending-reject:hover { border-color: var(--red); color: var(--red); }
 
+/* ── Memory v2 ────────────────────────────────────────────────────────── */
+.memory-filter {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.memory-filter .reminder-input { flex: 1; }
+.memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 380px;
+  overflow-y: auto;
+}
+.memory-row {
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-muted);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font-size: 11px;
+}
+.mem-fact { border-left-color: var(--text-dim); }
+.mem-preference { border-left-color: #f5a14a; }
+.mem-event { border-left-color: #6ec1ff; }
+.mem-instruction { border-left-color: #c785f5; }
+.mem-thought { border-left-color: #8effa1; }
+.mem-question { border-left-color: #ffd166; }
+.mem-line1 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+.mem-kind {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+.mem-importance {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+.mem-del {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.mem-del:hover { color: var(--red); border-color: var(--red); }
+.mem-content { color: var(--text); }
+.mem-subject { color: var(--text-dim); font-family: var(--mono); font-size: 9px; }
+.mem-meta {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
 /* ── LLM model selector ───────────────────────────────────────────────── */
 .model-row {
   display: flex;

@@ -84,6 +84,7 @@ class DashboardServer:
         self._identity = None         # Set by orchestrator via register_identity() — Identity v2
         self._notifications = None    # Set by orchestrator via register_notifications()
         self._model_registry = None   # Set by orchestrator via register_model_registry()
+        self._memory = None           # Set by orchestrator via register_memory()
         self._webhook_manager = None  # Set by orchestrator via register_webhook_manager()
 
         self._setup_routes()
@@ -173,6 +174,10 @@ class DashboardServer:
     def register_model_registry(self, registry) -> None:
         """Wire ModelRegistry so /api/models endpoints work."""
         self._model_registry = registry
+
+    def register_memory(self, memory_store) -> None:
+        """Wire MemoryStore so /api/memory endpoints work."""
+        self._memory = memory_store
 
     def register_webhook_manager(self, webhooks) -> None:
         """Wire WebhookManager so /api/webhook/{name} endpoints can dispatch inbound calls."""
@@ -744,6 +749,66 @@ class DashboardServer:
             if mgr is None:
                 raise HTTPException(status_code=503, detail="Notifications not available")
             ok = await mgr.delete(notification_id)
+            return JSONResponse({"ok": ok})
+
+        # ── Memory v2 ───────────────────────────────────────────────────────
+
+        @app.get("/api/memory")
+        async def memory_list(kind: Optional[str] = None, limit: int = 100):
+            mem = self._memory
+            if mem is None:
+                return JSONResponse({"items": []})
+            return JSONResponse({"items": await mem.list_recent(limit=limit, kind=kind)})
+
+        @app.get("/api/memory/search")
+        async def memory_search(q: str, k: int = 10):
+            mem = self._memory
+            if mem is None:
+                return JSONResponse({"items": []})
+            return JSONResponse({"items": await mem.retrieve(q, k=int(k))})
+
+        @app.post("/api/memory")
+        async def memory_add(request: Request):
+            mem = self._memory
+            if mem is None:
+                raise HTTPException(status_code=503, detail="Memory store not available")
+            body = await request.json()
+            content = str(body.get("content", "")).strip()
+            if not content:
+                raise HTTPException(status_code=400, detail="content required")
+            mid = await mem.add(
+                kind=str(body.get("kind", "fact")).lower(),
+                content=content,
+                subject=body.get("subject"),
+                importance=float(body.get("importance", 0.5)),
+                source_kind="manual",
+            )
+            await self.broadcast({"type": "memory.added", "id": mid})
+            return JSONResponse({"ok": mid is not None, "id": mid})
+
+        @app.post("/api/memory/{memory_id}")
+        async def memory_update(memory_id: int, request: Request):
+            mem = self._memory
+            if mem is None:
+                raise HTTPException(status_code=503, detail="Memory store not available")
+            body = await request.json()
+            ok = await mem.update(
+                memory_id,
+                content=body.get("content"),
+                importance=body.get("importance"),
+                kind=body.get("kind"),
+                subject=body.get("subject"),
+            )
+            await self.broadcast({"type": "memory.updated", "id": memory_id})
+            return JSONResponse({"ok": ok})
+
+        @app.delete("/api/memory/{memory_id}")
+        async def memory_delete(memory_id: int):
+            mem = self._memory
+            if mem is None:
+                raise HTTPException(status_code=503, detail="Memory store not available")
+            ok = await mem.delete(memory_id)
+            await self.broadcast({"type": "memory.deleted", "id": memory_id})
             return JSONResponse({"ok": ok})
 
         # ── LLM model selector ──────────────────────────────────────────────

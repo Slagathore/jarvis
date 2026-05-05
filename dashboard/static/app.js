@@ -206,6 +206,11 @@ function applyEvent(event) {
     case "model.pulled":
       loadModels();
       break;
+    case "memory.added":
+    case "memory.updated":
+    case "memory.deleted":
+      loadMemory();
+      break;
   }
 }
 
@@ -1413,6 +1418,63 @@ if (bellMarkAll) {
   });
 }
 loadNotifications();
+
+// ── MEMORY v2 ────────────────────────────────────────────────────────────
+
+let _memoryDebounce = null;
+
+function loadMemory() {
+  const kindEl = document.getElementById("memory-kind-filter");
+  const searchEl = document.getElementById("memory-search");
+  const kind = kindEl ? kindEl.value : "";
+  const search = searchEl ? searchEl.value.trim() : "";
+  const url = search
+    ? `/api/memory/search?q=${encodeURIComponent(search)}&k=20`
+    : `/api/memory?limit=80${kind ? `&kind=${encodeURIComponent(kind)}` : ""}`;
+  fetch(url)
+    .then((r) => r.json())
+    .then(({ items }) => renderMemory(items || []))
+    .catch(() => {});
+}
+
+function renderMemory(items) {
+  const el = document.getElementById("memory-list");
+  if (!el) return;
+  if (!items.length) {
+    el.innerHTML = `<div class="who-empty">No memories.</div>`;
+    return;
+  }
+  el.innerHTML = "";
+  items.forEach((m) => {
+    const row = document.createElement("div");
+    row.className = `memory-row mem-${m.kind || "fact"}`;
+    const subj = m.subject ? `<span class="mem-subject">[${escapeHtml(m.subject)}]</span> ` : "";
+    const imp = (m.importance || 0).toFixed(2);
+    const ts = (m.created_at || "").slice(0, 16);
+    row.innerHTML = `
+      <div class="mem-line1">
+        <span class="mem-kind">${escapeHtml(m.kind || "fact")}</span>
+        <span class="mem-importance">${imp}</span>
+        <button class="mem-del" data-id="${m.id}">×</button>
+      </div>
+      <div class="mem-content">${subj}${escapeHtml(m.content)}</div>
+      <div class="mem-meta">${ts}${typeof m.score === "number" ? ` · score ${m.score.toFixed(2)}` : ""}</div>
+    `;
+    row.querySelector(".mem-del").addEventListener("click", () => {
+      if (!confirm("Delete this memory?")) return;
+      fetch(`/api/memory/${m.id}`, { method: "DELETE" }).catch(() => {});
+    });
+    el.appendChild(row);
+  });
+}
+
+document.getElementById("memory-kind-filter")?.addEventListener("change", loadMemory);
+document.getElementById("memory-search")?.addEventListener("input", () => {
+  if (_memoryDebounce) clearTimeout(_memoryDebounce);
+  _memoryDebounce = setTimeout(loadMemory, 250);
+});
+
+loadMemory();
 
 // ── LLM MODEL SELECTOR ────────────────────────────────────────────────────
 

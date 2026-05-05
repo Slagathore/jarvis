@@ -281,6 +281,26 @@
           </div>
         </div>
 
+        <!-- Memory v2 (semantic long-term memory) -->
+        <div class="card" id="memory-card">
+          <div class="card-label">MEMORY</div>
+          <div class="memory-filter">
+            <select class="dev-select" id="memory-kind-filter">
+              <option value="">all kinds</option>
+              <option value="fact">fact</option>
+              <option value="preference">preference</option>
+              <option value="event">event</option>
+              <option value="instruction">instruction</option>
+              <option value="thought">thought</option>
+              <option value="question">question</option>
+            </select>
+            <input type="text" id="memory-search" class="reminder-input" placeholder="Semantic search…" autocomplete="off" />
+          </div>
+          <div class="memory-list" id="memory-list">
+            <div class="who-empty">No memories yet.</div>
+          </div>
+        </div>
+
         <!-- Pending review (drift conflicts + unknown clusters surfaced for naming) -->
         <div class="card" id="pending-card">
           <div class="card-label">PENDING REVIEW</div>
@@ -344,6 +364,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=17"></script>
+    <script src="/static/app.js?v=18"></script>
   </body>
 </html>

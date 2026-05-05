@@ -177,6 +177,37 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications (read, created_at);
 
+-- ── Memory v2 (semantic / importance-scored long-term memory) ───────────────
+-- The conversation_log table is a raw transcript; this is the *distilled*
+-- memory layer. After each user turn an LLM-extraction pass writes any
+-- "facts worth remembering" here with an importance score (0..1) and a
+-- 384-dim embedding (sentence-transformers all-MiniLM-L6-v2). Retrieval is
+-- semantic top-K weighted by importance × recency.
+--
+-- 'thought' kind is special: those are Jarvis's own self-generated reflections
+-- (curiosity engine when idle), not facts about the world. They live here so
+-- they're searchable and time-stamped like everything else.
+CREATE TABLE IF NOT EXISTS memories (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind               TEXT    NOT NULL,    -- fact | preference | event | instruction | thought | question
+    subject            TEXT,                 -- person/topic/room
+    content            TEXT    NOT NULL,
+    importance         REAL    DEFAULT 0.5, -- 0..1
+    embedding          BLOB,                 -- 384-dim float32 (all-MiniLM-L6-v2)
+    source_event_id    INTEGER,              -- backref to events.id when applicable
+    source_kind        TEXT,                 -- conversation | observation | self_thought | manual | claude
+    created_at         TEXT    NOT NULL,
+    last_accessed_at   TEXT,
+    access_count       INTEGER DEFAULT 0,
+    archived           INTEGER DEFAULT 0,
+    -- For 'thought' / 'question' kinds: has Jarvis already surfaced this to Cole?
+    surfaced_at        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories (kind);
+CREATE INDEX IF NOT EXISTS idx_memories_subject ON memories (subject);
+CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories (importance);
+CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories (archived);
+
 -- Per-activity transition log used for predicted-duration + routine learning.
 -- A row is open (ended_at NULL) while the activity is current; closed when the
 -- activity changes.
