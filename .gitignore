@@ -32,6 +32,10 @@ data/debug/
 data/google_token.json
 data/google_credentials.json
 data/test_frame_*.jpg
+# Supervisor / self-edit runtime state
+data/heartbeat.txt
+data/last_safe_sha.txt
+data/restart_pending.txt
 
 # Local config / secrets
 hardware/esphome/secrets.yaml
