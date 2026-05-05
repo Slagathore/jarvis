@@ -75,7 +75,7 @@ Variables:
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -91,6 +91,8 @@ from modules.activity.pc_monitor import PCMonitor
 from modules.brain.llm import OllamaLLM
 from modules.brain.model_registry import ModelRegistry
 from modules.brain.ask_claude import ClaudeClient
+from modules.computer.control import ComputerControl
+from modules.selfedit.edit import SelfEditControl
 from modules.brain.prompt_builder import PromptBuilder
 from modules.brain.session import SessionManager
 from modules.context.activity_history import ActivityHistory
@@ -168,6 +170,15 @@ class Orchestrator:
         # model escalate hard questions to a stronger reasoning model).
         # ANTHROPIC_API_KEY env var; tool only registers if key present.
         self._claude_client: Optional[ClaudeClient] = None
+        # Computer control — kill-switch-gated mouse + keyboard. Default OFF.
+        # Toggle from the dashboard. See modules/computer/control.py for the
+        # safety architecture (refuse list + confirm queue + pyautogui FAILSAFE).
+        self.computer: Optional[ComputerControl] = None
+        # Self-edit — Jarvis editing its own codebase. Read tools always
+        # available; write/restart tools gated by a kill switch (default OFF).
+        # Auto-commits before every write; restart_self pairs with the
+        # supervisor wrapper for auto-revert on broken startup.
+        self.selfedit: Optional[SelfEditControl] = None
         self.sessions: Optional[SessionManager] = None
         self.prompts: Optional[PromptBuilder] = None
 
@@ -327,6 +338,16 @@ class Orchestrator:
         except ImportError:
             pass
         self._claude_client = ClaudeClient()
+
+        # Computer control — start DISABLED (Cole flips on from dashboard).
+        self.computer = ComputerControl(broadcast=self._broadcast)
+
+        # Self-edit — start DISABLED. Project root is two levels up from this file.
+        from pathlib import Path as _Path
+        self.selfedit = SelfEditControl(
+            project_root=_Path(__file__).resolve().parents[1],
+            broadcast=self._broadcast,
+        )
 
         # Memory v2 — semantic store + extraction. Init schema is idempotent.
         if self.db is not None:
@@ -1223,6 +1244,210 @@ class Orchestrator:
         )
         return {"ok": mid is not None, "memory_id": mid}
 
+    # ── Computer control tools ──────────────────────────────────────────────
+    # Mouse + keyboard + screenshot. Gated by the kill switch on
+    # self.computer; tools only register when computer.enabled is True so the
+    # LLM doesn't even know they exist when control is off.
+    _COMPUTER_TOOLS: list[dict] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "screenshot",
+                "description": "Capture the current desktop. Returns a base64-encoded JPEG plus screen size. Use to see what's on screen before deciding where to click.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "screen_size",
+                "description": "Return the screen resolution as {width, height}. Useful for computing relative click positions.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "mouse_click",
+                "description": "Click at absolute screen pixel (x, y). Take a screenshot first to find the right coordinates.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "button": {"type": "string", "description": "left | right | middle"},
+                        "clicks": {"type": "integer", "description": "1 for click, 2 for double-click"},
+                    },
+                    "required": ["x", "y"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "mouse_move",
+                "description": "Move the cursor to (x, y) without clicking.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                    "required": ["x", "y"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "keyboard_type",
+                "description": "Type a string at the current keyboard focus. Refuses dangerous patterns (rm -rf, format, shutdown, etc.); some patterns require confirmation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "keyboard_hotkey",
+                "description": "Send a key combination, e.g. ['ctrl', 'c']. Refuses dangerous combos (Ctrl+Alt+Del, Win+L, Alt+F4).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"keys": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["keys"],
+                },
+            },
+        },
+    ]
+
+    def _computer_tool_handlers(self) -> dict:
+        c = self.computer
+        if c is None:
+            return {}
+        return {
+            "screenshot":      lambda: c.screenshot(),
+            "screen_size":     lambda: c.screen_size(),
+            "mouse_click":     c.mouse_click,
+            "mouse_move":      c.mouse_move,
+            "keyboard_type":   c.keyboard_type,
+            "keyboard_hotkey": c.keyboard_hotkey,
+        }
+
+    # ── Self-edit tools ─────────────────────────────────────────────────────
+    # Read tools always available so the LLM can analyze its own code even
+    # when write is disabled. Write/restart tools only register when the
+    # selfedit kill switch is ON.
+    _SELFEDIT_READ_TOOLS: list[dict] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file from the project. Path is relative to the project root.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files matching a glob pattern relative to the project root.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"glob": {"type": "string", "description": "Default: **/*"}},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "grep_files",
+                "description": "Search file contents for a regex pattern. Returns up to 100 matches.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "glob": {"type": "string", "description": "Default: **/*.py"},
+                    },
+                    "required": ["pattern"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "git_log",
+                "description": "Show the last N commits.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"n": {"type": "integer", "description": "Default 20"}},
+                },
+            },
+        },
+    ]
+    _SELFEDIT_WRITE_TOOLS: list[dict] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write a complete file. Auto-commits before writing so the change is one git reset away. Some files require dashboard confirmation; the protected list (this file, orchestrator, .env, jarvis.db) is blocked outright.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Find-and-replace exactly one occurrence of old_string with new_string. Auto-commits before editing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                    },
+                    "required": ["path", "old_string", "new_string"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "restart_self",
+                "description": "Schedule a graceful restart so just-applied edits take effect. Pairs with the supervisor wrapper for auto-revert if the new instance fails to start within 10 seconds.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"reason": {"type": "string"}},
+                    "required": ["reason"],
+                },
+            },
+        },
+    ]
+
+    def _selfedit_handlers(self) -> dict:
+        s = self.selfedit
+        if s is None:
+            return {}
+        return {
+            "read_file":     s.read_file,
+            "list_files":    s.list_files,
+            "grep_files":    s.grep_files,
+            "git_log":       s.git_log,
+            "write_file":    s.write_file,
+            "edit_file":     s.edit_file,
+            "restart_self":  s.restart_self,
+        }
+
     def _build_tool_registry(self) -> tuple[list[dict], dict]:
         """Aggregate every tool currently available to the LLM.
 
@@ -1244,6 +1469,27 @@ class Orchestrator:
             handlers["recall"]          = self._tool_recall
             handlers["record_thought"]  = self._tool_record_thought
             handlers["record_question"] = self._tool_record_question
+        # Computer tools only appear when the kill switch is ON. Removing
+        # them entirely (rather than always-present-with-error-stub) means
+        # the LLM doesn't know to attempt them when disabled.
+        if self.computer is not None and self.computer.enabled:
+            tools.extend(self._COMPUTER_TOOLS)
+            handlers.update(self._computer_tool_handlers())
+        # Self-edit: read tools always available so the LLM can analyze
+        # its own code regardless of the write switch. Write/restart only
+        # when the switch is on.
+        if self.selfedit is not None:
+            tools.extend(self._SELFEDIT_READ_TOOLS)
+            handlers.update({
+                k: v for k, v in self._selfedit_handlers().items()
+                if k in {"read_file", "list_files", "grep_files", "git_log"}
+            })
+            if self.selfedit.enabled:
+                tools.extend(self._SELFEDIT_WRITE_TOOLS)
+                handlers.update({
+                    k: v for k, v in self._selfedit_handlers().items()
+                    if k in {"write_file", "edit_file", "restart_self"}
+                })
         return tools, handlers
 
     async def _try_dnd(self, text: str, room: str) -> bool:
@@ -2629,6 +2875,10 @@ class Orchestrator:
                 self.dashboard.register_model_registry(self.model_registry)
             if self.memory is not None and hasattr(self.dashboard, "register_memory"):
                 self.dashboard.register_memory(self.memory)
+            if self.computer is not None and hasattr(self.dashboard, "register_computer"):
+                self.dashboard.register_computer(self.computer)
+            if self.selfedit is not None and hasattr(self.dashboard, "register_selfedit"):
+                self.dashboard.register_selfedit(self.selfedit)
             if self.webhooks:
                 self.dashboard.register_webhook_manager(self.webhooks)
 
@@ -2667,6 +2917,17 @@ class Orchestrator:
         # post-start and will spin up on demand.
         if self.wake_sources is not None:
             self.wake_sources.start()
+
+        # Write the heartbeat file the supervisor uses to confirm a clean
+        # startup. If we never reach this line, the supervisor will
+        # auto-revert the last self-edit.
+        try:
+            from pathlib import Path as _Path
+            heartbeat = _Path(__file__).resolve().parents[1] / "data" / "heartbeat.txt"
+            heartbeat.parent.mkdir(parents=True, exist_ok=True)
+            heartbeat.write_text(datetime.now(timezone.utc).isoformat(), "utf-8")
+        except Exception as e:
+            logger.debug(f"[Boot] heartbeat write failed: {e}")
 
         # Reminder scheduler
         if self.reminder_scheduler:

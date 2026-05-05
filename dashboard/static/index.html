@@ -157,6 +157,28 @@
           <div class="model-installed-list" id="model-installed-list"></div>
         </div>
 
+        <!-- Computer / Self-edit kill switches -->
+        <div class="card" id="control-card">
+          <div class="card-label">JARVIS CAPABILITIES</div>
+          <div class="control-row">
+            <span class="dev-label">COMPUTER</span>
+            <label class="switch">
+              <input type="checkbox" id="computer-toggle" />
+              <span class="slider"></span>
+            </label>
+            <span class="control-status" id="computer-status">disabled</span>
+          </div>
+          <div class="control-row">
+            <span class="dev-label">SELF-EDIT</span>
+            <label class="switch">
+              <input type="checkbox" id="selfedit-toggle" />
+              <span class="slider"></span>
+            </label>
+            <span class="control-status" id="selfedit-status">disabled</span>
+          </div>
+          <div class="control-pending" id="computer-pending"></div>
+        </div>
+
         <!-- Dev Controls Card -->
         <div class="card" id="dev-card">
           <div class="card-label">DEV CONTROLS</div>
@@ -364,6 +386,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=18"></script>
+    <script src="/static/app.js?v=19"></script>
   </body>
 </html>

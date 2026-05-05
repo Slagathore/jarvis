@@ -211,6 +211,16 @@ function applyEvent(event) {
     case "memory.deleted":
       loadMemory();
       break;
+    case "computer.toggled":
+    case "computer.pending_added":
+    case "computer.confirmed":
+    case "computer.rejected":
+      loadComputerStatus();
+      break;
+    case "selfedit.toggled":
+    case "selfedit.pending_added":
+      loadSelfEditStatus();
+      break;
   }
 }
 
@@ -1418,6 +1428,93 @@ if (bellMarkAll) {
   });
 }
 loadNotifications();
+
+// ── SELF-EDIT (kill switch + pending edits + revert) ─────────────────────
+
+function loadSelfEditStatus() {
+  fetch("/api/selfedit/status")
+    .then((r) => r.json())
+    .then((s) => {
+      const toggle = document.getElementById("selfedit-toggle");
+      const status = document.getElementById("selfedit-status");
+      if (toggle) toggle.checked = !!s.enabled;
+      if (status) {
+        status.textContent = s.available
+          ? (s.enabled ? "ENABLED — Jarvis can edit its own code" : "disabled (read-only)")
+          : "unavailable";
+        status.className = "control-status" + (s.enabled ? " on" : "");
+      }
+    })
+    .catch(() => {});
+}
+
+document.getElementById("selfedit-toggle")?.addEventListener("change", (e) => {
+  fetch("/api/selfedit/enable", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: e.target.checked }),
+  }).then(loadSelfEditStatus).catch(() => {});
+});
+loadSelfEditStatus();
+
+// ── COMPUTER CONTROL (kill switch + pending action queue) ────────────────
+
+function loadComputerStatus() {
+  fetch("/api/computer/status")
+    .then((r) => r.json())
+    .then((s) => {
+      const toggle = document.getElementById("computer-toggle");
+      const status = document.getElementById("computer-status");
+      if (toggle) toggle.checked = !!s.enabled;
+      if (status) {
+        status.textContent = s.available
+          ? (s.enabled ? "ENABLED — Jarvis can drive mouse + keyboard" : "disabled")
+          : "unavailable";
+        status.className = "control-status" + (s.enabled ? " on" : "");
+      }
+      renderComputerPending(s.pending || []);
+    })
+    .catch(() => {});
+}
+
+function renderComputerPending(pending) {
+  const el = document.getElementById("computer-pending");
+  if (!el) return;
+  if (!pending.length) { el.innerHTML = ""; return; }
+  el.innerHTML = `<div class="control-pending-title">Pending approval</div>` +
+    pending.map((p) => `
+      <div class="control-pending-row">
+        <div class="control-pending-info">
+          <div class="control-pending-action">${escapeHtml(p.action_type)}</div>
+          <div class="control-pending-args">${escapeHtml(JSON.stringify(p.args))}</div>
+          <div class="control-pending-reason">${escapeHtml(p.reason)}</div>
+        </div>
+        <button class="dev-btn pending-approve" data-id="${p.id}">APPROVE</button>
+        <button class="dev-btn pending-reject" data-id="${p.id}">REJECT</button>
+      </div>
+    `).join("");
+  el.querySelectorAll(".pending-approve").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      fetch(`/api/computer/pending/${btn.dataset.id}/approve`, { method: "POST" })
+        .then(loadComputerStatus).catch(() => {});
+    });
+  });
+  el.querySelectorAll(".pending-reject").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      fetch(`/api/computer/pending/${btn.dataset.id}/reject`, { method: "POST" })
+        .then(loadComputerStatus).catch(() => {});
+    });
+  });
+}
+
+document.getElementById("computer-toggle")?.addEventListener("change", (e) => {
+  fetch("/api/computer/enable", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: e.target.checked }),
+  }).then(loadComputerStatus).catch(() => {});
+});
+loadComputerStatus();
 
 // ── MEMORY v2 ────────────────────────────────────────────────────────────
 

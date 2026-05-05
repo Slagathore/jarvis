@@ -85,6 +85,8 @@ class DashboardServer:
         self._notifications = None    # Set by orchestrator via register_notifications()
         self._model_registry = None   # Set by orchestrator via register_model_registry()
         self._memory = None           # Set by orchestrator via register_memory()
+        self._computer = None         # Set by orchestrator via register_computer()
+        self._selfedit = None         # Set by orchestrator via register_selfedit()
         self._webhook_manager = None  # Set by orchestrator via register_webhook_manager()
 
         self._setup_routes()
@@ -178,6 +180,14 @@ class DashboardServer:
     def register_memory(self, memory_store) -> None:
         """Wire MemoryStore so /api/memory endpoints work."""
         self._memory = memory_store
+
+    def register_computer(self, computer_control) -> None:
+        """Wire ComputerControl so /api/computer endpoints work."""
+        self._computer = computer_control
+
+    def register_selfedit(self, selfedit_control) -> None:
+        """Wire SelfEditControl so /api/selfedit endpoints work."""
+        self._selfedit = selfedit_control
 
     def register_webhook_manager(self, webhooks) -> None:
         """Wire WebhookManager so /api/webhook/{name} endpoints can dispatch inbound calls."""
@@ -750,6 +760,91 @@ class DashboardServer:
                 raise HTTPException(status_code=503, detail="Notifications not available")
             ok = await mgr.delete(notification_id)
             return JSONResponse({"ok": ok})
+
+        # ── Computer control (kill-switch + pending-action review) ──────────
+
+        @app.get("/api/computer/status")
+        async def computer_status():
+            c = self._computer
+            if c is None:
+                return JSONResponse({"available": False, "enabled": False, "pending": []})
+            return JSONResponse({
+                "available": True,
+                **c.status(),
+                "pending":  c.list_pending(),
+            })
+
+        @app.post("/api/computer/enable")
+        async def computer_enable(request: Request):
+            c = self._computer
+            if c is None:
+                raise HTTPException(status_code=503, detail="Computer control not available")
+            body = await request.json()
+            value = bool(body.get("enabled", False))
+            c.set_enabled(value)
+            await self.broadcast({"type": "computer.toggled", "enabled": value})
+            return JSONResponse({"ok": True, "enabled": value})
+
+        @app.post("/api/computer/pending/{action_id}/approve")
+        async def computer_approve(action_id: int):
+            c = self._computer
+            if c is None:
+                raise HTTPException(status_code=503, detail="Computer control not available")
+            result = await c.approve(action_id)
+            return JSONResponse(result)
+
+        @app.post("/api/computer/pending/{action_id}/reject")
+        async def computer_reject(action_id: int):
+            c = self._computer
+            if c is None:
+                raise HTTPException(status_code=503, detail="Computer control not available")
+            ok = await c.reject(action_id)
+            return JSONResponse({"ok": ok})
+
+        # ── Self-edit (kill switch + pending review + revert) ───────────────
+
+        @app.get("/api/selfedit/status")
+        async def selfedit_status():
+            s = self._selfedit
+            if s is None:
+                return JSONResponse({"available": False, "enabled": False, "pending": []})
+            return JSONResponse({
+                "available": True, **s.status(),
+                "pending":   s.list_pending(),
+            })
+
+        @app.post("/api/selfedit/enable")
+        async def selfedit_enable(request: Request):
+            s = self._selfedit
+            if s is None:
+                raise HTTPException(status_code=503, detail="Self-edit not available")
+            body = await request.json()
+            value = bool(body.get("enabled", False))
+            s.set_enabled(value)
+            await self.broadcast({"type": "selfedit.toggled", "enabled": value})
+            return JSONResponse({"ok": True, "enabled": value})
+
+        @app.post("/api/selfedit/pending/{edit_id}/approve")
+        async def selfedit_approve(edit_id: int):
+            s = self._selfedit
+            if s is None:
+                raise HTTPException(status_code=503, detail="Self-edit not available")
+            return JSONResponse(await s.approve_pending(edit_id))
+
+        @app.post("/api/selfedit/pending/{edit_id}/reject")
+        async def selfedit_reject(edit_id: int):
+            s = self._selfedit
+            if s is None:
+                raise HTTPException(status_code=503, detail="Self-edit not available")
+            ok = await s.reject_pending(edit_id)
+            return JSONResponse({"ok": ok})
+
+        @app.post("/api/selfedit/revert")
+        async def selfedit_revert():
+            s = self._selfedit
+            if s is None:
+                raise HTTPException(status_code=503, detail="Self-edit not available")
+            return JSONResponse(await s.revert_last())
 
         # ── Memory v2 ───────────────────────────────────────────────────────
 

@@ -1088,6 +1088,87 @@ main {
 .pending-confirm { background: var(--bg-card); border-color: var(--green, #4ade80); }
 .pending-reject:hover { border-color: var(--red); color: var(--red); }
 
+/* ── Capability kill switches (computer + self-edit) ──────────────────── */
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.control-status {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-left: auto;
+}
+.control-status.on { color: var(--green, #4ade80); }
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  height: 18px;
+  flex-shrink: 0;
+}
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  transition: 0.2s;
+}
+.slider:before {
+  content: "";
+  position: absolute;
+  height: 12px;
+  width: 12px;
+  left: 2px;
+  top: 2px;
+  background: var(--text-muted);
+  border-radius: 50%;
+  transition: 0.2s;
+}
+.switch input:checked + .slider {
+  background: var(--green, #4ade80);
+  border-color: var(--green, #4ade80);
+}
+.switch input:checked + .slider:before {
+  transform: translateX(14px);
+  background: white;
+}
+.control-pending { margin-top: 8px; }
+.control-pending-title {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--amber);
+  margin-bottom: 4px;
+}
+.control-pending-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius);
+  padding: 4px 6px;
+  margin-bottom: 4px;
+}
+.control-pending-info { flex: 1; }
+.control-pending-action {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+}
+.control-pending-args, .control-pending-reason {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
 /* ── Memory v2 ────────────────────────────────────────────────────────── */
 .memory-filter {
   display: flex;
