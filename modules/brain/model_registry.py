@@ -38,10 +38,37 @@ class ModelCapabilities:
     thinking_mode: bool = False                # CoT / 'think' modes
     feature_toggles: list[str] = None          # type: ignore[assignment]
     notes: str = ""                            # short capability summary
+    is_api_direct: bool = False                # True for direct API endpoints (not Ollama-installed)
 
     def __post_init__(self):
         if self.feature_toggles is None:
             self.feature_toggles = []
+
+
+# Direct-API entries — always available regardless of what Ollama has
+# installed. The OllamaLLM dispatcher routes these through their respective
+# direct clients (currently: Gemini via modules/brain/gemini_direct.py).
+# Model name suffix ':gapi' = Google API direct.
+API_DIRECT_MODELS: list[ModelCapabilities] = [
+    ModelCapabilities(
+        name="gemini-3-flash-preview:gapi",
+        is_cloud=True,
+        is_api_direct=True,
+        context_window=1_000_000,
+        tool_use=True,
+        vision=True,
+        notes="Google API direct (no Ollama). ~300ms first token, full tool calling, native vision. Requires GEMINI_API_KEY in .env.",
+    ),
+    ModelCapabilities(
+        name="gemini-flash-latest:gapi",
+        is_cloud=True,
+        is_api_direct=True,
+        context_window=1_000_000,
+        tool_use=True,
+        vision=True,
+        notes="Google's auto-rolling 'latest flash' alias. Same caps as gemini-3-flash-preview but moves forward when Google releases newer flash.",
+    ),
+]
 
 
 # Hardcoded capability table for well-known models. Match by prefix so e.g.
@@ -244,15 +271,11 @@ class ModelRegistry:
     # ── Listing ─────────────────────────────────────────────────────────────
 
     async def list_installed(self) -> list[dict]:
-        """Return [{name, size_bytes, modified_at, capabilities, user_notes}, ...]."""
-        try:
-            client = self._llm.client
-            resp = await client.list()
-        except Exception as e:
-            logger.warning(f"[ModelRegistry] ollama list failed: {e}")
-            return []
+        """Return [{name, size_bytes, modified_at, capabilities, user_notes}, ...].
 
-        models = resp.get("models") if isinstance(resp, dict) else getattr(resp, "models", [])
+        Includes both Ollama-installed models AND direct-API entries so the
+        dashboard dropdown shows everything Jarvis can route to.
+        """
         out: list[dict] = []
         notes_rows = {}
         try:
@@ -264,10 +287,32 @@ class ModelRegistry:
         except Exception:
             pass
 
+        # Direct-API entries first (always available)
+        for caps in API_DIRECT_MODELS:
+            note_row = notes_rows.get(caps.name) or {}
+            out.append({
+                "name": caps.name,
+                "size_bytes": None,
+                "modified_at": None,
+                "capabilities": asdict(caps),
+                "user_notes": note_row.get("user_notes", ""),
+                "active_chat": (caps.name == self._llm.model),
+                "active_vision": (caps.name == self._llm.vision_model),
+                "is_api_direct": True,
+            })
+
+        # Ollama-installed models
+        try:
+            client = self._llm.client
+            resp = await client.list()
+        except Exception as e:
+            logger.warning(f"[ModelRegistry] ollama list failed: {e}")
+            return out
+
+        models = resp.get("models") if isinstance(resp, dict) else getattr(resp, "models", [])
         for m in models or []:
             name = m.get("model") if isinstance(m, dict) else getattr(m, "model", "")
             if not name:
-                # Some ollama versions return 'name' instead
                 name = m.get("name") if isinstance(m, dict) else getattr(m, "name", "")
             size = m.get("size") if isinstance(m, dict) else getattr(m, "size", None)
             modified = (
@@ -283,6 +328,7 @@ class ModelRegistry:
                 "user_notes": note_row.get("user_notes", ""),
                 "active_chat": (name == self._llm.model),
                 "active_vision": (name == self._llm.vision_model),
+                "is_api_direct": False,
             })
         return out
 
@@ -313,7 +359,11 @@ class ModelRegistry:
             yield {"status": "error", "error": str(e)}
 
     async def delete(self, name: str) -> bool:
-        """Remove a model from the local Ollama install."""
+        """Remove a model from the local Ollama install. Direct-API entries
+        cannot be deleted (they're virtual)."""
+        if any(m.name == name for m in API_DIRECT_MODELS):
+            logger.debug(f"[ModelRegistry] refusing to delete API-direct entry '{name}'")
+            return False
         if name == self._llm.model:
             return False  # don't delete the model that's currently in use
         client = self._llm.client

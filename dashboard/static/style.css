@@ -1114,6 +1114,7 @@ main {
   color: var(--text-dim);
 }
 .cap-cloud { color: #6ec1ff; border-color: #6ec1ff44; }
+.cap-api { color: #ffd166; border-color: #ffd16644; background: #ffd16611; }
 .cap-tools { color: #8effa1; border-color: #8effa144; }
 .cap-vision { color: #f5a14a; border-color: #f5a14a44; }
 .cap-think { color: #c785f5; border-color: #c785f544; }

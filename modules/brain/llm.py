@@ -29,7 +29,7 @@ Variables:
 
 import asyncio
 import base64
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 import numpy as np
@@ -71,6 +71,30 @@ class OllamaLLM:
         except ImportError as e:
             raise LLMError("ollama package not installed. Run: pip install ollama") from e
 
+        # Lazy-init Gemini direct-API client. Only built when a model name with
+        # the ':gapi' suffix gets selected — keeps the import + httpx pool out
+        # of the boot path for users who never use the direct API.
+        self._gemini_direct: Optional[Any] = None
+
+    @staticmethod
+    def _is_gemini_direct(model_name: str) -> bool:
+        """True for models routed through Google's direct API (not via Ollama)."""
+        return ":gapi" in (model_name or "")
+
+    def _get_gemini_direct(self) -> Any:
+        if self._gemini_direct is None:
+            from modules.brain.gemini_direct import GeminiDirectClient
+            from pathlib import Path
+            # Load .env so GEMINI_API_KEY is visible. Idempotent — python-dotenv
+            # is a no-op if already loaded or absent.
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+            except ImportError:
+                pass
+            self._gemini_direct = GeminiDirectClient(timeout=self._timeout)
+        return self._gemini_direct
+
     @property
     def model(self) -> str:
         """Current text-chat model name. Read by health checks + dashboard."""
@@ -110,6 +134,10 @@ class OllamaLLM:
         Raises:
             LLMError: On connection failure, timeout, or invalid response.
         """
+        # Dispatch: ':gapi' models go through Google's direct API instead of Ollama.
+        if self._is_gemini_direct(self._model):
+            return await self._get_gemini_direct().chat(messages, model=self._model)
+
         try:
             response = await asyncio.wait_for(
                 self._client.chat(
@@ -155,6 +183,16 @@ class OllamaLLM:
             LLMError: On connection failure, timeout, or unrecognized tool call.
         """
         import json
+
+        # Dispatch: ':gapi' models route to Gemini direct, with its own tool loop.
+        if self._is_gemini_direct(self._model):
+            return await self._get_gemini_direct().chat_with_tools(
+                messages=messages,
+                tools=tools,
+                model=self._model,
+                tool_dispatcher=tool_handlers,
+                max_iterations=max_iterations,
+            )
 
         working_messages = list(messages)
 
@@ -252,6 +290,12 @@ class OllamaLLM:
         success, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
         if not success:
             raise LLMError("Failed to encode camera frame as JPEG")
+
+        # Dispatch: ':gapi' models go to Gemini direct API
+        if self._is_gemini_direct(self._vision_model):
+            return await self._get_gemini_direct().vision_query(
+                buf.tobytes(), prompt, model=self._vision_model
+            )
 
         img_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
 

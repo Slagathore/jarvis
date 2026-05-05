@@ -90,6 +90,7 @@ from modules.activity.audio_classifier import AudioClassifier
 from modules.activity.pc_monitor import PCMonitor
 from modules.brain.llm import OllamaLLM
 from modules.brain.model_registry import ModelRegistry
+from modules.brain.ask_claude import ClaudeClient
 from modules.brain.prompt_builder import PromptBuilder
 from modules.brain.session import SessionManager
 from modules.context.activity_history import ActivityHistory
@@ -158,6 +159,10 @@ class Orchestrator:
         # Model catalog/registry — surfaces installed models, capabilities,
         # and pull/delete/swap operations to the dashboard.
         self.model_registry: Optional[ModelRegistry] = None
+        # Claude API client used by the ask_claude LLM tool (lets the local
+        # model escalate hard questions to a stronger reasoning model).
+        # ANTHROPIC_API_KEY env var; tool only registers if key present.
+        self._claude_client: Optional[ClaudeClient] = None
         self.sessions: Optional[SessionManager] = None
         self.prompts: Optional[PromptBuilder] = None
 
@@ -309,6 +314,14 @@ class Orchestrator:
         self.llm = OllamaLLM(self.config)
         self.sessions = SessionManager(self.config)
         self.prompts = PromptBuilder(config=self.config)
+        # Load .env so GEMINI_API_KEY / ANTHROPIC_API_KEY are visible.
+        try:
+            from dotenv import load_dotenv
+            from pathlib import Path as _Path
+            load_dotenv(_Path(__file__).resolve().parents[1] / ".env")
+        except ImportError:
+            pass
+        self._claude_client = ClaudeClient()
         # Model registry — wires the dashboard's LLM selector to the live
         # OllamaLLM. Schema init is idempotent and safe to call before run.
         if self.db is not None:
@@ -733,14 +746,16 @@ class Orchestrator:
             extras=extras or None,
         )
 
-        # Tool calling: if calendar is available, give the LLM the calendar
-        # tool schemas and it'll query Google Calendar in real time when needed
-        # (any date range, no stale cache). Otherwise fall back to plain chat.
-        if self.calendar is not None and self.calendar.is_authenticated:
+        # Tool calling: collect every tool currently available — calendar (if
+        # authenticated), ask_claude (always available with API key), memory
+        # tools, etc. The LLM picks whichever it needs based on the user's
+        # question. Empty list → plain chat path.
+        tools, handlers = self._build_tool_registry()
+        if tools:
             response = await self.llm.chat_with_tools(
                 messages=prompt_context,
-                tools=self._CALENDAR_TOOLS,
-                tool_handlers=self._calendar_tool_handlers(),
+                tools=tools,
+                tool_handlers=handlers,
             )
         else:
             response = await self.llm.chat(messages=prompt_context)
@@ -994,6 +1009,66 @@ class Orchestrator:
             "calendar_delete_event":  self._tool_calendar_delete_event,
             "calendar_update_event":  self._tool_calendar_update_event,
         }
+
+    # ── ask_claude tool ──────────────────────────────────────────────────────
+    # Lets the local LLM escalate hard questions to Claude (a stronger
+    # reasoning model). Useful when Jarvis is on a smaller local model and
+    # hits a wall on a tricky debug, design choice, or code question.
+    _ASK_CLAUDE_TOOL: dict = {
+        "type": "function",
+        "function": {
+            "name": "ask_claude",
+            "description": (
+                "Ask Anthropic's Claude (a strong reasoning model) a question. "
+                "Use this when you need help debugging code, reasoning about a "
+                "tricky design, or getting a second opinion. Pass the user's "
+                "question or your own. Optionally include a code snippet, "
+                "stack trace, or other context."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to ask Claude. Be specific.",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": (
+                            "Optional context: code snippet, error message, file "
+                            "contents, etc. Goes after the question."
+                        ),
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    }
+
+    async def _tool_ask_claude(self, question: str, context: Optional[str] = None) -> dict:
+        if self._claude_client is None:
+            return {"error": "ask_claude unavailable — ANTHROPIC_API_KEY not set"}
+        if not self._claude_client.has_key:
+            return {"error": "ask_claude unavailable — ANTHROPIC_API_KEY not set"}
+        answer = await self._claude_client.ask(question, context=context)
+        return {"answer": answer}
+
+    def _build_tool_registry(self) -> tuple[list[dict], dict]:
+        """Aggregate every tool currently available to the LLM.
+
+        Returns (tools_schema, name->handler dict). Each module that adds
+        tools (calendar, claude, memory, computer, self-edit) appends here.
+        Empty result triggers a plain chat (no-tools) call upstream.
+        """
+        tools: list[dict] = []
+        handlers: dict = {}
+        if self.calendar is not None and self.calendar.is_authenticated:
+            tools.extend(self._CALENDAR_TOOLS)
+            handlers.update(self._calendar_tool_handlers())
+        if self._claude_client is not None and self._claude_client.has_key:
+            tools.append(self._ASK_CLAUDE_TOOL)
+            handlers["ask_claude"] = self._tool_ask_claude
+        return tools, handlers
 
     async def _try_dnd(self, text: str, room: str) -> bool:
         """

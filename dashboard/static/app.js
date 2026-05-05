@@ -1431,7 +1431,11 @@ function loadModels() {
 function _capsBadges(caps) {
   if (!caps) return "";
   const items = [];
-  if (caps.is_cloud) items.push(`<span class="cap-badge cap-cloud">CLOUD</span>`);
+  if (caps.is_api_direct) {
+    items.push(`<span class="cap-badge cap-api">API</span>`);
+  } else if (caps.is_cloud) {
+    items.push(`<span class="cap-badge cap-cloud">CLOUD</span>`);
+  }
   if (caps.tool_use) items.push(`<span class="cap-badge cap-tools">TOOLS</span>`);
   if (caps.vision) items.push(`<span class="cap-badge cap-vision">VISION</span>`);
   if (caps.thinking_mode) items.push(`<span class="cap-badge cap-think">CoT</span>`);
