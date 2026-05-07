@@ -1020,7 +1020,11 @@ def _count_faces(frame: np.ndarray) -> int:
         # detected; filter by facial_area.w.
         n = 0
         for f in faces or []:
+            if not isinstance(f, dict):
+                continue
             fa = f.get("facial_area") or {}
+            if not isinstance(fa, dict):
+                continue
             if int(fa.get("w", 0)) >= 30 and int(fa.get("h", 0)) >= 30:
                 n += 1
         return n

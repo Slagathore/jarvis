@@ -77,21 +77,53 @@ class NodeManager:
         self._mqtt = mqtt_client
         self._stale_seconds: float = NODE_STALE_SECONDS
 
-        # Initialize node records from rooms config
+        # Initialize node records from rooms config. Under the new toggle
+        # schema, "this room has an ESP32-CAM node" means at least one of
+        # video / mic / speaker uses an esp32_* driver. We derive the IP
+        # from the video URL when present; mic/speaker MQTT topics don't
+        # carry IPs (they go through the broker).
         self._nodes: dict[str, NodeInfo] = {}
         # Per-room desired FPS, published on connect so the firmware's
         # set_idle_update_interval lambda picks it up.
         self._room_fps_idle: dict[str, int] = {}
         for room_cfg in config.get("rooms", []):
             room_id = room_cfg.get("id", "unknown")
-            if room_cfg.get("has_node", False):
+            if self._room_has_esp32(room_cfg):
                 self._nodes[room_id] = NodeInfo(
                     room=room_id,
-                    ip_address=room_cfg.get("node_ip"),
+                    ip_address=self._extract_esp32_ip(room_cfg),
                 )
             fps_idle = room_cfg.get("fps_idle")
             if isinstance(fps_idle, (int, float)) and fps_idle > 0:
                 self._room_fps_idle[room_id] = int(fps_idle)
+
+    @staticmethod
+    def _room_has_esp32(room_cfg: dict) -> bool:
+        """True if any of the room's three channels uses an esp32_* driver."""
+        for key in ("video", "mic", "speaker"):
+            channel = room_cfg.get(key) or {}
+            if isinstance(channel, dict):
+                ctype = str(channel.get("type", ""))
+                if ctype.startswith("esp32_"):
+                    return True
+        return False
+
+    @staticmethod
+    def _extract_esp32_ip(room_cfg: dict) -> Optional[str]:
+        """Pull the ESP32 IP from the video URL when present. Returns None
+        when only mic/speaker are ESP-routed (those go through MQTT topics,
+        not direct IPs).
+        """
+        video_cfg = room_cfg.get("video") or {}
+        if isinstance(video_cfg, dict) and video_cfg.get("type") == "esp32_http":
+            url = str(video_cfg.get("url", ""))
+            # Cheap parse: http://<host>:<port>/<path> → host
+            try:
+                from urllib.parse import urlparse
+                return urlparse(url).hostname
+            except Exception:
+                return None
+        return None
 
     async def load(self) -> None:
         """Register MQTT subscriptions for node status topics."""

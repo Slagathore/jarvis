@@ -19,8 +19,7 @@ No cloud subscriptions. No wake-word-to-server round trips. Everything runs on y
 - **Real-time dashboard** at `http://localhost:7070` — activity state, room status, conversation log, appliance tracking
 - **Multi-room support** via ESP32-CAM nodes over MQTT (optional hardware expansion)
 
----https://www.amazon.com/s?k=sd+cards+64gb+high+speed
-
+---
 
 ## Architecture
 
@@ -132,7 +131,7 @@ Key sections:
 | `ollama.system_prompt` | Personality and household context — customize to your setup |
 | `voice.whisper.model_size` | STT accuracy vs. speed (`base` → `large-v3`) |
 | `voice.wake_word.model` | openWakeWord model name |
-| `rooms` | Add `camera_source` or `node_ip` for each room |
+| `rooms` | Per-room `video` / `mic` / `speaker` channels — see `WYZE_SETUP.md` |
 | `interruptibility.activity_scores` | How interruptible each detected activity is |
 | `curiosity.topic_cooldowns_hours` | How often Jarvis can proactively comment on each topic |
 | `process_activity_map` | Map your specific game/app .exe names to activities |

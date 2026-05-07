@@ -65,6 +65,21 @@ fastapi==0.115.0
 uvicorn==0.32.0
 websockets==13.1
 
+# ── Wyze V2 Camera Integration (wz_mini_hacks RTSP) ────────────────────────
+# PyAV demuxes audio from the camera's RTSP stream. OpenCV's VideoCapture only
+# decodes video frames, so we need a separate demuxer for the audio track.
+# av >=12 ships with FFmpeg 6+ wheels for Windows — no system FFmpeg required.
+av>=12.3.0
+# Paramiko drives the Wyze speaker via SSH → SCP → aplay. It's our temporary
+# bridge until we replace the awful built-in speaker with a proper one.
+# Once you upgrade speakers, you may keep paramiko around — useful for any
+# future SSH-based device control.
+paramiko>=3.4.0
+# Pydantic models give us typed, validated config loading. Field validation
+# happens at startup, so a typo in config.yaml fails fast with a clear error
+# instead of crashing 20 minutes into a session with a NoneType error.
+pydantic>=2.8.0
+
 # ── Testing ────────────────────────────────────────────────────────────────
 pytest==8.3.3
 pytest-asyncio==0.24.0

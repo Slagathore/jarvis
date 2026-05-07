@@ -2404,13 +2404,23 @@ class Orchestrator:
 
     def _speaker_sink_for(self, room: str) -> str:
         """
-        Return the configured speaker_sink ("local" | "node") for a room.
-        Defaults to "local" when no entry or no explicit sink is configured.
+        Return the routing key for a room's speaker: "local" or "node".
+        Resolved from the new schema's `room.speaker.type`:
+            usb_device_spk / wyze_ssh_aplay / none → "local"
+                (all run from the orchestrator process — Wyze SSH speaks
+                directly from here without going through the ESP MQTT bus)
+            esp32_i2s_spk → "node"
+                (audio is published over MQTT for the ESP firmware to play)
+        Unknown / missing rooms default to "local".
         """
         for room_cfg in self.config.get("rooms", []):
-            if room_cfg.get("id") == room:
-                sink = str(room_cfg.get("speaker_sink", "local")).lower()
-                return sink if sink in ("local", "node") else "local"
+            if room_cfg.get("id") != room:
+                continue
+            spk_cfg = room_cfg.get("speaker") or {}
+            stype = str(spk_cfg.get("type", "")).lower() if isinstance(spk_cfg, dict) else ""
+            if stype == "esp32_i2s_spk":
+                return "node"
+            return "local"
         return "local"
 
     # ── Continuous-conversation follow-up listener ─────────────────────────

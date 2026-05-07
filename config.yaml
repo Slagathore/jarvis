@@ -79,39 +79,147 @@ mqtt:
     vision: jarvis/vision/{room}/frame
     reminder: jarvis/events/reminder
     state: jarvis/system/state
+# Per-room I/O channels. Each room declares video / mic / speaker
+# independently — pick the driver via the `type:` toggle on each channel,
+# then fill in the driver-specific fields. Adding a new room is one block;
+# upgrading hardware (e.g. swap a Wyze speaker for a USB DAC) is a one-line
+# `type:` change. Schema is validated at boot via core/config.py.
+#
+# Available types:
+#   video.type:    wyze_rtsp | esp32_http | usb_index | none
+#   mic.type:      wyze_rtsp_audio | esp32_i2s_mic | usb_device_mic | none
+#   speaker.type:  wyze_ssh_aplay  | esp32_i2s_spk | usb_device_spk | none
+#
+# fps_active / fps_idle survive from the legacy schema for the ESP32 firmware
+# (NodeManager pushes them to nodes via MQTT). Wyze cams ignore them — RTSP
+# sets its own framerate inside the camera.
 rooms:
 - id: office
   display_name: Office
-  camera_source: 0
-  has_node: false
-  node_ip: null
-  speaker_sink: local
+  video:
+    type: usb_index
+    device_index: 0
+  mic:
+    type: usb_device_mic
+    device_name: default
+    sample_rate_hz: 16000
+    channels: 1
+  speaker:
+    type: usb_device_spk
+    device_name: default
+    sample_rate_hz: 22050
+    channels: 1
   fps_active: 30
   fps_idle: 30
+
 - id: laundry_room
   display_name: Laundry Room
-  camera_source: null
-  has_node: true
-  node_ip: 192.168.1.101
-  speaker_sink: node
+  video:
+    type: esp32_http
+    url: http://192.168.1.101:8081/
+  mic:
+    type: esp32_i2s_mic
+    mqtt_topic: jarvis/nodes/laundry_room/audio/in
+  speaker:
+    type: esp32_i2s_spk
+    mqtt_topic: jarvis/nodes/laundry_room/audio/out
   fps_active: 5
   fps_idle: 1
+
+# ── Wyze V2 cams (wz_mini_hacks) ────────────────────────────────────────────
+# Living Room is the only verified cam at 192.168.1.134. Bedroom and Kitchen
+# IPs are placeholders — UPDATE after flashing each cam's SD card. The RTSP
+# port (8554) and path (/video6_unicast) are wz_mini-build-specific; if a
+# future flash uses a different build, change the URL here, not in code.
+
 - id: bedroom
   display_name: Bedroom
-  camera_source: null
-  has_node: false
-  node_ip: null
-  speaker_sink: local
+  video:
+    type: wyze_rtsp
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.135:8554/video6_unicast  # ← UPDATE IP after flash
+    transport: tcp
+  mic:
+    type: wyze_rtsp_audio
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.135:8554/video6_unicast
+    transport: tcp
+    sample_rate_hz: 16000
+    channels: 1
+  speaker:
+    type: wyze_ssh_aplay
+    host: 192.168.1.135  # ← UPDATE IP after flash
+    ssh_user: ${WYZE_SSH_USER}
+    ssh_password: ${WYZE_SSH_PASSWORD}
+    ssh_key_path: ${WYZE_SSH_KEY_PATH}
+    remote_play_path: /tmp/jarvis_play.wav
+    volume: 60
+    sample_rate_hz: 8000
   fps_active: 5
   fps_idle: 1
+
 - id: kitchen
   display_name: Kitchen
-  camera_source: null
-  has_node: false
-  node_ip: null
-  speaker_sink: local
+  video:
+    type: wyze_rtsp
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.136:8554/video6_unicast  # ← UPDATE IP after flash
+    transport: tcp
+  mic:
+    type: wyze_rtsp_audio
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.136:8554/video6_unicast
+    transport: tcp
+    sample_rate_hz: 16000
+    channels: 1
+  speaker:
+    type: wyze_ssh_aplay
+    host: 192.168.1.136  # ← UPDATE IP after flash
+    ssh_user: ${WYZE_SSH_USER}
+    ssh_password: ${WYZE_SSH_PASSWORD}
+    ssh_key_path: ${WYZE_SSH_KEY_PATH}
+    remote_play_path: /tmp/jarvis_play.wav
+    volume: 60
+    sample_rate_hz: 8000
   fps_active: 5
   fps_idle: 1
+
+- id: living_room
+  display_name: Living Room
+  video:
+    type: wyze_rtsp
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.134:8554/video6_unicast  # verified working
+    transport: tcp
+  mic:
+    type: wyze_rtsp_audio
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.134:8554/video6_unicast
+    transport: tcp
+    sample_rate_hz: 16000
+    channels: 1
+  speaker:
+    type: wyze_ssh_aplay
+    host: 192.168.1.134
+    ssh_user: ${WYZE_SSH_USER}
+    ssh_password: ${WYZE_SSH_PASSWORD}
+    ssh_key_path: ${WYZE_SSH_KEY_PATH}
+    remote_play_path: /tmp/jarvis_play.wav
+    volume: 60
+    sample_rate_hz: 8000
+  fps_active: 5
+  fps_idle: 1
+
+# Driver-level defaults shared across rooms. Anything not set here falls back
+# to the Pydantic model defaults in core/config.py.
+drivers:
+  wyze_rtsp_video:
+    buffer_size: 1               # cv2 buffer depth — 1 = freshest frame
+    drain_stale_frames: 2        # cap.grab() N times before cap.read()
+    reconnect_delay_s: 3.0
+  wyze_rtsp_audio:
+    audio_chunk_ms: 30
+    max_consecutive_errors: 5
+  wyze_ssh_speaker:
+    sftp_chunk_size: 32768
+    aplay_volume: 100
+  esp32_http_video:
+    request_timeout_s: 5.0
+    reconnect_delay_s: 2.0
 context:
   vision_scan_interval_minutes: 1
   pc_poll_interval_seconds: 10

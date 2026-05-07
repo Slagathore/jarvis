@@ -218,11 +218,18 @@ class FaceRecognizer:
             return None
 
         # Largest face wins (closest person to camera most likely)
-        def _area(f: dict) -> int:
+        def _area(f: Any) -> int:
+            if not isinstance(f, dict):
+                return 0
             fa = f.get("facial_area", {}) or {}
+            if not isinstance(fa, dict):
+                return 0
             return int(fa.get("w", 0)) * int(fa.get("h", 0))
 
-        biggest = max(faces, key=_area)
+        face_dicts = [f for f in faces if isinstance(f, dict)]
+        if not face_dicts:
+            return None
+        biggest = max(face_dicts, key=_area)
         if _area(biggest) < 30 * 30:
             # Too small to be a real face; opencv detector false-positives on
             # noise crops sometimes. Skip rather than enroll garbage.
@@ -244,7 +251,10 @@ class FaceRecognizer:
             return None
         if not reps:
             return None
-        emb = np.asarray(reps[0]["embedding"], dtype=np.float32)
+        first = reps[0] if isinstance(reps, list) else reps
+        if not isinstance(first, dict):
+            return None
+        emb = np.asarray(first["embedding"], dtype=np.float32)
         return emb
 
 

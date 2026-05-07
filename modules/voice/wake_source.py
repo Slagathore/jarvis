@@ -53,9 +53,12 @@ class WakeSource(Protocol):
         """The room this source represents (e.g. 'living_room')."""
         ...
 
-    async def stream(self) -> AsyncIterator[np.ndarray]:
+    def stream(self) -> AsyncIterator[np.ndarray]:
         """Yield audio chunks of shape (OWW_CHUNK_SIZE,) dtype int16, ~80ms each.
 
+        Declared non-async on the Protocol because async-generator functions
+        return an AsyncIterator immediately when called — callers use
+        `async for chunk in source.stream():` without an extra await.
         Implementations should make this cancellation-safe — when the
         consumer task is cancelled, the source must release its underlying
         capture (close socket, stop ffmpeg, etc.) and exit cleanly.

@@ -78,7 +78,13 @@ def _setup_logging(log_level: str) -> None:
 
 
 def _load_config(path: Path) -> dict:
-    """Load and return the YAML config. Raises on missing file or parse error."""
+    """Load and return the YAML config. Raises on missing file or parse error.
+
+    Performs ${VAR} env-var interpolation (so RTSP URLs like
+    rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@... resolve at boot) and
+    runs the typed Pydantic validation on the rooms[] block. Validation
+    failures raise ConfigError with a pointer to the offending room/field.
+    """
     if not path.exists():
         raise FileNotFoundError(
             f"config.yaml not found at {path}. "
@@ -96,6 +102,16 @@ def _load_config(path: Path) -> dict:
         config["mqtt"]["username"] = os.getenv("MQTT_USERNAME")
     if os.getenv("MQTT_PASSWORD"):
         config["mqtt"]["password"] = os.getenv("MQTT_PASSWORD")
+
+    # Env-var interpolation + typed-room validation. Imported here (not at
+    # top of file) so the config module can use loguru without bootstrapping
+    # the logger first.
+    from core.config import expand_and_validate
+    config, typed_rooms = expand_and_validate(config)
+    # Stash the typed rooms under a private key so managers that want
+    # autocomplete + Literal exhaustiveness can reach them without re-parsing.
+    # Existing modules that read room dicts via config["rooms"] keep working.
+    config["_typed_rooms"] = typed_rooms
 
     return config
 

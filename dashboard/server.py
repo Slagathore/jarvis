@@ -1091,6 +1091,63 @@ class DashboardServer:
                 headers={"Cache-Control": "no-store"},
             )
 
+        @app.get("/stream/{room}")
+        async def camera_mjpeg_stream(room: str):
+            """Multipart MJPEG stream — efficient live view that the browser
+            consumes as <img src="/stream/bedroom">. Holds the connection
+            open and pushes one JPEG per frame instead of the snapshot
+            endpoint's poll-per-frame round trip. Useful for the dashboard's
+            full-room view.
+
+            Capped at ~5 fps on the server side because the JPEG encoder is
+            the bottleneck for cv2.imencode on large RTSP frames; bump if
+            that turns out to be CPU-cheap on Cole's GPU box.
+            """
+            from fastapi.responses import StreamingResponse
+            if not _CV2_AVAILABLE or cv2 is None:
+                raise HTTPException(status_code=503, detail="OpenCV not available")
+            cm = self._camera_manager
+            if cm is None:
+                raise HTTPException(status_code=503, detail="Camera manager not registered")
+            if room not in cm.get_available_rooms():
+                raise HTTPException(status_code=404, detail=f"No camera for '{room}'")
+
+            stream_fps_cap = 5.0
+            frame_interval = 1.0 / stream_fps_cap
+
+            async def gen():
+                # Re-narrow inside the closure — Pylance doesn't carry the
+                # outer `if cv2 is None` check through a generator boundary.
+                assert cv2 is not None
+                while True:
+                    frame = await cm.capture_frame_async(room)
+                    if frame is None:
+                        # Don't tear the stream down on a transient miss —
+                        # Wyze RTSP burps occasionally and recovers.
+                        await asyncio.sleep(0.5)
+                        continue
+                    ok, buf = cv2.imencode(
+                        ".jpg",
+                        frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, self._camera_jpeg_quality],
+                    )
+                    if not ok:
+                        await asyncio.sleep(frame_interval)
+                        continue
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n"
+                        + buf.tobytes()
+                        + b"\r\n"
+                    )
+                    await asyncio.sleep(frame_interval)
+
+            return StreamingResponse(
+                gen(),
+                media_type="multipart/x-mixed-replace; boundary=frame",
+                headers={"Cache-Control": "no-store"},
+            )
+
     async def broadcast(self, event: dict):
         """
         Push an event to all connected browser clients.

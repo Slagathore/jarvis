@@ -434,6 +434,9 @@ class ModelRegistry:
             name = m.get("model") if isinstance(m, dict) else getattr(m, "model", "")
             if not name:
                 name = m.get("name") if isinstance(m, dict) else getattr(m, "name", "")
+            if not name:
+                continue
+            name = str(name)
             size = m.get("size") if isinstance(m, dict) else getattr(m, "size", None)
             modified = (
                 m.get("modified_at") if isinstance(m, dict) else getattr(m, "modified_at", None)

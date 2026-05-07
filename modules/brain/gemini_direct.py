@@ -155,6 +155,7 @@ class GeminiDirectClient:
         Ollama path — see orchestrator._build_tool_dispatcher.
         """
         running_messages = list(messages)
+        text = ""
         for iteration in range(max_iterations):
             result = await self._generate(running_messages, model, tools=tools)
             text = result.get("text", "")
@@ -261,7 +262,7 @@ class GeminiDirectClient:
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPStatusError as e:
-            logger.warning(f"[Gemini] generate {resp.status_code}: {resp.text[:300]}")
+            logger.warning(f"[Gemini] generate {e.response.status_code}: {e.response.text[:300]}")
             return {"text": "", "function_calls": []}
         except Exception as e:
             logger.warning(f"[Gemini] generate failed: {e}")
