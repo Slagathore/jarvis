@@ -1935,8 +1935,12 @@ async function openModelTuneModal(name) {
 
         <div class="model-tune-row">
           <label class="model-tune-think">
-            <input type="checkbox" id="t-thinking_enabled" />
-            Thinking enabled (CoT mode for qwen3.x / deepseek-r1)
+            Thinking
+            <select id="t-thinking_enabled" class="dev-select" title="Use default = let the model decide (no think kwarg sent). On/Off = force the value, useful when a model's default trips an API constraint (e.g. Gemini 3 thinking requires thought_signature handling Ollama-cloud doesn't preserve).">
+              <option value="">Use model default (recommended)</option>
+              <option value="true">On — force thinking</option>
+              <option value="false">Off — force no thinking</option>
+            </select>
           </label>
         </div>
 
@@ -1967,7 +1971,14 @@ async function openModelTuneModal(name) {
         if (el && sel[k] !== undefined) el.value = sel[k];
       });
       const t = document.getElementById("t-thinking_enabled");
-      if (t) t.checked = !!sel.thinking_enabled;
+      if (t) {
+        // Presets explicitly set thinking on or off — they're not for
+        // "model default" cases (those wouldn't need a preset). So
+        // missing thinking_enabled in the preset → leave the dropdown
+        // alone; explicit boolean → set it.
+        if (sel.thinking_enabled === true) t.value = "true";
+        else if (sel.thinking_enabled === false) t.value = "false";
+      }
     });
   }
 
@@ -1978,7 +1989,16 @@ async function openModelTuneModal(name) {
     if (el) el.value = (s[k] !== null && s[k] !== undefined) ? s[k] : "";
   });
   const t = document.getElementById("t-thinking_enabled");
-  if (t) t.checked = (s.thinking_enabled === undefined || s.thinking_enabled === null) ? true : !!s.thinking_enabled;
+  if (t) {
+    // Tri-state hydration. None/undefined → "Use default" (no override
+    // sent — model decides). True/False → force the value. The previous
+    // version coerced None to True, which silently wrote thinking=on to
+    // every model the user opened the modal for. That tripped Gemini 3's
+    // thought_signature requirement on Ollama-cloud and broke chat.
+    if (s.thinking_enabled === true) t.value = "true";
+    else if (s.thinking_enabled === false) t.value = "false";
+    else t.value = "";
+  }
   const presetSel = document.getElementById("model-tune-preset");
   if (presetSel) presetSel.value = s.preset || "";
 
@@ -1990,7 +2010,13 @@ async function openModelTuneModal(name) {
       const v = document.getElementById(`t-${k}`).value;
       body[k] = (v === "" ? null : (k === "top_k" ? parseInt(v, 10) : parseFloat(v)));
     });
-    body.thinking_enabled = document.getElementById("t-thinking_enabled").checked;
+    // Tri-state save: "" → null (no override), "true" → true, "false" → false.
+    // Backend's _build_options_and_think skips the kwarg entirely when null,
+    // so the model uses its own default behavior.
+    {
+      const tv = document.getElementById("t-thinking_enabled").value;
+      body.thinking_enabled = (tv === "true" ? true : (tv === "false" ? false : null));
+    }
     fetch(`/api/models/${encodeURIComponent(name)}/settings`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

@@ -113,6 +113,10 @@ class CameraManager:
         self._fail_counts: dict[str, int] = {}
         self._reopen_threshold: int = 3
         self._read_locks: dict[str, asyncio.Lock] = {}
+        # Throttled-retry timestamps for RTSP self-reconnect. When a cap
+        # is None (cam rebooted, transient drop), don't hammer the cam
+        # — wait at least _wyze_reconnect_delay between attempts.
+        self._next_reopen_attempt: dict[str, float] = {}
         # Pull tunables from config.drivers; fall back to sensible defaults.
         # The drain count is the magic Wyze touch — the camera sends a
         # buffered backlog when you connect, and we want the freshest frame.
@@ -586,6 +590,12 @@ class CameraManager:
         """
         cap = self._caps.get(room)
         if cap is None:
+            # Connection lost — cam rebooted, network blip, or a previous
+            # reopen attempt failed (we previously stranded the room with
+            # no path back short of a Jarvis restart). Try a throttled
+            # reconnect; the next read attempt will use the new cap if it
+            # came up. Returns None for THIS read either way.
+            self._try_reopen_rtsp_throttled(room)
             return None
         try:
             for _ in range(self._wyze_drain):
@@ -634,9 +644,27 @@ class CameraManager:
             logger.warning(f"[CameraManager] USB reopen error for '{room}': {e}")
 
     def _reopen_rtsp(self, room: str) -> None:
-        """Close and reopen a Wyze RTSP cv2.VideoCapture. Sleeps the
-        configured reconnect_delay first — hammering wz_mini_hacks while it's
-        already in trouble (cam rebooting, WiFi blip) just makes it worse.
+        """Close any existing cap then attempt a fresh open. Called from
+        _read_cap_rtsp when a still-open cap accumulates _reopen_threshold
+        read failures (slow death, packet loss, cam degrading). Drops the
+        old cap explicitly because the FFmpeg context is in a bad state
+        and reusing it just produces more bad frames.
+        """
+        old = self._caps.pop(room, None)
+        if old is not None:
+            self._safe_release(old)
+        self._try_reopen_rtsp_throttled(room, force=True)
+
+    def _try_reopen_rtsp_throttled(self, room: str, force: bool = False) -> None:
+        """Attempt to (re)connect a Wyze RTSP stream, throttled by
+        _wyze_reconnect_delay so we don't hammer the cam during a reboot
+        or network outage. force=True bypasses the throttle for the
+        slow-death reopen path where we already burned _reopen_threshold
+        failed reads (the throttle window has effectively elapsed).
+
+        Runs synchronously — callers (_read_cap_rtsp) are already inside
+        asyncio.to_thread, and the throttle is the wait, not a sleep.
+        Returns nothing; the next read will see the new cap if successful.
         """
         if not _HAS_CV2:
             return
@@ -644,27 +672,31 @@ class CameraManager:
         source = self._sources.get(room)
         if source is None or not isinstance(source, str):
             return
-        old = self._caps.pop(room, None)
-        if old is not None:
-            self._safe_release(old)
-        # Sync sleep — we're already inside a thread (called from
-        # _read_cap_rtsp via asyncio.to_thread). Don't add asyncio overhead.
         import time as _time
-        _time.sleep(self._wyze_reconnect_delay)
+        now = _time.monotonic()
+        if not force:
+            next_ok = self._next_reopen_attempt.get(room, 0.0)
+            if now < next_ok:
+                return  # still throttled; quietly skip this attempt
+        # Set throttle BEFORE the attempt so a slow / hung VideoCapture
+        # constructor can't get retried in parallel.
+        self._next_reopen_attempt[room] = now + self._wyze_reconnect_delay
+
         try:
             cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, self._wyze_buffer_size)
                 self._caps[room] = cap
                 self._fail_counts[room] = 0
-                logger.info(f"[CameraManager] Reopened RTSP '{room}'")
+                logger.info(f"[CameraManager] RTSP reconnected '{room}'")
             else:
                 self._safe_release(cap)
-                logger.warning(
-                    f"[CameraManager] RTSP reopen failed for '{room}' — will retry"
+                logger.debug(
+                    f"[CameraManager] RTSP reconnect '{room}' not yet ready "
+                    f"(retry in {self._wyze_reconnect_delay:.0f}s)"
                 )
         except Exception as e:
-            logger.warning(f"[CameraManager] RTSP reopen error for '{room}': {e}")
+            logger.debug(f"[CameraManager] RTSP reconnect error for '{room}': {e}")
 
     @staticmethod
     def _safe_release(cap: Any) -> None:

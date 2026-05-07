@@ -3341,8 +3341,27 @@ class Orchestrator:
         # ping, and we don't want a stray fan-noise blip to spawn a wake.
         await self._speak(startup_line, priority="ambient", expects_response=False)
 
+        # Wrap each top-level task so exceptions get logged the moment
+        # they happen instead of disappearing into the gather's result list.
+        # Without this, a task that crashes at startup (e.g. uvicorn config
+        # rejecting an unknown kwarg) is silently absorbed by
+        # return_exceptions=True and we don't notice until shutdown.
+        async def _logged(name: str, coro):
+            try:
+                return await coro
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception as e:
+                logger.exception(f"[Orchestrator] task '{name}' crashed: {e}")
+                raise
+
+        labeled_tasks = []
+        for c in tasks:
+            label = getattr(getattr(c, "cr_code", None), "co_qualname", None) or repr(c)
+            labeled_tasks.append(_logged(label, c))
+
         # Run forever — cancel all tasks cleanly on exit
-        gather = asyncio.gather(*tasks, return_exceptions=True)
+        gather = asyncio.gather(*labeled_tasks, return_exceptions=True)
         try:
             await gather
         except (KeyboardInterrupt, asyncio.CancelledError):

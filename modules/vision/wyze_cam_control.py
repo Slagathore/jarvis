@@ -54,7 +54,10 @@ WYZE_PARAMS: dict[str, dict[str, Any]] = {
         "label": "Night Vision",
         "valid": (1, 2, 3),
         "labels": {1: "On", 2: "Off", 3: "Auto"},
-        "reboot_required": False,  # iCamera daemon picks this up live
+        # iCamera reads /configs/.parameters at boot, not live — verified
+        # 2026-05-06: writing nightVision=2 while running persists to disk
+        # but the IR cut filter doesn't actually flip until reboot.
+        "reboot_required": True,
     },
     "night_cut_thr": {
         "label": "Auto threshold",
@@ -78,6 +81,9 @@ WYZE_PARAMS: dict[str, dict[str, Any]] = {
         "label": "Front status LED",
         "valid": (1, 2),
         "labels": {1: "On", 2: "Off"},
+        # Confirmed live-apply: setting indicator=2 visibly turned the
+        # front status LED off within ~1s. Wyze handles LED state via a
+        # different (faster) path than the IR / night-vision settings.
         "reboot_required": False,
     },
 }

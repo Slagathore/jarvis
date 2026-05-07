@@ -9,7 +9,7 @@ system:
 ollama:
   model: gemini-3-flash-preview:cloud
   vision_model: gemini-3-flash-preview:cloud
-  action_model: qwen3.5:4b
+  action_model: gemini-3-flash-preview:cloud
   base_url: http://localhost:11434
   timeout_seconds: 30
   system_prompt: "You are Jarvis, an ambient home AI assistant.\nYou live in the house\

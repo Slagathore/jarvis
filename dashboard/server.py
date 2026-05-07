@@ -240,15 +240,33 @@ class DashboardServer:
     def _setup_routes(self):
         app = self.app
 
-        # Serve static files
+        # Serve static files. Subclass StaticFiles so every response gets
+        # `Cache-Control: no-store` — without this, Chrome aggressively
+        # caches app.js / style.css and a hot-reloaded dashboard shows
+        # stale UI until the user manually hard-refreshes (Ctrl+F5).
+        # We're a single-user dev tool, not a CDN; bandwidth from
+        # re-fetching ~50KB of static is irrelevant compared to "the
+        # new feature I just shipped doesn't appear" frustration.
+        class NoCacheStatic(StaticFiles):
+            async def get_response(self, path, scope):
+                resp = await super().get_response(path, scope)
+                resp.headers["Cache-Control"] = "no-store, max-age=0"
+                return resp
+
         if STATIC_DIR.exists():
-            app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+            app.mount("/static", NoCacheStatic(directory=str(STATIC_DIR)), name="static")
 
         @app.get("/", response_class=HTMLResponse)
         async def index():
             html_path = STATIC_DIR / "index.html"
             if html_path.exists():
-                return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+                # Same no-cache treatment for the HTML shell — otherwise
+                # an updated index.html (new <script> tags, new section
+                # markup) won't show up either.
+                return HTMLResponse(
+                    content=html_path.read_text(encoding="utf-8"),
+                    headers={"Cache-Control": "no-store, max-age=0"},
+                )
             return HTMLResponse(content="<h1>Dashboard loading...</h1>")
 
         @app.websocket("/ws")
@@ -856,23 +874,26 @@ class DashboardServer:
             unconditionally safe for any commit Cole authored."""
             import asyncio as _asyncio, os as _os
             await self.broadcast({"type": "system.restarting"})
-            async def _exit():
-                await _asyncio.sleep(0.5)
-                logger.warning("[System] Restart requested via dashboard — exiting 43 (plain relaunch)")
-                _os._exit(43)
-            _asyncio.create_task(_exit())
+            # call_later schedules a callback on the loop's timer; unlike
+            # create_task() the result isn't a Task object that uvicorn's
+            # graceful-shutdown can cancel. So even if uvicorn starts
+            # tearing down right after the response goes out, this still
+            # fires and os._exit takes the whole process with it.
+            loop = _asyncio.get_event_loop()
+            loop.call_later(0.5, lambda: (logger.warning("[System] Restart — exit 43"), _os._exit(43)))
             return JSONResponse({"ok": True, "action": "restart"})
 
         @app.post("/api/system/shutdown")
         async def system_shutdown():
-            """Clean exit — supervisor will stop the loop on a non-42 exit."""
+            """Clean exit — supervisor will stop the loop on a non-42 exit.
+            Uses loop.call_later for the same reason restart does — the
+            create_task pattern was racy with uvicorn shutdown and would
+            sometimes only kill the dashboard.
+            """
             import asyncio as _asyncio, os as _os
             await self.broadcast({"type": "system.shutting_down"})
-            async def _exit():
-                await _asyncio.sleep(0.5)
-                logger.warning("[System] Shutdown requested via dashboard — exiting 0")
-                _os._exit(0)
-            _asyncio.create_task(_exit())
+            loop = _asyncio.get_event_loop()
+            loop.call_later(0.5, lambda: (logger.warning("[System] Shutdown — exit 0"), _os._exit(0)))
             return JSONResponse({"ok": True, "action": "shutdown"})
 
         # ── Self-edit (kill switch + pending review + revert) ───────────────
@@ -1543,7 +1564,19 @@ class DashboardServer:
                 self._state["rooms"][room]["audio_db"] = event.get("db")
 
     async def run(self):
-        """Start the dashboard server. Run as a background asyncio task."""
+        """Start the dashboard server. Run as a background asyncio task.
+
+        Disabling uvicorn's signal handlers is critical: by default it
+        intercepts SIGINT/SIGTERM and gracefully shuts itself down. When
+        the dashboard is one of many tasks inside the orchestrator,
+        Ctrl+C ends up only killing uvicorn — the rest of the orchestrator
+        keeps running. Letting the orchestrator's own KeyboardInterrupt
+        handling do the right thing for the whole process is what we want.
+
+        uvicorn 0.30+ exposes `install_signal_handlers` as a Server method
+        to override; older versions accepted it as a Config kwarg. Override
+        the method directly so we don't have to version-sniff.
+        """
         import uvicorn
         config = uvicorn.Config(
             self.app,
@@ -1553,5 +1586,8 @@ class DashboardServer:
             access_log=False,
         )
         server = uvicorn.Server(config)
+        # No-op the method uvicorn calls inside serve() to set up its own
+        # SIGINT/SIGTERM hooks. Lambda discards self, accepts no args.
+        server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
         logger.info(f"[Dashboard] Running at http://{self.host}:{self.port}")
         await server.serve()
