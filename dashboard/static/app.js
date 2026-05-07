@@ -331,12 +331,22 @@ function updateRooms(rooms) {
       : "";
 
     card.innerHTML = `
-      <div class="room-name">${roomId.replace(/_/g, " ").toUpperCase()}</div>
+      <div class="room-card-header">
+        <div class="room-name">${roomId.replace(/_/g, " ").toUpperCase()}</div>
+        <button class="room-cog" data-room="${roomId}" title="Camera + audio settings for this room">⚙</button>
+      </div>
       ${feedTag}
       <div class="room-status">${data.person_present ? "● Person detected" : "○ Empty"}</div>
       <div class="room-meta">${escapeHtml(data.description || "No camera data yet")}</div>
       ${lightLabel}
     `;
+    const cogBtn = card.querySelector(".room-cog");
+    if (cogBtn) {
+      cogBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openRoomSettingsModal(roomId);
+      });
+    }
     grid.appendChild(card);
   });
 
@@ -1759,6 +1769,10 @@ function renderModels() {
       `<option value="${escapeHtml(c.name)}">${escapeHtml(c.notes || "")}</option>`
     ).join("");
   }
+
+  // Reflect the active selection in the inline cogs — has to happen here
+  // (after the selects are populated) AND on every change handler call.
+  if (typeof _syncInlineTuneButtons === "function") _syncInlineTuneButtons();
 }
 
 function setActiveModel(kind, name) {
@@ -1774,9 +1788,39 @@ const chatSelEl = document.getElementById("model-chat-select");
 const visSelEl = document.getElementById("model-vision-select");
 const actSelEl = document.getElementById("model-action-select");
 const pullBtnEl = document.getElementById("model-pull-btn");
-if (chatSelEl) chatSelEl.addEventListener("change", (e) => setActiveModel("chat", e.target.value));
-if (visSelEl) visSelEl.addEventListener("change", (e) => setActiveModel("vision", e.target.value));
-if (actSelEl) actSelEl.addEventListener("change", (e) => setActiveModel("action", e.target.value));
+if (chatSelEl) chatSelEl.addEventListener("change", (e) => { setActiveModel("chat", e.target.value); _syncInlineTuneButtons(); });
+if (visSelEl) visSelEl.addEventListener("change", (e) => { setActiveModel("vision", e.target.value); _syncInlineTuneButtons(); });
+if (actSelEl) actSelEl.addEventListener("change", (e) => { setActiveModel("action", e.target.value); _syncInlineTuneButtons(); });
+
+// Inline tune cogs sit next to the CHAT/VISION/ACTION dropdowns. Show
+// only when the dropdown has a non-empty selection — there's no model
+// to tune when ACTION is "— disabled —" or a select is still loading.
+// Each cog reuses the same openModelTuneModal() the per-row gear in the
+// installed-list uses, so behavior is identical.
+function _syncInlineTuneButtons() {
+  const map = [
+    ["model-chat-select",   "model-chat-tune"],
+    ["model-vision-select", "model-vision-tune"],
+    ["model-action-select", "model-action-tune"],
+  ];
+  map.forEach(([selId, btnId]) => {
+    const sel = document.getElementById(selId);
+    const btn = document.getElementById(btnId);
+    if (!sel || !btn) return;
+    const hasModel = !!(sel.value && sel.value.trim());
+    btn.hidden = !hasModel;
+    if (hasModel) btn.dataset.modelName = sel.value;
+  });
+}
+["model-chat-tune", "model-vision-tune", "model-action-tune"].forEach((btnId) => {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  btn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const name = btn.dataset.modelName;
+    if (name) openModelTuneModal(name);
+  });
+});
 if (pullBtnEl) pullBtnEl.addEventListener("click", () => {
   const inp = document.getElementById("model-pull-name");
   const name = (inp && inp.value || "").trim();
@@ -1960,6 +2004,388 @@ async function openModelTuneModal(name) {
   };
 
   modal.classList.add("open");
+}
+
+// ── PER-FEED ROOM SETTINGS MODAL (rotate / flip / volume / TTS / talkback) ──
+//
+// Single modal reused across all rooms. Mirrors the model-tune modal's
+// layout (same .person-modal scaffold) so the dashboard feels cohesive.
+// State is pulled live from /api/room/{room}/settings on open and pushed
+// back via /api/room/{room}/settings on every slider change (debounced
+// for smoothness without spamming the backend).
+
+let _roomSettingsDebounce = 0;
+
+async function openRoomSettingsModal(room) {
+  // Pull current settings + speaker/mic capability info in parallel.
+  const [settingsResp, micStatus] = await Promise.all([
+    fetch(`/api/room/${encodeURIComponent(room)}/settings`).then((r) => r.json()).catch(() => ({ settings: {} })),
+    fetch(`/api/mic/${encodeURIComponent(room)}/status`).then((r) => r.json()).catch(() => ({})),
+  ]);
+  const s = settingsResp.settings || {};
+  const hasSpeaker = !!micStatus.has_speaker;
+  const speakerType = String(micStatus.speaker_type || "none");
+  // Volume slider only meaningful for Wyze (audioplay_t20 takes 0-100).
+  // USB / ESP / null sinks ignore the override; hide the slider in those
+  // cases to avoid suggesting it does something it doesn't.
+  const volumeSupported = (speakerType === "wyze_ssh_aplay");
+
+  let modal = document.getElementById("room-settings-modal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "room-settings-modal";
+    modal.className = "person-modal";
+    modal.innerHTML = `
+      <div class="person-modal-backdrop"></div>
+      <div class="person-modal-body">
+        <div class="person-modal-header">
+          <div class="person-modal-title">
+            <div class="model-tune-name" id="room-settings-name"></div>
+            <div class="person-modal-meta" id="room-settings-meta"></div>
+          </div>
+          <button class="person-modal-close" id="room-settings-close">×</button>
+        </div>
+
+        <div class="room-settings-section">
+          <div class="room-settings-section-title">CAMERA</div>
+          <div class="room-settings-row">
+            <label>Rotation</label>
+            <select id="rs-rotation">
+              <option value="0">0°</option>
+              <option value="90">90° CW</option>
+              <option value="180">180°</option>
+              <option value="270">270° (90° CCW)</option>
+            </select>
+          </div>
+          <div class="room-settings-row">
+            <label><input type="checkbox" id="rs-flip_h" /> Flip horizontally (mirror)</label>
+            <label><input type="checkbox" id="rs-flip_v" /> Flip vertically</label>
+          </div>
+          <div class="room-settings-row">
+            <label>Brightness <input type="range" id="rs-brightness" min="0.5" max="1.5" step="0.05" /></label>
+            <span class="room-settings-val" id="rs-brightness-val"></span>
+          </div>
+          <div class="room-settings-row">
+            <label>Contrast <input type="range" id="rs-contrast" min="0.5" max="1.5" step="0.05" /></label>
+            <span class="room-settings-val" id="rs-contrast-val"></span>
+          </div>
+          <div class="room-settings-row">
+            <button class="dev-btn" id="rs-snapshot">DOWNLOAD SNAPSHOT</button>
+          </div>
+        </div>
+
+        <div class="room-settings-section" id="rs-speaker-section">
+          <div class="room-settings-section-title">SPEAKER</div>
+          <div class="room-settings-row" id="rs-volume-row">
+            <label>Volume <input type="range" id="rs-volume" min="0" max="100" step="1" /></label>
+            <span class="room-settings-val" id="rs-volume-val"></span>
+          </div>
+          <div class="room-settings-row">
+            <label><input type="checkbox" id="rs-muted" /> Muted (drop all TTS in this room)</label>
+          </div>
+          <div class="room-settings-row">
+            <input type="text" id="rs-speak-text" class="reminder-input" placeholder="Type something to speak in this room…" />
+            <button class="dev-btn" id="rs-speak-btn">SPEAK</button>
+          </div>
+          <div class="room-settings-row">
+            <button class="dev-btn" id="rs-talkback-btn" title="Hold to push your mic into this room's speaker">🎤 TALKBACK (HOLD)</button>
+            <span class="room-settings-val" id="rs-talkback-status"></span>
+          </div>
+        </div>
+
+        <div class="room-settings-section" id="rs-wyze-section" hidden>
+          <div class="room-settings-section-title">WYZE CAMERA</div>
+          <div id="rs-wyze-fields"></div>
+          <div class="room-settings-row">
+            <button class="dev-btn" id="rs-wyze-reboot" title="Reboot the cam — needed for some settings to take effect (~30s downtime)">REBOOT CAM</button>
+            <span class="room-settings-val" id="rs-wyze-status"></span>
+          </div>
+        </div>
+
+        <div class="room-settings-section">
+          <div class="room-settings-actions">
+            <button class="dev-btn" id="rs-reset" title="Wipe all tweaks; revert to config.yaml defaults">RESET ALL</button>
+          </div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+    modal.querySelector(".person-modal-backdrop").addEventListener("click", () => modal.classList.remove("open"));
+    document.getElementById("room-settings-close").addEventListener("click", () => modal.classList.remove("open"));
+  }
+
+  // Header label
+  document.getElementById("room-settings-name").textContent =
+    `${room.replace(/_/g, " ").toUpperCase()} — settings`;
+  document.getElementById("room-settings-meta").textContent =
+    `Speaker: ${speakerType}` + (volumeSupported ? "" : "  (volume slider disabled — driver doesn't take a volume arg)");
+
+  // Hide the speaker section entirely if there's no speaker
+  const spkSection = document.getElementById("rs-speaker-section");
+  if (spkSection) spkSection.hidden = !hasSpeaker;
+  const volRow = document.getElementById("rs-volume-row");
+  if (volRow) volRow.hidden = !volumeSupported;
+
+  modal.dataset.room = room;
+
+  // Hydrate form from current settings
+  document.getElementById("rs-rotation").value = String(s.rotation ?? 0);
+  document.getElementById("rs-flip_h").checked = !!s.flip_h;
+  document.getElementById("rs-flip_v").checked = !!s.flip_v;
+  const setSlider = (id, v, def) => {
+    const el = document.getElementById(id);
+    const valEl = document.getElementById(`${id}-val`);
+    el.value = String(v ?? def);
+    if (valEl) valEl.textContent = el.value;
+  };
+  setSlider("rs-brightness", s.brightness, 1.0);
+  setSlider("rs-contrast", s.contrast, 1.0);
+  setSlider("rs-volume", s.volume, 60);
+  document.getElementById("rs-muted").checked = !!s.muted;
+
+  // Wire change handlers (idempotent — overwriting onchange replaces prior closures)
+  const debouncedSave = (patch) => {
+    clearTimeout(_roomSettingsDebounce);
+    _roomSettingsDebounce = setTimeout(() => {
+      fetch(`/api/room/${encodeURIComponent(room)}/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      }).catch(() => {});
+    }, 150);
+  };
+  document.getElementById("rs-rotation").onchange = (e) => debouncedSave({ rotation: parseInt(e.target.value, 10) });
+  document.getElementById("rs-flip_h").onchange = (e) => debouncedSave({ flip_h: e.target.checked });
+  document.getElementById("rs-flip_v").onchange = (e) => debouncedSave({ flip_v: e.target.checked });
+  ["rs-brightness", "rs-contrast", "rs-volume"].forEach((id) => {
+    const el = document.getElementById(id);
+    el.oninput = () => {
+      const valEl = document.getElementById(`${id}-val`);
+      if (valEl) valEl.textContent = el.value;
+      const key = id.slice(3); // "rs-foo" → "foo"
+      const isInt = (key === "volume");
+      debouncedSave({ [key]: isInt ? parseInt(el.value, 10) : parseFloat(el.value) });
+    };
+  });
+  document.getElementById("rs-muted").onchange = (e) => debouncedSave({ muted: e.target.checked });
+
+  // Snapshot download — open the snapshot URL with a timestamp so the
+  // browser doesn't serve a cached frame; the download attribute hints
+  // a filename to the save dialog.
+  document.getElementById("rs-snapshot").onclick = () => {
+    const a = document.createElement("a");
+    a.href = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?t=${Date.now()}`;
+    a.download = `${room}_snapshot_${Date.now()}.jpg`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
+  // TTS speak
+  document.getElementById("rs-speak-btn").onclick = () => {
+    const text = (document.getElementById("rs-speak-text").value || "").trim();
+    if (!text) return;
+    fetch(`/api/room/${encodeURIComponent(room)}/speak`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    }).catch(() => {});
+    document.getElementById("rs-speak-text").value = "";
+  };
+
+  // Talkback — hold-to-talk pattern. getUserMedia + AudioContext capture
+  // → resample to 16kHz int16 → POST raw bytes to /api/room/{room}/play_pcm.
+  // Hold semantic is friendlier than press-toggle for a one-off "tell the
+  // dog to get off the couch" use case.
+  _wireTalkback(room);
+
+  // Reset all tweaks
+  document.getElementById("rs-reset").onclick = () => {
+    if (!confirm(`Wipe all runtime tweaks for '${room}'?`)) return;
+    fetch(`/api/room/${encodeURIComponent(room)}/settings`, { method: "DELETE" })
+      .then(() => modal.classList.remove("open"));
+  };
+
+  // WYZE CAMERA section — only renders for rooms with a wyze cam wired
+  // up (orchestrator's wyze_cam_controls dict). Hidden otherwise.
+  await _renderWyzeSection(room);
+
+  modal.classList.add("open");
+}
+
+// Renders the WYZE CAMERA section (night vision, IR LEDs, status LED, reboot).
+// Pulls live values from /api/wyze/{room}/cam — if 404, the section stays hidden
+// (room isn't a Wyze cam, so the controls would be meaningless).
+async function _renderWyzeSection(room) {
+  const section = document.getElementById("rs-wyze-section");
+  const fieldsEl = document.getElementById("rs-wyze-fields");
+  const statusEl = document.getElementById("rs-wyze-status");
+  if (!section || !fieldsEl) return;
+
+  let resp;
+  try {
+    resp = await fetch(`/api/wyze/${encodeURIComponent(room)}/cam`);
+  } catch (_) {
+    section.hidden = true;
+    return;
+  }
+  if (resp.status === 404) {
+    section.hidden = true;  // not a Wyze cam
+    return;
+  }
+  if (!resp.ok) {
+    section.hidden = false;
+    fieldsEl.innerHTML = `<div class="room-settings-row">cam unreachable (HTTP ${resp.status})</div>`;
+    return;
+  }
+  const data = await resp.json();
+  const values = data.values || {};
+  const spec = data.spec || {};
+
+  section.hidden = false;
+  // Build a row per known param. Each row has a label + a select. The
+  // <option value=""> represents "default" (key not present in
+  // /configs/.parameters); selecting it doesn't write anything (no
+  // "remove key from file" API yet).
+  const rowsHtml = Object.keys(spec).map((key) => {
+    const s = spec[key];
+    const cur = values[key];
+    const opts = [`<option value="">default</option>`].concat(
+      s.options.map((o) =>
+        `<option value="${o.value}" ${cur == o.value ? "selected" : ""}>${escapeHtml(o.label)}</option>`
+      )
+    ).join("");
+    const rebootHint = s.reboot_required ? `<span class="room-settings-val" title="needs reboot to apply">⟳</span>` : "";
+    return `
+      <div class="room-settings-row">
+        <label>${escapeHtml(s.label)} ${rebootHint}</label>
+        <select data-wyze-key="${escapeHtml(key)}">${opts}</select>
+      </div>`;
+  }).join("");
+  fieldsEl.innerHTML = rowsHtml;
+
+  // Wire each select to POST on change. A single key per change so we
+  // can show per-key success/failure cleanly in the status line.
+  fieldsEl.querySelectorAll("select[data-wyze-key]").forEach((sel) => {
+    sel.onchange = async (ev) => {
+      const key = sel.dataset.wyzeKey;
+      const v = ev.target.value;
+      if (v === "") return;  // "default" — no-op; we don't remove keys
+      statusEl.textContent = `setting ${key}…`;
+      const r = await fetch(`/api/wyze/${encodeURIComponent(room)}/cam`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [key]: parseInt(v, 10) }),
+      });
+      const j = await r.json().catch(() => ({}));
+      const ok = j.results && j.results[key];
+      statusEl.textContent = ok
+        ? `✓ ${key}=${v}` + (spec[key].reboot_required ? " (reboot to apply)" : "")
+        : `✗ ${key} failed`;
+    };
+  });
+
+  // REBOOT CAM
+  const rebootBtn = document.getElementById("rs-wyze-reboot");
+  if (rebootBtn) {
+    rebootBtn.onclick = async () => {
+      if (!confirm(`Reboot the ${room} cam? Stream will drop for ~30s.`)) return;
+      statusEl.textContent = "rebooting…";
+      const r = await fetch(`/api/wyze/${encodeURIComponent(room)}/reboot`, { method: "POST" });
+      statusEl.textContent = r.ok ? "✓ rebooting (cam back in ~30s)" : `✗ reboot failed (${r.status})`;
+    };
+  }
+}
+
+// Talkback recorder. Captures via getUserMedia + an AudioWorklet (or
+// ScriptProcessor fallback for older browsers — we use the simpler
+// MediaRecorder + decode-on-server path because Wyze speakers truncate
+// hard at 8kHz anyway, so quality isn't the bottleneck).
+function _wireTalkback(room) {
+  const btn = document.getElementById("rs-talkback-btn");
+  const status = document.getElementById("rs-talkback-status");
+  if (!btn) return;
+  let mediaStream = null;
+  let audioCtx = null;
+  let processor = null;
+  let source = null;
+  const targetRate = 16000;
+  const chunks = [];
+
+  const start = async () => {
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      status.textContent = "mic permission denied";
+      return;
+    }
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    source = audioCtx.createMediaStreamSource(mediaStream);
+    // ScriptProcessor is deprecated but still ubiquitously supported.
+    // Buffer 4096 = ~85ms at 48kHz capture; small enough for low latency,
+    // big enough to avoid GC pressure.
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (ev) => {
+      const inBuf = ev.inputBuffer.getChannelData(0);
+      // Downsample by linear decimation. Browser sample rates are
+      // typically 44.1k or 48k; targetRate is 16k. Quality is fine for a
+      // 1cm Wyze cone; better resampling adds code for inaudible gain.
+      const ratio = audioCtx.sampleRate / targetRate;
+      const outLen = Math.floor(inBuf.length / ratio);
+      const out = new Int16Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const v = inBuf[Math.floor(i * ratio)] || 0;
+        out[i] = Math.max(-32768, Math.min(32767, v * 32767));
+      }
+      chunks.push(out);
+    };
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+    status.textContent = "● recording";
+  };
+
+  const stop = async () => {
+    if (!mediaStream) return;
+    try { processor && processor.disconnect(); } catch {}
+    try { source && source.disconnect(); } catch {}
+    try { audioCtx && audioCtx.close(); } catch {}
+    mediaStream.getTracks().forEach((t) => t.stop());
+    mediaStream = null;
+    audioCtx = null;
+    processor = null;
+    source = null;
+
+    // Concatenate captured int16 chunks into one buffer + POST as
+    // application/octet-stream. The endpoint takes raw PCM bytes; a
+    // ?rate=16000 query tells the speaker driver the input rate.
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    if (total === 0) {
+      status.textContent = "(no audio captured)";
+      return;
+    }
+    const merged = new Int16Array(total);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+    chunks.length = 0;
+    status.textContent = "uploading…";
+    try {
+      const r = await fetch(`/api/room/${encodeURIComponent(room)}/play_pcm?rate=${targetRate}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: merged.buffer,
+      });
+      status.textContent = r.ok ? "✓ played" : `failed (${r.status})`;
+    } catch (e) {
+      status.textContent = "upload failed";
+    }
+  };
+
+  // Pointer events cover mouse + touch + pen uniformly.
+  btn.onpointerdown = (ev) => { ev.preventDefault(); start(); };
+  btn.onpointerup = (ev) => { ev.preventDefault(); stop(); };
+  btn.onpointerleave = () => { if (mediaStream) stop(); };
+  btn.onpointercancel = () => { if (mediaStream) stop(); };
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────

@@ -91,8 +91,14 @@ class CameraManager:
     YOLO+MediaPipe scan on the same cv2.VideoCapture handle.
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, room_settings: Any = None) -> None:
         self._rooms_config: list[dict] = config.get("rooms", [])
+        # RoomSettings is optional — when None (e.g. smoke test, unit test),
+        # capture_frame_async returns the raw frame untransformed. When
+        # supplied (orchestrator wiring), per-room rotate/flip/brightness/
+        # contrast tweaks are applied on every frame so YOLO + MediaPipe
+        # see the corrected orientation, not just the dashboard preview.
+        self._room_settings = room_settings
         # cv2.VideoCapture pool — used by both USB ("usb") and RTSP ("rtsp") rooms
         self._caps: dict[str, Any] = {}
         # HTTP snapshot URLs — fetched per-frame, no persistent state
@@ -463,7 +469,7 @@ class CameraManager:
         # to a real read on the next call.
         cached = self._last_frames.pop(room, None)
         if cached is not None:
-            return cached
+            return self._apply_room_tweaks(room, cached)
 
         kind = self._video_kinds.get(room)
         if kind == "http":
@@ -473,7 +479,7 @@ class CameraManager:
             frame = await self._fetch_http_frame(url)
             if frame is not None:
                 self._fail_counts[room] = 0
-                return frame
+                return self._apply_room_tweaks(room, frame)
             self._fail_counts[room] = self._fail_counts.get(room, 0) + 1
             logger.debug(
                 f"[CameraManager] HTTP fetch failed for '{room}' "
@@ -482,10 +488,72 @@ class CameraManager:
             return None
 
         if kind == "rtsp":
-            return await asyncio.to_thread(self._read_cap_rtsp, room)
+            frame = await asyncio.to_thread(self._read_cap_rtsp, room)
+            return self._apply_room_tweaks(room, frame) if frame is not None else None
 
         # USB
-        return await asyncio.to_thread(self._read_cap, room)
+        frame = await asyncio.to_thread(self._read_cap, room)
+        return self._apply_room_tweaks(room, frame) if frame is not None else None
+
+    # ── Per-room post-processing ─────────────────────────────────────────────
+
+    def _apply_room_tweaks(self, room: str, frame: np.ndarray) -> np.ndarray:
+        """Apply rotate/flip/brightness/contrast from RoomSettings. Returns
+        the original frame untouched when no settings or no RoomSettings
+        instance — keeps the hot path cheap when the dashboard hasn't
+        configured anything for this room.
+        """
+        if self._room_settings is None or frame is None:
+            return frame
+        try:
+            tweaks = self._room_settings.get(room)
+        except Exception:
+            return frame
+        if not tweaks:
+            return frame
+
+        out = frame
+        rot = tweaks.get("rotation")
+        if rot in (90, 180, 270) and cv2 is not None:
+            # cv2 rotate constants: ROTATE_90_CLOCKWISE=0, ROTATE_180=1,
+            # ROTATE_90_COUNTERCLOCKWISE=2. We define rotation as clockwise
+            # degrees so 90→0, 180→1, 270→2.
+            rot_map = {90: cv2.ROTATE_90_CLOCKWISE,
+                       180: cv2.ROTATE_180,
+                       270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+            try:
+                out = cv2.rotate(out, rot_map[rot])
+            except Exception as e:
+                logger.debug(f"[CameraManager] rotate failed for '{room}': {e}")
+
+        flip_h = bool(tweaks.get("flip_h", False))
+        flip_v = bool(tweaks.get("flip_v", False))
+        if (flip_h or flip_v) and cv2 is not None:
+            # cv2.flip flipCode: 0=v, 1=h, -1=both
+            code = (-1 if (flip_h and flip_v) else (1 if flip_h else 0))
+            try:
+                out = cv2.flip(out, code)
+            except Exception as e:
+                logger.debug(f"[CameraManager] flip failed for '{room}': {e}")
+
+        # Brightness + contrast in one convertScaleAbs call: out = α·in + β.
+        # Skip if both are at defaults to avoid the per-pixel pass.
+        brightness = float(tweaks.get("brightness", 1.0))
+        contrast = float(tweaks.get("contrast", 1.0))
+        if (brightness != 1.0 or contrast != 1.0) and cv2 is not None:
+            # Map: contrast → α (multiplier); brightness → β (additive offset).
+            # Brightness 1.0 = no shift; >1 brightens; <1 darkens. Range
+            # ±50 luminance is a reasonable feel for the slider.
+            alpha = max(0.1, contrast)
+            beta = (brightness - 1.0) * 50.0
+            try:
+                out = cv2.convertScaleAbs(out, alpha=alpha, beta=beta)
+            except Exception as e:
+                logger.debug(
+                    f"[CameraManager] brightness/contrast failed for '{room}': {e}"
+                )
+
+        return out
 
     # ── cv2.VideoCapture readers ─────────────────────────────────────────────
 

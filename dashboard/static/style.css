@@ -1725,3 +1725,108 @@ main {
   background: var(--blue-dim);
   box-shadow: var(--glow-blue);
 }
+
+/* ── Inline LLM model tune cogs (next to CHAT/VISION/ACTION dropdowns) ── */
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.model-inline-tune {
+  background: transparent;
+  border: 1px solid var(--blue-dim);
+  border-radius: var(--radius);
+  color: var(--blue);
+  font-size: 14px;
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.model-inline-tune:hover {
+  background: var(--blue-dim);
+  box-shadow: var(--glow-blue);
+}
+.model-inline-tune[hidden] { display: none; }
+
+/* ── Per-room card cog (top-right of each room-card) ─────────────────── */
+.room-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.room-cog {
+  background: transparent;
+  border: 1px solid var(--blue-dim);
+  border-radius: var(--radius);
+  color: var(--blue);
+  font-size: 13px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.6;
+  transition: opacity 0.15s, background 0.15s;
+}
+.room-cog:hover {
+  opacity: 1;
+  background: var(--blue-dim);
+}
+
+/* ── Room settings modal sections ───────────────────────────────────── */
+.room-settings-section {
+  border-top: 1px solid var(--border);
+  padding: 12px 0;
+}
+.room-settings-section:first-child { border-top: none; }
+.room-settings-section-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+.room-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.room-settings-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+}
+.room-settings-row select,
+.room-settings-row input[type="text"] {
+  flex: 1;
+  min-width: 120px;
+}
+.room-settings-row input[type="range"] {
+  flex: 1;
+  min-width: 100px;
+}
+.room-settings-val {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 36px;
+  text-align: right;
+}
+.room-settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

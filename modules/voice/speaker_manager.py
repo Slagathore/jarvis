@@ -27,7 +27,7 @@ Classes: SpeakerManager
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from loguru import logger
 
@@ -81,8 +81,12 @@ class SpeakerManager:
     the right driver handles the rest.
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, room_settings: Any = None) -> None:
         self._sinks: dict[str, SpeakerSink] = {}
+        # Optional RoomSettings store — when supplied, play() consults it
+        # for live volume + mute overrides. None at construct time = use
+        # the values baked in at __init__.
+        self._room_settings = room_settings
         for room_cfg in config.get("rooms", []):
             room_id = room_cfg.get("id", "unknown")
             spk_cfg = room_cfg.get("speaker") or {}
@@ -120,20 +124,51 @@ class SpeakerManager:
 
     async def play(self, room: str, pcm: bytes, sample_rate: int) -> bool:
         """Send PCM to the room's speaker. Returns False if no sink is
-        configured. Errors inside the driver are logged and swallowed —
-        the orchestrator already has fallback logic and we don't want a
-        single unreachable Wyze cam to crash the whole TTS path.
+        configured, the room is muted via RoomSettings, or the driver
+        errors out.
+
+        Live overrides from RoomSettings (when wired):
+          - muted=True → silently drop the audio (returns True so callers
+            don't fall back to a louder path; user wanted silence)
+          - volume=N → temporarily set the WyzeSshSpeakerSink's volume
+            for this play call only. The setter approach (rather than
+            reading volume on every play() inside the sink) keeps the
+            sink portable — RoomSettings is a SpeakerManager concern.
         """
         sink = self._sinks.get(room)
         if sink is None:
             logger.warning(f"[SpeakerManager] No speaker configured for room '{room}'")
             return False
+
+        tweaks = self._room_settings.get(room) if self._room_settings is not None else {}
+        if tweaks.get("muted"):
+            logger.debug(f"[SpeakerManager] '{room}' is muted; dropping {len(pcm)} bytes")
+            return True
+
+        # Volume override — only meaningful for sinks that have a _volume
+        # attribute (WyzeSshSpeakerSink). USB / ESP / null sinks ignore
+        # the override transparently.
+        prev_volume = None
+        new_volume = tweaks.get("volume")
+        if new_volume is not None and hasattr(sink, "_volume"):
+            try:
+                prev_volume = getattr(sink, "_volume")
+                setattr(sink, "_volume", max(0, min(100, int(new_volume))))
+            except Exception:
+                prev_volume = None  # restore step is a no-op below
+
         try:
             await sink.play(pcm, sample_rate)
             return True
         except Exception as e:
             logger.warning(f"[SpeakerManager] play('{room}') failed: {e}")
             return False
+        finally:
+            if prev_volume is not None:
+                try:
+                    setattr(sink, "_volume", prev_volume)
+                except Exception:
+                    pass
 
     async def close(self) -> None:
         for room, sink in self._sinks.items():

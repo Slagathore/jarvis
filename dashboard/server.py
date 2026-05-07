@@ -77,6 +77,8 @@ class DashboardServer:
         self._camera_jpeg_quality = 70
         self._mic_manager = None     # Set by orchestrator via register_mic_manager()
         self._speaker_manager = None # Set by orchestrator via register_speaker_manager()
+        self._room_settings = None   # Set by orchestrator via register_room_settings()
+        self._wyze_cam_controls: dict = {}  # Set by orchestrator via register_wyze_cam_controls()
         self._reminders_store = None  # Set by orchestrator via register_reminders_store()
         self._calendar = None         # Set by orchestrator via register_calendar()
         self._interruptibility = None # Set by orchestrator via register_interruptibility()
@@ -161,6 +163,26 @@ class DashboardServer:
             self._state["rooms"].setdefault(room_id, {})
             self._state["rooms"][room_id]["has_speaker"] = True
             self._state["rooms"][room_id]["speaker_type"] = speaker_manager.get_speaker_type(room_id)
+
+    def register_room_settings(self, room_settings) -> None:
+        """Wire the per-room runtime tweak store so the dashboard's per-feed
+        cog modal can read/write rotation, flip, brightness, contrast,
+        volume, and mute. The store is shared with CameraManager and
+        SpeakerManager so changes take effect on the very next frame /
+        play() call without a restart.
+        """
+        self._room_settings = room_settings
+
+    def register_wyze_cam_controls(self, controls: dict) -> None:
+        """Wire per-Wyze-room hardware controls (night vision, IR LEDs,
+        status LED, reboot). Dict is {room_id: WyzeCamControl}. The
+        modal's WYZE CAMERA section is hidden for rooms not in this dict,
+        so non-Wyze rooms (USB office, ESP laundry) don't get useless
+        toggles."""
+        self._wyze_cam_controls = controls or {}
+        for room_id in self._wyze_cam_controls:
+            self._state["rooms"].setdefault(room_id, {})
+            self._state["rooms"][room_id]["wyze_cam"] = True
 
     def register_reminders_store(self, store) -> None:
         """Wire the orchestrator's RemindersStore so /api/reminders endpoints work."""
@@ -1232,6 +1254,184 @@ class DashboardServer:
                     sm.get_speaker_type(room) if sm is not None else "none"
                 ),
             })
+
+        # ── Per-room runtime settings (rotate / flip / volume / mute) ────
+
+        @app.get("/api/room/{room}/settings")
+        async def room_settings_get(room: str):
+            """Return the room's current runtime tweaks. Empty dict means
+            'all defaults'. Used by the per-feed cog modal to populate
+            the form when it opens."""
+            rs = self._room_settings
+            if rs is None:
+                return JSONResponse({"settings": {}})
+            return JSONResponse({"settings": rs.get(room)})
+
+        @app.post("/api/room/{room}/settings")
+        async def room_settings_set(room: str, request: Request):
+            """Patch the room's runtime tweaks. Body is a partial dict —
+            only keys present get updated; pass null to clear a key.
+            Recognized keys: rotation (0/90/180/270), flip_h, flip_v,
+            brightness, contrast, volume, muted. Unknown keys are
+            silently dropped after normalize().
+            """
+            rs = self._room_settings
+            if rs is None:
+                raise HTTPException(status_code=503, detail="RoomSettings not registered")
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="body must be an object")
+            from core.room_settings import RoomSettings as _RS
+            cleaned = _RS.normalize(body)
+            updated = await rs.update(room, **cleaned)
+            await self.broadcast(
+                {"type": "room_settings_changed", "room": room, "settings": updated}
+            )
+            return JSONResponse({"ok": True, "room": room, "settings": updated})
+
+        @app.delete("/api/room/{room}/settings")
+        async def room_settings_clear(room: str):
+            """Wipe all runtime tweaks for the room — reverts to config.yaml defaults."""
+            rs = self._room_settings
+            if rs is None:
+                raise HTTPException(status_code=503, detail="RoomSettings not registered")
+            await rs.clear_room(room)
+            await self.broadcast(
+                {"type": "room_settings_changed", "room": room, "settings": {}}
+            )
+            return JSONResponse({"ok": True})
+
+        @app.post("/api/room/{room}/speak")
+        async def room_speak(room: str, request: Request):
+            """Speak arbitrary text in this room's speaker. Routes through
+            the orchestrator's full _speak path so the per-room sink
+            dispatch (Wyze SSH vs ESP MQTT vs PC) is identical to organic
+            TTS. Used by the per-feed cog modal's 'Send TTS' field.
+            """
+            orch = self._orchestrator
+            if orch is None:
+                raise HTTPException(status_code=503, detail="Orchestrator not registered")
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            text = str(body.get("text", "")).strip()
+            if not text:
+                raise HTTPException(status_code=400, detail="text required")
+            # priority=oneway suppresses the post-speech listen window —
+            # this is a manual broadcast, not an organic conversation turn.
+            try:
+                await orch._speak(text, room=room, priority="oneway")
+            except Exception as e:
+                logger.warning(f"[Dashboard] room_speak('{room}') failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+            return JSONResponse({"ok": True, "room": room, "text": text})
+
+        # ── Wyze cam hardware controls (per-cam SSH-driven) ─────────────
+
+        @app.get("/api/wyze/{room}/cam")
+        async def wyze_cam_get(room: str):
+            """Return the cam's current /configs/.parameters values for
+            the keys we know about (night vision, IR LEDs, status LED,
+            etc.) plus the WYZE_PARAMS spec so the dashboard can render
+            the correct option labels without hardcoding them. Missing
+            keys come back as null = "cam is using default."
+            """
+            ctrl = self._wyze_cam_controls.get(room)
+            if ctrl is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Room '{room}' is not a Wyze cam"
+                )
+            from modules.vision.wyze_cam_control import WYZE_PARAMS
+            values = await ctrl.get_all()
+            spec = {
+                k: {
+                    "label": v["label"],
+                    "options": [
+                        {"value": opt, "label": v["labels"].get(opt, str(opt))}
+                        for opt in v["valid"]
+                    ],
+                    "reboot_required": v["reboot_required"],
+                }
+                for k, v in WYZE_PARAMS.items()
+            }
+            return JSONResponse({"room": room, "values": values, "spec": spec})
+
+        @app.post("/api/wyze/{room}/cam")
+        async def wyze_cam_set(room: str, request: Request):
+            """Set one or more cam params. Body: {key: value, ...}. Each
+            key is validated against WYZE_PARAMS; bad keys are ignored
+            and reported in the response so the dashboard can highlight
+            what didn't take.
+            """
+            ctrl = self._wyze_cam_controls.get(room)
+            if ctrl is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Room '{room}' is not a Wyze cam"
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="body must be an object")
+            results = {}
+            for k, v in body.items():
+                results[k] = await ctrl.set_param(k, v)
+            await self.broadcast(
+                {"type": "wyze_cam_changed", "room": room, "results": results}
+            )
+            return JSONResponse({"ok": all(results.values()), "results": results})
+
+        @app.post("/api/wyze/{room}/reboot")
+        async def wyze_cam_reboot(room: str):
+            """Reboot the Wyze cam — necessary for some param changes
+            (the reboot_required flag in the spec). Cam comes back
+            online ~25-40s later. RTSP/SSH will fail in the interim;
+            CameraManager's reopen logic + SSH lazy-reconnect handle
+            the recovery transparently.
+            """
+            ctrl = self._wyze_cam_controls.get(room)
+            if ctrl is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Room '{room}' is not a Wyze cam"
+                )
+            ok = await ctrl.reboot()
+            if not ok:
+                raise HTTPException(status_code=502, detail="reboot SSH command failed")
+            await self.broadcast({"type": "wyze_cam_rebooting", "room": room})
+            return JSONResponse({"ok": True, "room": room})
+
+        @app.post("/api/room/{room}/play_pcm")
+        async def room_play_pcm(room: str, request: Request):
+            """Talkback: client uploads raw int16 PCM bytes (16kHz mono
+            assumed unless `?rate=N` query is supplied) and we route it
+            through SpeakerManager. Used by the per-feed cog modal's
+            'Push from your mic' button — browser captures audio via
+            getUserMedia, downsamples to int16, POSTs the buffer here.
+            """
+            sm = self._speaker_manager
+            if sm is None:
+                raise HTTPException(status_code=503, detail="SpeakerManager not registered")
+            if room not in sm.get_rooms():
+                raise HTTPException(status_code=404, detail=f"No speaker for '{room}'")
+            try:
+                pcm = await request.body()
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"body read failed: {e}")
+            if not pcm:
+                raise HTTPException(status_code=400, detail="empty body")
+            try:
+                rate = int(request.query_params.get("rate", "16000"))
+            except ValueError:
+                rate = 16000
+            ok = await sm.play(room, pcm, rate)
+            if not ok:
+                raise HTTPException(status_code=502, detail="speaker rejected playback")
+            return JSONResponse({"ok": True, "room": room, "bytes": len(pcm), "rate": rate})
 
     async def broadcast(self, event: dict):
         """

@@ -119,6 +119,8 @@ from modules.vision.mess_detector import MessDetector
 from modules.vision.object_detector import ObjectDetector
 from modules.vision.posture_analyzer import PostureAnalyzer
 from modules.vision.scene_analyzer import SceneAnalyzer
+from modules.vision.wyze_cam_control import WyzeCamControl
+from core.room_settings import RoomSettings
 from modules.voice.audio_focus import AudioFocus
 from modules.voice.intents import parse_dnd
 from modules.voice.mic_manager import MicManager
@@ -170,6 +172,16 @@ class Orchestrator:
         # event tagged with the right room.
         self.mic_manager: Optional[MicManager] = None
         self.speaker_manager: Optional[SpeakerManager] = None
+        # Per-room runtime tweaks (rotation, flip, volume, mute) — JSON-
+        # persisted at data/room_settings.json. Mutated by the dashboard
+        # cog modal; consumed by CameraManager (every frame) and
+        # SpeakerManager (every play).
+        self.room_settings: Optional[RoomSettings] = None
+        # Per-Wyze-room hardware control (night vision, IR LEDs, status
+        # LED, reboot). Keyed by room id; only rooms with
+        # video.type == wyze_rtsp get an instance. Reuses the SSH
+        # credentials from the room's wyze_ssh_aplay speaker config.
+        self.wyze_cam_controls: dict[str, WyzeCamControl] = {}
         self.speaker_id: Optional[SpeakerIdentifier] = None
         # When set, the next wake-recording captured audio is enrolled as a
         # voice sample for this person (instead of being run through STT/LLM).
@@ -305,6 +317,16 @@ class Orchestrator:
         # The agent wrote the modules one way and the orchestrator another.
         # Every constructor here was wrong — now all pass self.config.
 
+        # Per-room runtime tweaks store. Constructed before the audio +
+        # vision managers so they can reference it during their __init__.
+        # File path matches data_dir from config so it lives next to the
+        # SQLite DB and event logs (sane backup target).
+        from pathlib import Path as _Path
+        data_dir = _Path(
+            self.config.get("system", {}).get("data_dir", "data")
+        )
+        self.room_settings = RoomSettings(data_dir / "room_settings.json")
+
         self.stt = WhisperSTT(self.config)
         # WhisperSTT.load() is synchronous (blocking GPU/CPU work) — run in thread
         await asyncio.to_thread(self.stt.load)
@@ -329,8 +351,12 @@ class Orchestrator:
         # Per-room mic + speaker managers. Built unconditionally — null
         # drivers handle "this room has no audio" cleanly so the rest of
         # the orchestrator doesn't have to None-check at every callsite.
+        # SpeakerManager takes RoomSettings so live volume + mute
+        # overrides from the dashboard apply on every play() without a
+        # restart. MicManager doesn't consume it (no mic-side tweaks
+        # yet) but the wiring is parallel for symmetry.
         self.mic_manager = MicManager(self.config)
-        self.speaker_manager = SpeakerManager(self.config)
+        self.speaker_manager = SpeakerManager(self.config, room_settings=self.room_settings)
         logger.info(
             f"[Init] MicManager: {len(self.mic_manager.get_rooms())} active rooms; "
             f"SpeakerManager: {len(self.speaker_manager.get_rooms())} active rooms"
@@ -476,8 +502,43 @@ class Orchestrator:
         """Initialize camera, vision models, and scene analysis."""
         # BUG FIX: PostureAnalyzer and ObjectDetector take config: dict — were missing it
         # BUG FIX: SceneAnalyzer takes (config, llm) — was receiving flat model/base_url kwargs
-        self.cameras = CameraManager(config=self.config)
+        # CameraManager takes RoomSettings so per-room rotation/flip/
+        # brightness/contrast applies to every captured frame — both the
+        # dashboard preview AND the YOLO/MediaPipe pipelines see the
+        # same corrected orientation.
+        self.cameras = CameraManager(config=self.config, room_settings=self.room_settings)
         await self.cameras.load()
+
+        # Wyze hardware controls — one per room with video.type wyze_rtsp.
+        # SSH host comes from the URL (already env-expanded by core/config),
+        # SSH credentials are reused from the room's wyze_ssh_aplay speaker
+        # block. Built after CameraManager because the .url field on the
+        # video block is the source of truth for the cam IP.
+        for room_cfg in self.config.get("rooms", []):
+            video = room_cfg.get("video") or {}
+            if not isinstance(video, dict) or video.get("type") != "wyze_rtsp":
+                continue
+            spk = room_cfg.get("speaker") or {}
+            host = self._extract_wyze_host(video.get("url", ""))
+            if not host:
+                logger.warning(
+                    f"[Init] Wyze room '{room_cfg.get('id')}' has no host in video.url; "
+                    "skipping WyzeCamControl"
+                )
+                continue
+            room_id = room_cfg.get("id", "unknown")
+            self.wyze_cam_controls[room_id] = WyzeCamControl(
+                room=room_id,
+                host=host,
+                ssh_user=str(spk.get("ssh_user", "root")),
+                ssh_password=spk.get("ssh_password"),
+                ssh_key_path=spk.get("ssh_key_path"),
+            )
+        if self.wyze_cam_controls:
+            logger.info(
+                f"[Init] WyzeCamControl ready for {len(self.wyze_cam_controls)} room(s): "
+                + ", ".join(self.wyze_cam_controls.keys())
+            )
         self.light_detector = LightDetector(config=self.config)
         self.posture = PostureAnalyzer(self.config)
         await self.posture.load_async()
@@ -2551,6 +2612,20 @@ class Orchestrator:
             )
         return sent
 
+    @staticmethod
+    def _extract_wyze_host(url: str) -> Optional[str]:
+        """Pull the host out of an rtsp://user:pass@host:port/path URL.
+        Used to wire WyzeCamControl from the room's video block without
+        asking the user to specify the host twice in config.yaml.
+        """
+        if not url:
+            return None
+        try:
+            from urllib.parse import urlparse
+            return urlparse(url).hostname
+        except Exception:
+            return None
+
     def _speaker_sink_for(self, room: str) -> str:
         """
         Return the routing key for a room's speaker: "local" or "node".
@@ -3072,6 +3147,11 @@ class Orchestrator:
                 await self.speaker_manager.close()
             except Exception as e:
                 logger.debug(f"[Shutdown] SpeakerManager close failed: {e}")
+        for room, ctrl in self.wyze_cam_controls.items():
+            try:
+                await ctrl.close()
+            except Exception as e:
+                logger.debug(f"[Shutdown] WyzeCamControl close for '{room}' failed: {e}")
 
         if self.db:
             try:
@@ -3161,6 +3241,10 @@ class Orchestrator:
                 self.dashboard.register_mic_manager(self.mic_manager)
             if self.speaker_manager is not None and hasattr(self.dashboard, "register_speaker_manager"):
                 self.dashboard.register_speaker_manager(self.speaker_manager)
+            if self.room_settings is not None and hasattr(self.dashboard, "register_room_settings"):
+                self.dashboard.register_room_settings(self.room_settings)
+            if self.wyze_cam_controls and hasattr(self.dashboard, "register_wyze_cam_controls"):
+                self.dashboard.register_wyze_cam_controls(self.wyze_cam_controls)
             if self.reminders_store:
                 self.dashboard.register_reminders_store(self.reminders_store)
             if self.calendar:
