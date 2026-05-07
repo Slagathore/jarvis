@@ -121,8 +121,14 @@ from modules.vision.posture_analyzer import PostureAnalyzer
 from modules.vision.scene_analyzer import SceneAnalyzer
 from modules.voice.audio_focus import AudioFocus
 from modules.voice.intents import parse_dnd
+from modules.voice.mic_manager import MicManager
+from modules.voice.speaker_manager import SpeakerManager
 from modules.voice.speaker_id import SpeakerIdentifier
 from modules.identity.identity_manager import IdentityManager
+from modules.voice.sources.null_audio import NullMicSource, NullSpeakerSink
+from modules.voice.sources.usb_mic import UsbMicSource
+from modules.voice.sources.wake_adapter import MicSourceWakeAdapter
+from modules.voice.sources.wyze_ssh_speaker import WyzeSshSpeakerSink
 from modules.voice.stt import WhisperSTT
 from modules.voice.tts import PiperTTS
 from modules.voice.wake_word import WakeWordDetector
@@ -155,6 +161,15 @@ class Orchestrator:
         self.wake_sources: Optional[WakeSourceManager] = None
         self.stt: Optional[WhisperSTT] = None
         self.tts: Optional[PiperTTS] = None
+        # Per-room mic/speaker dispatch. MicManager owns one driver per room
+        # (USB / Wyze RTSP / ESP MQTT / null); SpeakerManager mirrors it on
+        # the output side. The PC mic stays on `self.wake` (WakeWordDetector
+        # has its own sounddevice grab); per-room MicSources for non-USB
+        # rooms get bridged into wake_sources via MicSourceWakeAdapter so
+        # talking near the bedroom Wyze cam fires a 'voice.wake_detected'
+        # event tagged with the right room.
+        self.mic_manager: Optional[MicManager] = None
+        self.speaker_manager: Optional[SpeakerManager] = None
         self.speaker_id: Optional[SpeakerIdentifier] = None
         # When set, the next wake-recording captured audio is enrolled as a
         # voice sample for this person (instead of being run through STT/LLM).
@@ -232,6 +247,15 @@ class Orchestrator:
         self._active_user_room: str = "office"
         self._wake_lock = asyncio.Lock()
         self._audio_io_active: bool = False
+        # Wake-event coalescer: when multiple mics hear the same wake word
+        # at nearly the same time (Cole says "Hey Jarvis" between the
+        # bedroom and kitchen cams), each MicWakeRunner fires its own
+        # voice.wake_detected event. Without coalescing we'd start the
+        # capture pipeline once per mic, then queue the rest behind the
+        # wake_lock. Instead, hold all wake events for a short window and
+        # fire ONE capture for the loudest (highest-confidence) room.
+        self._pending_wakes: list[dict] = []
+        self._wake_window_task: Optional[asyncio.Task] = None
         # Continuous-conversation follow-up listener: after each TTS reply,
         # we open a window where the user can speak again without re-saying
         # the wake word. The depth counter tracks how nested we are; we don't
@@ -297,10 +321,44 @@ class Orchestrator:
         await asyncio.to_thread(self.wake.load)
         logger.info("[Init] Wake word detector ready")
 
-        # Multi-room wake registry — empty today, populated by Wyze cam adapter
-        # and ESP node mic firmware once those land. Started when the run loop
-        # spins up so any sources registered between init and start are picked up.
+        # Multi-room wake registry — empty today, populated below from
+        # MicManager. Started when the run loop spins up so any sources
+        # registered between init and start are picked up.
         self.wake_sources = WakeSourceManager(config=self.config, bus=self.bus)
+
+        # Per-room mic + speaker managers. Built unconditionally — null
+        # drivers handle "this room has no audio" cleanly so the rest of
+        # the orchestrator doesn't have to None-check at every callsite.
+        self.mic_manager = MicManager(self.config)
+        self.speaker_manager = SpeakerManager(self.config)
+        logger.info(
+            f"[Init] MicManager: {len(self.mic_manager.get_rooms())} active rooms; "
+            f"SpeakerManager: {len(self.speaker_manager.get_rooms())} active rooms"
+        )
+
+        # Bridge per-room mic sources into the wake-word system. Skip:
+        #   - Rooms whose mic is the PC's USB device — WakeWordDetector
+        #     already consumes that via its own sounddevice grab; a
+        #     second listener on the same device would race for samples.
+        #   - Rooms with no mic configured (NullMicSource).
+        # Everything else (Wyze RTSP audio, ESP MQTT mic) gets a
+        # MicSourceWakeAdapter so wake-word detection fires per-room.
+        for room_id, src in self.mic_manager._sources.items():
+            if isinstance(src, NullMicSource):
+                continue
+            if isinstance(src, UsbMicSource):
+                logger.debug(
+                    f"[Init] Skipping wake adapter for '{room_id}' — USB mic is "
+                    "owned by the PC WakeWordDetector"
+                )
+                continue
+            try:
+                self.wake_sources.register(MicSourceWakeAdapter(src))
+                logger.info(f"[Init] Registered wake adapter for '{room_id}'")
+            except Exception as e:
+                logger.warning(
+                    f"[Init] Wake adapter registration for '{room_id}' failed: {e}"
+                )
 
         # Speaker identification — best-effort, fine if it fails to load
         if self.db is not None:
@@ -470,7 +528,9 @@ class Orchestrator:
         # BUG FIX: WakeWordDetector publishes to "voice.wake_detected" —
         # orchestrator was subscribing to "wake.detected" (completely different topic).
         # The wake pipeline would have silently never fired.
-        self.bus.subscribe("voice.wake_detected", self._on_wake_detected)
+        # Coalescer first — it batches per-mic wake events over a short
+        # window and forwards only the loudest to _on_wake_detected.
+        self.bus.subscribe("voice.wake_detected", self._on_wake_event_raw)
         self.bus.subscribe("appliance.state_changed", self._on_appliance_changed)
         self.bus.subscribe("node.status", self._on_node_status)
         self.bus.subscribe("audio.level", self._on_audio_level)
@@ -532,6 +592,65 @@ class Orchestrator:
         })
 
     # ── Wake Word + Conversation Pipeline ─────────────────────────────────
+
+    async def _on_wake_event_raw(self, event: dict) -> None:
+        """Coalesce concurrent wake-detection events. When Cole says
+        "Hey Jarvis" between two cams, every mic that hears it fires its
+        own voice.wake_detected — without coalescing the orchestrator
+        would start the capture pipeline once per mic and have to serialize
+        them behind _wake_lock. Instead, batch all events for a short
+        window after the first one arrives and dispatch ONE capture for
+        the loudest (highest-confidence) room.
+
+        The window is set in config.voice.wake_word.coalesce_window_ms
+        (default 250 ms). 250 is enough for ~3 OWW prediction cycles per
+        mic — long enough that a quiet mic in another room reliably gets
+        a vote in, short enough that the user doesn't perceive a delay
+        between saying the wake word and the chime.
+        """
+        self._pending_wakes.append(event)
+        if self._wake_window_task is None or self._wake_window_task.done():
+            wake_cfg = self.config.get("voice", {}).get("wake_word", {}) or {}
+            window_ms = int(wake_cfg.get("coalesce_window_ms", 250))
+            window_s = max(0.0, window_ms / 1000.0)
+            self._wake_window_task = asyncio.create_task(
+                self._fire_pending_wake_after(window_s)
+            )
+
+    async def _fire_pending_wake_after(self, delay_s: float) -> None:
+        """Sleeps the coalesce window, then fires the loudest pending wake.
+        On cancellation (orchestrator shutting down) drops the pending
+        list silently — the capture pipeline isn't safe to start mid-shutdown.
+        """
+        try:
+            await asyncio.sleep(delay_s)
+        except asyncio.CancelledError:
+            self._pending_wakes = []
+            self._wake_window_task = None
+            return
+
+        pending = self._pending_wakes
+        self._pending_wakes = []
+        self._wake_window_task = None
+        if not pending:
+            return
+
+        winner = max(
+            pending, key=lambda e: float(e.get("confidence", 0.0))
+        )
+        if len(pending) > 1:
+            # Per-room rundown so the log makes the choice obvious. Useful
+            # when tuning per-room sensitivity — if the bedroom always wins
+            # but Cole's standing in the kitchen, the kitchen mic needs gain.
+            rundown = ", ".join(
+                f"{e.get('room', '?')}@{float(e.get('confidence', 0.0)):.3f}"
+                for e in pending
+            )
+            logger.info(
+                f"[Wake] Coalesced {len(pending)} simultaneous wakes "
+                f"[{rundown}] → winner '{winner.get('room')}'"
+            )
+        await self._on_wake_detected(winner)
 
     async def _on_wake_detected(self, event: dict) -> None:
         """
@@ -2361,6 +2480,36 @@ class Orchestrator:
             "ip": ip,
         })
 
+    async def _speak_via_speaker_manager(self, text: str, room: str) -> bool:
+        """Route TTS through SpeakerManager — used for non-PC sinks like
+        Wyze SSH (audioplay_t20) and any USB device that's NOT the host's
+        default output. Synthesizes once, hands the int16 PCM to the
+        right driver, and waits for playback to complete (the driver's
+        play() blocks until the remote binary exits).
+
+        Returns True on successful playback. False = caller should fall
+        back to the local PC speaker path.
+        """
+        if self.tts is None or self.speaker_manager is None:
+            return False
+        try:
+            audio = await self.tts.synthesize_async(text)
+        except Exception as e:
+            logger.warning(f"[TTS] SpeakerManager-route synthesis failed: {e}")
+            return False
+        try:
+            import numpy as _np
+            pcm_int16 = (_np.clip(audio, -1.0, 1.0) * 32767.0).astype(_np.int16)
+            payload = pcm_int16.tobytes()
+        except Exception as e:
+            logger.warning(f"[TTS] PCM conversion failed: {e}")
+            return False
+        # PiperTTS sample rate is the rate of the synthesized PCM. The
+        # driver (e.g. WyzeSshSpeakerSink) handles any further resampling
+        # to the destination's native rate (Wyze speaker is 8kHz).
+        rate = int(getattr(self.tts, "_sample_rate", 22050))
+        return await self.speaker_manager.play(room, payload, rate)
+
     async def _speak_via_node(self, text: str, room: str) -> bool:
         """
         Synthesize text and send the audio bytes to the room's ESP32 node over
@@ -2716,12 +2865,26 @@ class Orchestrator:
                 logger.warning("[TTS] TTS module not initialized — skipping playback")
                 return
 
-            routed_to_node = False
-            sink = self._speaker_sink_for(room)
-            if sink == "node" and self.nodes is not None and self.nodes.is_online(room):
-                routed_to_node = await self._speak_via_node(text, room)
+            # Three-way routing:
+            #   1. esp32_i2s_spk → MQTT to ESP node (legacy "node" path)
+            #   2. wyze_ssh_aplay → SSH SFTP to cam, audioplay_t20 (new)
+            #   3. anything else (usb_device_spk, none, missing config) →
+            #      local PC sound device with audio_focus + classifier coordination
+            # The local-PC path stays the default because that's where the
+            # office speaker lives and it has the rich ducking/focus
+            # integration; routing it through SpeakerManager would lose that.
+            routed = False
+            speaker_type = (
+                self.speaker_manager.get_speaker_type(room)
+                if self.speaker_manager is not None
+                else "none"
+            )
+            if speaker_type == "esp32_i2s_spk" and self.nodes is not None and self.nodes.is_online(room):
+                routed = await self._speak_via_node(text, room)
+            elif speaker_type == "wyze_ssh_aplay":
+                routed = await self._speak_via_speaker_manager(text, room)
 
-            if not routed_to_node:
+            if not routed:
                 # Local playback. Streaming for multi-sentence; quick path for
                 # one-liners. _audio_io_active blocks the audio classifier from
                 # reading wake_word's buffer during our own playback. Audio focus
@@ -2866,6 +3029,15 @@ class Orchestrator:
 
     async def _shutdown(self) -> None:
         """Release long-lived resources cleanly during shutdown."""
+        # Cancel any pending wake-coalesce window so it doesn't try to
+        # fire the capture pipeline against modules we're about to close.
+        if self._wake_window_task is not None and not self._wake_window_task.done():
+            self._wake_window_task.cancel()
+            try:
+                await self._wake_window_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._pending_wakes = []
         if self.wake:
             self.wake.stop()
         if self.wake_sources is not None:
@@ -2885,6 +3057,21 @@ class Orchestrator:
                 await self.cameras.close()
             except Exception as e:
                 logger.debug(f"[Shutdown] Camera close failed: {e}")
+
+        # Mic + speaker managers — close after wake_sources so the
+        # MicSourceWakeAdapters that hold these sources see the wake side
+        # tear down first; otherwise an in-flight callback could fire
+        # against a freshly-stopped MicSource and log noise on its way out.
+        if self.mic_manager is not None:
+            try:
+                await self.mic_manager.close()
+            except Exception as e:
+                logger.debug(f"[Shutdown] MicManager close failed: {e}")
+        if self.speaker_manager is not None:
+            try:
+                await self.speaker_manager.close()
+            except Exception as e:
+                logger.debug(f"[Shutdown] SpeakerManager close failed: {e}")
 
         if self.db:
             try:
@@ -2970,6 +3157,10 @@ class Orchestrator:
                 )
             if self.cameras:
                 self.dashboard.register_camera_manager(self.cameras)
+            if self.mic_manager is not None and hasattr(self.dashboard, "register_mic_manager"):
+                self.dashboard.register_mic_manager(self.mic_manager)
+            if self.speaker_manager is not None and hasattr(self.dashboard, "register_speaker_manager"):
+                self.dashboard.register_speaker_manager(self.speaker_manager)
             if self.reminders_store:
                 self.dashboard.register_reminders_store(self.reminders_store)
             if self.calendar:

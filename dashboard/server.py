@@ -75,6 +75,8 @@ class DashboardServer:
         self._active_voice: str = ""
         self._camera_manager = None  # Set by orchestrator via register_camera_manager()
         self._camera_jpeg_quality = 70
+        self._mic_manager = None     # Set by orchestrator via register_mic_manager()
+        self._speaker_manager = None # Set by orchestrator via register_speaker_manager()
         self._reminders_store = None  # Set by orchestrator via register_reminders_store()
         self._calendar = None         # Set by orchestrator via register_calendar()
         self._interruptibility = None # Set by orchestrator via register_interruptibility()
@@ -139,6 +141,26 @@ class DashboardServer:
         for room_id in rooms:
             self._state["rooms"].setdefault(room_id, {})
             self._state["rooms"][room_id]["has_camera"] = True
+
+    def register_mic_manager(self, mic_manager) -> None:
+        """Wire the orchestrator's MicManager so /api/mic/{room}/* endpoints
+        (and the dashboard's per-room mic indicator) know which rooms have
+        a live mic source. Per-room state gets a `has_mic` flag."""
+        self._mic_manager = mic_manager
+        rooms = mic_manager.get_rooms() if mic_manager else []
+        for room_id in rooms:
+            self._state["rooms"].setdefault(room_id, {})
+            self._state["rooms"][room_id]["has_mic"] = True
+
+    def register_speaker_manager(self, speaker_manager) -> None:
+        """Wire the orchestrator's SpeakerManager so /api/speaker/{room}/test
+        can play a verification phrase in any room with a configured sink."""
+        self._speaker_manager = speaker_manager
+        rooms = speaker_manager.get_rooms() if speaker_manager else []
+        for room_id in rooms:
+            self._state["rooms"].setdefault(room_id, {})
+            self._state["rooms"][room_id]["has_speaker"] = True
+            self._state["rooms"][room_id]["speaker_type"] = speaker_manager.get_speaker_type(room_id)
 
     def register_reminders_store(self, store) -> None:
         """Wire the orchestrator's RemindersStore so /api/reminders endpoints work."""
@@ -1147,6 +1169,69 @@ class DashboardServer:
                 media_type="multipart/x-mixed-replace; boundary=frame",
                 headers={"Cache-Control": "no-store"},
             )
+
+        # ── Per-room speaker / mic test endpoints ────────────────────────
+
+        @app.post("/api/speaker/{room}/test")
+        async def speaker_test(room: str, request: Request):
+            """Play a short test phrase in the given room's speaker.
+            Used for verifying a Wyze cam (or any other sink) is wired
+            up correctly without having to wait for an organic TTS event.
+
+            Body (optional): {"text": "custom phrase"}; defaults to a
+            self-identifying phrase that names the room, so Cole can tell
+            which cam actually beeped if multiple are within earshot.
+            """
+            sm = self._speaker_manager
+            orch = self._orchestrator
+            if sm is None or orch is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Speaker manager / orchestrator not registered",
+                )
+            if room not in sm.get_rooms():
+                raise HTTPException(
+                    status_code=404, detail=f"No speaker configured for '{room}'"
+                )
+            body = {}
+            try:
+                body = await request.json()
+            except Exception:
+                pass  # empty body is fine — use the default phrase
+            text = str(body.get("text", "")).strip() or (
+                f"Speaker test from {room.replace('_', ' ')}."
+            )
+            # Route through the orchestrator's full _speak path so the
+            # per-room sink dispatch (Wyze SSH vs ESP MQTT vs PC) is the
+            # same path organic TTS goes through. priority=oneway to
+            # suppress the post-speech listen window on a manual test.
+            try:
+                await orch._speak(text, room=room, priority="oneway")
+            except Exception as e:
+                logger.warning(f"[Dashboard] speaker test for '{room}' failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+            await self.broadcast(
+                {"type": "speaker_test", "room": room, "text": text}
+            )
+            return JSONResponse({"ok": True, "room": room, "text": text})
+
+        @app.get("/api/mic/{room}/status")
+        async def mic_status(room: str):
+            """Report whether the given room has a configured mic source.
+            Doesn't probe the source live — the dashboard polls this for
+            the per-room mic indicator dot. Live mic-level data flows
+            through the existing 'audio_level' broadcast events.
+            """
+            mm = self._mic_manager
+            sm = self._speaker_manager
+            return JSONResponse({
+                "room": room,
+                "has_mic": (mm is not None and room in mm.get_rooms()),
+                "has_speaker": (sm is not None and room in sm.get_rooms()),
+                "speaker_type": (
+                    sm.get_speaker_type(room) if sm is not None else "none"
+                ),
+            })
 
     async def broadcast(self, event: dict):
         """
