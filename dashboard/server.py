@@ -79,6 +79,7 @@ class DashboardServer:
         self._speaker_manager = None # Set by orchestrator via register_speaker_manager()
         self._room_settings = None   # Set by orchestrator via register_room_settings()
         self._wyze_cam_controls: dict = {}  # Set by orchestrator via register_wyze_cam_controls()
+        self._persona = None  # Set by orchestrator via register_persona()
         self._reminders_store = None  # Set by orchestrator via register_reminders_store()
         self._calendar = None         # Set by orchestrator via register_calendar()
         self._interruptibility = None # Set by orchestrator via register_interruptibility()
@@ -172,6 +173,15 @@ class DashboardServer:
         play() call without a restart.
         """
         self._room_settings = room_settings
+
+    def register_persona(self, persona_manager) -> None:
+        """Wire the PersonaManager so the dashboard's persona dropdown +
+        command box can list/switch personas. Hidden personas are
+        excluded from the dropdown listing (enforced at /api/persona/list)
+        — the only way to activate them is to type the name into the
+        command box.
+        """
+        self._persona = persona_manager
 
     def register_wyze_cam_controls(self, controls: dict) -> None:
         """Wire per-Wyze-room hardware controls (night vision, IR LEDs,
@@ -895,6 +905,129 @@ class DashboardServer:
             loop = _asyncio.get_event_loop()
             loop.call_later(0.5, lambda: (logger.warning("[System] Shutdown — exit 0"), _os._exit(0)))
             return JSONResponse({"ok": True, "action": "shutdown"})
+
+        # ── Persona system ──────────────────────────────────────────────────
+
+        @app.get("/api/personas")
+        async def personas_list():
+            """Return only personas with visible_in_ui=true. Hidden ones
+            (uwu) MUST NOT appear here — that's the user-facing safety
+            property of 'hidden': the persona doesn't exist as far as
+            the dropdown knows. Activating it requires typing the name
+            into the command box, i.e., knowing it exists."""
+            p = self._persona
+            if p is None:
+                return JSONResponse({"personas": [], "active": None, "locked": False})
+            return JSONResponse({
+                "personas": p.list_visible(),
+                "active": p.current_name(),
+                "locked": p.is_locked(),
+            })
+
+        @app.get("/api/persona/current")
+        async def persona_current():
+            """Live status — what's active, lock state, and any pending
+            phone-resume offer the dashboard should show as a prompt."""
+            p = self._persona
+            if p is None:
+                return JSONResponse({"active": None, "locked": False, "pending_resume": None})
+            st = p.state()
+            return JSONResponse({
+                "active": st.active,
+                "locked": st.locked,
+                "pending_resume": st.pending_resume,
+                "last_change_ts": st.last_change_ts,
+            })
+
+        @app.post("/api/persona/set")
+        async def persona_set(request: Request):
+            """Switch personas. Body: {name, lock?, force?}.
+            - name: persona key from config.yaml (visible OR hidden — the
+              listing endpoint hides them but SET accepts any known name).
+            - lock: when true, blocks the time/phone auto-revert paths.
+              Person-entry revert still fires regardless.
+            - force: bypass the privacy gate (use sparingly — intended for
+              CLI / debug scenarios, not the normal UI).
+            """
+            from core.exceptions import PersonaError as _PersonaError
+            p = self._persona
+            if p is None:
+                raise HTTPException(status_code=503, detail="Persona system not configured")
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            name = str(body.get("name", "")).strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="name required")
+            try:
+                await p.set(
+                    name,
+                    lock=bool(body.get("lock", False)),
+                    force=bool(body.get("force", False)),
+                )
+            except _PersonaError as e:
+                # 409 = conflict (privacy gate or unknown persona). Lets
+                # the frontend distinguish "wrong name" / "not allowed
+                # right now" from generic 500s.
+                raise HTTPException(status_code=409, detail=str(e))
+            return JSONResponse({"ok": True, "active": p.current_name(), "locked": p.is_locked()})
+
+        @app.post("/api/persona/command")
+        async def persona_command(request: Request):
+            """Free-text command from the hidden command box. Recognized:
+              uwu / focus / default / <any persona name> → set
+              revert | normal                            → snap to default
+              lock | unlock                              → toggle lock
+              resume                                     → accept pending phone-resume
+              set <name>                                 → explicit set form
+            Returns the new active state plus a `recognized` flag so the
+            frontend can tell "did anything happen" vs "typo".
+            """
+            from core.exceptions import PersonaError as _PersonaError
+            p = self._persona
+            if p is None:
+                raise HTTPException(status_code=503, detail="Persona system not configured")
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            cmd = str(body.get("text", "")).strip().lower()
+            if not cmd:
+                raise HTTPException(status_code=400, detail="text required")
+            recognized = True
+            try:
+                if cmd in ("revert", "normal"):
+                    await p.revert(reason="dashboard_command")
+                elif cmd == "lock":
+                    p.set_lock(True)
+                elif cmd == "unlock":
+                    p.set_lock(False)
+                elif cmd == "resume":
+                    ok = await p.accept_pending_resume()
+                    if not ok:
+                        raise HTTPException(
+                            status_code=409, detail="No pending resume to accept"
+                        )
+                elif cmd.startswith("set "):
+                    name = cmd.split(maxsplit=1)[1].strip()
+                    await p.set(name)
+                else:
+                    # Bare persona name — try to set it
+                    await p.set(cmd)
+            except _PersonaError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            except HTTPException:
+                raise
+            except Exception:
+                recognized = False
+                raise HTTPException(status_code=400, detail=f"Unknown command: {cmd}")
+            return JSONResponse({
+                "ok": True,
+                "active": p.current_name(),
+                "locked": p.is_locked(),
+                "recognized": recognized,
+            })
 
         # ── Self-edit (kill switch + pending review + revert) ───────────────
 

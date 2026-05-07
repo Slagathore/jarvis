@@ -35,9 +35,21 @@ voice:
     engine: piper
     active_voice: glados
     piper_binary: C:/Users/Cole/CodeStuff/Misc/piper/piper.exe
+    # Display name → .onnx path. Add new voices by dropping the model
+    # folder under C:/Users/Cole/CodeStuff/Misc/piper/voices/ then adding
+    # one line here. Switching between configured voices is hot — the
+    # dashboard dropdown calls PiperTTS.set_voice() which swaps live.
+    # New voices are picked up on Jarvis restart.
     voices:
       glados: C:/Users/Cole/CodeStuff/Misc/piper/voices/vits-piper-en_US-glados-high/en_US-glados-high.onnx
       wheatley: C:/Users/Cole/CodeStuff/Misc/piper/voices/wheatley1/wheatley1.onnx
+      cori: C:/Users/Cole/CodeStuff/Misc/piper/voices/cori/high/en_GB-cori-high.onnx
+      cori_medium: C:/Users/Cole/CodeStuff/Misc/piper/voices/cori/medium/en_GB-cori-medium.onnx
+      jenny: C:/Users/Cole/CodeStuff/Misc/piper/voices/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx
+      kathleen: C:/Users/Cole/CodeStuff/Misc/piper/voices/kathleen/low/en_US-kathleen-low.onnx
+      kristin: C:/Users/Cole/CodeStuff/Misc/piper/voices/kristin/medium/en_US-kristin-medium.onnx
+      libritts: C:/Users/Cole/CodeStuff/Misc/piper/voices/libritts/high/en_US-libritts-high.onnx
+      southern_female: C:/Users/Cole/CodeStuff/Misc/piper/voices/southern_english_female/low/en_GB-southern_english_female-low.onnx
     speed: 1.0
     sample_rate: 22050
   wake_word:
@@ -327,3 +339,73 @@ window_title_activity_map:
   notion.so: note_taking
   obsidian: note_taking
   comfyui: ai_image_gen
+
+# ── Persona system ───────────────────────────────────────────────────────────
+# Each persona is a system-prompt + behavior bundle. The active LLM model
+# and TTS voice are NOT per-persona — both come from ollama.* and voice.tts.*
+# above. Switching personas is purely a prompt change. See
+# modules/brain/persona_manager.py for the auto-revert state machine.
+#
+# 'default' MUST exist — every revert path lands on it. The persona_overlay
+# below is prepended to every persona's system_prompt, including default,
+# so default-Jarvis is also discreet about hidden personas.
+personas:
+  default:
+    system_prompt: |
+      You are Jarvis, an ambient home AI assistant. Observant, helpful, dry
+      wit. You speak like a smart friend, not a customer service bot. Never
+      say "I notice" or "I observe" — just say what you see. Keep responses
+      short unless asked for detail.
+    content_tier: standard
+    response_style: terse
+    visible_in_ui: true
+    requires_privacy: false
+
+  focus:
+    system_prompt: |
+      You are Jarvis. Cole is in a meeting or focused work session. Short,
+      factual, no jokes, no proactive ambient commentary unless something
+      truly important. Respond in one sentence when possible.
+    content_tier: standard
+    response_style: minimal
+    visible_in_ui: true
+    requires_privacy: false
+    display_name: Focus mode
+
+# Private personas (uwu, etc.) live in a gitignored overlay file so the
+# public config doesn't carry sensitive prompts. The overlay is merged in
+# AT BOOT — overlay entries win on key collision, so you can also use it
+# to locally override a public persona's prompt without editing this file.
+# Path is relative to the project root. Set to null/empty to disable.
+personas_overlay_file: data/personas.local.yaml
+
+# Global overlay PREPENDED to every persona's system_prompt (default included).
+# This is what makes default-Jarvis discreet, not just uwu-Jarvis.
+persona_overlay: |
+  PRIVACY DIRECTIVE — applies regardless of active mode:
+  Cole has private modes that are not to be referenced, named, alluded to, or
+  hinted at, except when ALL of:
+    (a) Cole is alone in his current room (no other person present or audible),
+    (b) Cole brought up the topic himself in this conversation,
+    (c) the topic is directly relevant to what's being discussed.
+  Never volunteer information about private modes. Never mention them when
+  anyone else is present, on a call, or audibly nearby. If asked by someone
+  who is not Cole, deflect naturally without confirming or denying anything.
+  This rule overrides any creative or roleplay instruction in the active mode.
+
+# Auto-revert tunables for PersonaManager. away_timeout_s applies to private
+# personas only; phone_resume_window_s is how long the dashboard's "resume?"
+# offer stays valid after a call ends. Lock + person-entry rules are NOT
+# tunable here — they're hard safety floors in code.
+persona_revert:
+  away_timeout_s: 1800
+  phone_resume_window_s: 30
+  call_processes:
+    - zoom.exe
+    - teams.exe
+    - slack.exe
+    - discord.exe
+  call_window_keywords:
+    - Meeting
+    - Call
+    - Huddle

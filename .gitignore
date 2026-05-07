@@ -32,6 +32,11 @@ data/debug/
 data/google_token.json
 data/google_credentials.json
 data/test_frame_*.jpg
+# Persona overlay — private personas merged into the active set at boot.
+# See core/config.py:load_personas_overlay(). Keeps sensitive prompts out
+# of the public repo while still loading them at runtime.
+data/personas.local.yaml
+data/personas.local.yml
 # Supervisor / self-edit runtime state
 data/heartbeat.txt
 data/last_safe_sha.txt

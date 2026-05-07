@@ -52,6 +52,22 @@ class PromptBuilder:
         self._memory_event_limit: int = int(
             config.get("memory", {}).get("prompt_memory_events", 8)
         )
+        # Optional persona manager — injected post-construction by the
+        # orchestrator. When set, _build_system uses
+        # persona_manager.composed_system_prompt() (overlay + active
+        # persona) as the personality base instead of self._base_system.
+        # Kept Optional so PromptBuilder still works in unit tests + on
+        # legacy configs that don't have a personas section.
+        self._persona_manager = None  # set via attach_persona_manager()
+
+    def attach_persona_manager(self, persona_manager) -> None:
+        """Wire the PersonaManager so build() uses the active persona's
+        composed system prompt (overlay + persona-specific text) on
+        every call. Called by the orchestrator at boot, after both
+        managers exist.
+        """
+        self._persona_manager = persona_manager
+        logger.info("[Prompt] PersonaManager attached")
 
     def build(
         self,
@@ -158,7 +174,22 @@ class PromptBuilder:
         day_str = f"{now.strftime('%A, %B')} {now.day}, {now.year}"
         iso_str = now.strftime("%Y-%m-%dT%H:%M:%S")
 
-        lines = [self._base_system, ""]
+        # Persona system: when wired, the PersonaManager composes the
+        # full personality prompt as overlay + active-persona prompt.
+        # Falls back to the legacy ollama.system_prompt for tests / configs
+        # without a personas section. The overlay is always present —
+        # that's what keeps default-Jarvis discreet about hidden personas.
+        base = self._base_system
+        if self._persona_manager is not None:
+            try:
+                base = self._persona_manager.composed_system_prompt()
+            except Exception as e:
+                logger.warning(
+                    f"[Prompt] persona compose failed, falling back to "
+                    f"ollama.system_prompt: {e}"
+                )
+
+        lines = [base, ""]
         lines.append(f"Current time: {time_str} on {day_str} (ISO: {iso_str}).")
         lines.append(f"Active room: {room.replace('_', ' ').title()}.")
 

@@ -247,45 +247,86 @@ class CameraManager:
         device_index: int,
         fps_active: Optional[int],
     ) -> None:
-        """Open a USB webcam via cv2.VideoCapture with retries (DirectShow flakiness)."""
+        """Open a USB webcam via cv2.VideoCapture with retries.
+
+        Per attempt: try DirectShow first, then Media Foundation as a
+        fallback. The two backends use different driver paths, so when
+        DirectShow returns not-opened (e.g. another process has the
+        device, or Windows hasn't released the handle from a prior
+        Jarvis instance), CAP_MSMF often succeeds. Avoiding
+        auto-backend-select intentionally — on Cole's machine that
+        path tries to enumerate his Sound BlasterX G5 as a webcam and
+        hangs ~20s.
+
+        Wait between attempts is exponential-ish (1.5 → 3 → 5s) so a
+        prior process has time to release the device handle on a clean
+        Jarvis restart.
+        """
         assert cv2 is not None
-        attempts = 3
+        backends = [("CAP_DSHOW", cv2.CAP_DSHOW), ("CAP_MSMF", cv2.CAP_MSMF)]
+        between_waits = [1.5, 3.0, 5.0]
+        attempts = len(between_waits)
+
         for attempt in range(1, attempts + 1):
-            logger.info(
-                f"[CameraManager] Connecting to USB device {device_index} for "
-                f"'{room_id}' (attempt {attempt}/{attempts})..."
-            )
-            try:
-                # Explicit DirectShow on Windows — auto-select hangs ~20s on
-                # Cole's Sound BlasterX G5 capture path (it enumerates as a
-                # webcam with no available frames).
-                cap = await asyncio.wait_for(
-                    asyncio.to_thread(cv2.VideoCapture, device_index, cv2.CAP_DSHOW),
-                    timeout=20.0,
+            cap = None
+            for backend_label, backend_const in backends:
+                logger.info(
+                    f"[CameraManager] Connecting to USB device {device_index} for "
+                    f"'{room_id}' (attempt {attempt}/{attempts}, {backend_label})..."
                 )
-                if not cap.isOpened():
-                    self._safe_release(cap)
-                    logger.warning(
-                        f"[CameraManager] Could not open device {device_index} for '{room_id}'"
+                try:
+                    candidate = await asyncio.wait_for(
+                        asyncio.to_thread(cv2.VideoCapture, device_index, backend_const),
+                        timeout=20.0,
                     )
-                else:
-                    if fps_active is not None:
-                        try:
-                            await asyncio.to_thread(
-                                cap.set, cv2.CAP_PROP_FPS, float(fps_active)
-                            )
-                            actual = await asyncio.to_thread(cap.get, cv2.CAP_PROP_FPS)
-                            logger.info(
-                                f"[CameraManager] '{room_id}' requested {fps_active} fps, "
-                                f"driver reports {actual:.1f}"
-                            )
-                        except Exception as e:
-                            logger.debug(
-                                f"[CameraManager] Could not set fps for '{room_id}': {e}"
-                            )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[CameraManager] {backend_label} timed out for device "
+                        f"{device_index}"
+                    )
+                    continue
+                except Exception as e:
+                    logger.warning(
+                        f"[CameraManager] {backend_label} error opening device "
+                        f"{device_index}: {e}"
+                    )
+                    continue
+                if not candidate.isOpened():
+                    self._safe_release(candidate)
+                    logger.warning(
+                        f"[CameraManager] {backend_label} could not open device "
+                        f"{device_index} for '{room_id}'"
+                    )
+                    continue
+                cap = candidate
+                break  # got a working cap
+
+            if cap is not None:
+                # We have an open cap; configure FPS and verify with one read.
+                if fps_active is not None:
+                    try:
+                        await asyncio.to_thread(
+                            cap.set, cv2.CAP_PROP_FPS, float(fps_active)
+                        )
+                        actual = await asyncio.to_thread(cap.get, cv2.CAP_PROP_FPS)
+                        logger.info(
+                            f"[CameraManager] '{room_id}' requested {fps_active} fps, "
+                            f"driver reports {actual:.1f}"
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"[CameraManager] Could not set fps for '{room_id}': {e}"
+                        )
+                try:
                     ok, frame = await asyncio.wait_for(
                         asyncio.to_thread(cap.read), timeout=5.0
                     )
+                except asyncio.TimeoutError:
+                    self._safe_release(cap)
+                    logger.warning(
+                        f"[CameraManager] Read timed out for '{room_id}' after open"
+                    )
+                else:
                     if not ok or frame is None:
                         self._safe_release(cap)
                         logger.warning(
@@ -300,25 +341,23 @@ class CameraManager:
                         self._last_frames[room_id] = frame
                         self._read_locks[room_id] = asyncio.Lock()
                         logger.info(
-                            f"[CameraManager] Opened device {device_index} for '{room_id}'"
+                            f"[CameraManager] Opened device {device_index} for "
+                            f"'{room_id}'"
                         )
                         return
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[CameraManager] Timed out connecting to device {device_index} "
-                    f"for '{room_id}'"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[CameraManager] Error opening device {device_index} for "
-                    f"'{room_id}': {e}"
-                )
 
             if attempt < attempts:
-                await asyncio.sleep(1.5)
+                wait = between_waits[attempt - 1]
+                logger.debug(
+                    f"[CameraManager] Will retry '{room_id}' in {wait:.1f}s "
+                    "(another process may be holding the device)"
+                )
+                await asyncio.sleep(wait)
 
         logger.warning(
-            f"[CameraManager] Gave up on '{room_id}' after {attempts} attempt(s)"
+            f"[CameraManager] Gave up on '{room_id}' after {attempts} attempt(s) "
+            "— check for another app holding the camera (Discord call, browser "
+            "with webcam permission, OBS, Camera app)"
         )
 
     # ── Wyze RTSP path ───────────────────────────────────────────────────────
@@ -682,6 +721,20 @@ class CameraManager:
         # constructor can't get retried in parallel.
         self._next_reopen_attempt[room] = now + self._wyze_reconnect_delay
 
+        # Set the same FFmpeg options as the initial open (stimeout +
+        # analyzeduration + probesize) so the reconnect doesn't fall
+        # back to FFmpeg defaults that take 15-25s on Wyze's bitrate.
+        # transport defaults to tcp; if the room originally used udp we
+        # don't have that here, but TCP-on-reconnect is a safe choice
+        # (slightly slower but more reliable, and the open succeeds).
+        import os as _os
+        prev_opts = _os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+        _os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            "rtsp_transport;tcp"
+            "|stimeout;5000000"
+            "|analyzeduration;500000"
+            "|probesize;100000"
+        )
         try:
             cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
             if cap.isOpened():
@@ -697,6 +750,11 @@ class CameraManager:
                 )
         except Exception as e:
             logger.debug(f"[CameraManager] RTSP reconnect error for '{room}': {e}")
+        finally:
+            if prev_opts is None:
+                _os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+            else:
+                _os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = prev_opts
 
     @staticmethod
     def _safe_release(cap: Any) -> None:

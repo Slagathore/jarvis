@@ -143,3 +143,16 @@ class ActivityDetectionError(JarvisError):
     audio classification model fails, or state fusion receives contradictory signals.
     """
     pass
+
+
+# ── Persona system ───────────────────────────────────────────────────────────
+
+
+class PersonaError(JarvisError):
+    """
+    Raised by PersonaManager when a persona operation can't proceed:
+    unknown persona name, privacy gate blocking activation of a
+    requires_privacy persona while another person is in the room, or
+    config validation failure (e.g., missing 'default' persona).
+    """
+    pass

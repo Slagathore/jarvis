@@ -166,6 +166,37 @@
           <div class="model-installed-list" id="model-installed-list"></div>
         </div>
 
+        <!-- Persona system: visible dropdown + hidden command box -->
+        <div class="card" id="persona-card">
+          <div class="card-label">PERSONA <span class="persona-badge" id="persona-badge"></span></div>
+          <div class="model-row">
+            <span class="dev-label">MODE</span>
+            <select class="dev-select" id="persona-select">
+              <option value="">loading…</option>
+            </select>
+          </div>
+          <!-- Hidden personas (uwu) activate via this command box. The
+               input deliberately has no autocomplete so the activation
+               name doesn't get persisted in browser history. -->
+          <div class="model-row">
+            <input
+              type="text"
+              id="persona-cmd"
+              class="reminder-input"
+              placeholder="Command (lock, unlock, revert, resume, …)"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button class="dev-btn" id="persona-cmd-btn">RUN</button>
+          </div>
+          <div class="persona-status" id="persona-status"></div>
+          <div class="persona-resume" id="persona-resume" hidden>
+            <span id="persona-resume-text"></span>
+            <button class="dev-btn" id="persona-resume-yes">RESUME</button>
+            <button class="dev-btn" id="persona-resume-no">SKIP</button>
+          </div>
+        </div>
+
         <!-- Computer / Self-edit kill switches -->
         <div class="card" id="control-card">
           <div class="card-label">JARVIS CAPABILITIES</div>

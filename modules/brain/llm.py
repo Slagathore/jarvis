@@ -79,6 +79,17 @@ class OllamaLLM:
         # of the boot path for users who never use the direct API.
         self._gemini_direct: Optional[Any] = None
 
+        # Set of model names that need think=False forced for tool-call
+        # round-trips. Populated when chat_with_tools observes the
+        # Gemini-3-via-Ollama-cloud "missing thought_signature" 400 — once
+        # we've hit that for a model, future tool turns skip the bad
+        # request entirely and go straight to think=False. Plain chat()
+        # calls (no tools, single round-trip) are unaffected — those work
+        # fine with thinking on.
+        # In-memory only. A restart re-learns; that's fine because the set
+        # is tiny and the cost of one re-discovery is one extra round-trip.
+        self._tools_force_no_think: set[str] = set()
+
     @staticmethod
     def _is_gemini_direct(model_name: str) -> bool:
         """True for models routed through Google's direct API (not via Ollama)."""
@@ -298,8 +309,18 @@ class OllamaLLM:
                 }
                 if options:
                     chat_kwargs["options"] = options
-                if think is not None:
-                    chat_kwargs["think"] = think
+                # Effective think value: per-model setting unless we've
+                # learned this model needs think=False for tool calls
+                # (Gemini 3 thinking models via Ollama-cloud lose the
+                # thought_signature on round-trip and 400 the next call).
+                # Learned override is in-memory only — a restart re-learns
+                # via one wasted round-trip, fine for a million-context
+                # session that's already paid for.
+                effective_think = think
+                if active_model in self._tools_force_no_think:
+                    effective_think = False
+                if effective_think is not None:
+                    chat_kwargs["think"] = effective_think
                 try:
                     response = await asyncio.wait_for(
                         self._client.chat(**chat_kwargs),
@@ -308,7 +329,43 @@ class OllamaLLM:
                 except asyncio.TimeoutError:
                     raise LLMError(f"Ollama chat (tools) timed out after {self._timeout}s")
                 except Exception as e:
-                    raise LLMError(f"Ollama chat (tools) failed: {e}") from e
+                    # Workaround: Gemini 3 thinking models via Ollama-cloud
+                    # 400 with "thought_signature" on tool-call round-trips
+                    # because Ollama-cloud doesn't preserve the signature
+                    # field. Detect that specific error, mark this model
+                    # as needing think=False for future tool turns, and
+                    # retry this turn ONCE with the workaround applied.
+                    err_text = str(e).lower()
+                    looks_like_signature_400 = (
+                        "thought_signature" in err_text
+                        and "400" in err_text
+                        and effective_think is not False
+                    )
+                    if looks_like_signature_400:
+                        logger.warning(
+                            f"[LLM] '{active_model}' tripped Gemini-3 "
+                            "thought_signature 400 — caching think=False "
+                            "for this model's tool-call rounds and retrying"
+                        )
+                        self._tools_force_no_think.add(active_model)
+                        chat_kwargs["think"] = False
+                        try:
+                            response = await asyncio.wait_for(
+                                self._client.chat(**chat_kwargs),
+                                timeout=self._timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            raise LLMError(
+                                f"Ollama chat (tools) timed out after {self._timeout}s "
+                                "(after thought_signature retry)"
+                            )
+                        except Exception as e2:
+                            raise LLMError(
+                                f"Ollama chat (tools) failed even after "
+                                f"think=False retry: {e2}"
+                            ) from e2
+                    else:
+                        raise LLMError(f"Ollama chat (tools) failed: {e}") from e
 
                 message = response.get("message", {}) or {}
                 tool_calls = message.get("tool_calls") or []

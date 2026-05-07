@@ -121,6 +121,7 @@ from modules.vision.posture_analyzer import PostureAnalyzer
 from modules.vision.scene_analyzer import SceneAnalyzer
 from modules.vision.wyze_cam_control import WyzeCamControl
 from core.room_settings import RoomSettings
+from modules.brain.persona_manager import PersonaManager
 from modules.voice.audio_focus import AudioFocus
 from modules.voice.intents import parse_dnd
 from modules.voice.mic_manager import MicManager
@@ -182,6 +183,12 @@ class Orchestrator:
         # video.type == wyze_rtsp get an instance. Reuses the SSH
         # credentials from the room's wyze_ssh_aplay speaker config.
         self.wyze_cam_controls: dict[str, WyzeCamControl] = {}
+        # Persona system — owns the active system-prompt bundle + the
+        # auto-revert state machine (person-entry, away timeout, phone
+        # call). Built in _init_brain after the prompt builder so we
+        # can wire them together. Optional for legacy configs without
+        # a personas section.
+        self.persona: Optional[PersonaManager] = None
         self.speaker_id: Optional[SpeakerIdentifier] = None
         # When set, the next wake-recording captured audio is enrolled as a
         # voice sample for this person (instead of being run through STT/LLM).
@@ -414,6 +421,27 @@ class Orchestrator:
         self.llm = OllamaLLM(self.config)
         self.sessions = SessionManager(self.config)
         self.prompts = PromptBuilder(config=self.config)
+        # Persona system. Built from typed config produced by
+        # core.config.expand_and_validate(). Wired into PromptBuilder so
+        # every LLM call uses the active persona's composed prompt
+        # (overlay + persona-specific text). When the personas section
+        # is missing from config (legacy), persona stays None and
+        # PromptBuilder falls back to ollama.system_prompt.
+        typed_personas = self.config.get("_typed_personas")
+        if typed_personas:
+            self.persona = PersonaManager(
+                personas=typed_personas,
+                overlay=self.config.get("_persona_overlay", ""),
+                revert_cfg=self.config["_persona_revert_cfg"],
+                broadcast=self._broadcast,
+            )
+            self.prompts.attach_persona_manager(self.persona)
+            logger.info(
+                f"[Init] PersonaManager active "
+                f"(default persona = '{self.persona.current_name()}')"
+            )
+        else:
+            logger.info("[Init] No personas section in config — persona system disabled")
         # Load .env so GEMINI_API_KEY / ANTHROPIC_API_KEY are visible.
         try:
             from dotenv import load_dotenv
@@ -1937,8 +1965,28 @@ class Orchestrator:
                     logger.debug(f"[Context] Signals this cycle: {signal_summary}")
 
                     # BUG FIX: StateFusion.fuse() is async def — must be awaited
+                    prev_activity = self._current_state.activity
                     new_state = await self.state_fusion.fuse(signals, room="office")
                     self._current_state = new_state
+
+                    # Persona auto-revert hook: feeds the away-timeout
+                    # logic. Only fires on transitions (away → not-away
+                    # cancels the timer; not-away → away starts it). The
+                    # PersonaManager itself decides whether to act based
+                    # on the active persona's requires_privacy flag.
+                    if self.persona is not None and prev_activity != new_state.activity:
+                        try:
+                            await self.persona.notify_state_changed(new_state.activity)
+                        except Exception as e:
+                            logger.debug(f"[Persona] state notify failed: {e}")
+
+                    # Persona phone-call detection — derived from the
+                    # current PC process. We treat the room-only PC as
+                    # the source of truth (the only place a Cole-driven
+                    # call originates today). Window-title keywords add
+                    # specificity for ambiguous processes like Slack.
+                    if self.persona is not None:
+                        await self._persona_check_phone_call(signals)
 
                     await self._broadcast({
                         "type": "state_update",
@@ -2056,6 +2104,36 @@ class Orchestrator:
                                         self._active_user_room = room_id
                             except Exception as e:
                                 logger.debug(f"[Identity/face] identify failed: {e}")
+
+                        # Persona system hooks. Two updates per pass:
+                        #   1. Room occupancy snapshot — feeds the activation
+                        #      privacy gate ("can I activate uwu right now?").
+                        #   2. Face-identity notification — triggers the hard
+                        #      person-entry revert when a non-Cole face shows
+                        #      up in Cole's active room while a private
+                        #      persona is on.
+                        # person_present is YOLO's "any human in frame" so
+                        # it doubles as a count proxy until we have
+                        # multi-face counting wired (see project_known_issues).
+                        if self.persona is not None:
+                            self.persona.notify_room_occupancy(
+                                room=room_id,
+                                person_count=1 if person_present else 0,
+                                cole_present=(recognized_name == "Cole"),
+                            )
+                            if person_present:
+                                # Pass identity even if None — persona_manager
+                                # treats None as "unknown face", which is
+                                # treated as not-Cole for safety.
+                                try:
+                                    await self.persona.notify_face_identified(
+                                        room=room_id,
+                                        identity=recognized_name,
+                                    )
+                                except Exception as e:
+                                    logger.debug(
+                                        f"[Persona] face notify failed: {e}"
+                                    )
 
                         # Drift verify (passive): if a recent wake matched
                         # someone via voice, opportunistically save the face
@@ -2612,6 +2690,54 @@ class Orchestrator:
             )
         return sent
 
+    # Tracks whether we last reported "phone call active" to PersonaManager.
+    # Used to dedup the start/end notifications — PersonaManager itself
+    # also dedupes but doing it here saves the call cost when state didn't change.
+    _persona_call_seen: bool = False
+
+    async def _persona_check_phone_call(self, signals: dict) -> None:
+        """Inspect the latest PC signal for an active phone-call process
+        and notify PersonaManager on transitions. The detection rule:
+            - active process matches one of persona_revert.call_processes
+            - AND (the process is unconditional like zoom/teams, OR the
+              window title contains one of call_window_keywords)
+        Slack and Discord need the title check because they're often open
+        without being in a call. Zoom/Teams are usually call-only.
+        """
+        if self.persona is None:
+            return
+        revert_cfg = self.config.get("_persona_revert_cfg")
+        if revert_cfg is None:
+            return
+        call_processes = {p.lower() for p in revert_cfg.call_processes}
+        title_keywords = [k.lower() for k in revert_cfg.call_window_keywords]
+
+        pc_sig = signals.get("pc") if isinstance(signals.get("pc"), dict) else {}
+        proc = str(pc_sig.get("exe", "")).lower() if isinstance(pc_sig, dict) else ""
+        title = str(pc_sig.get("window_title", "")).lower() if isinstance(pc_sig, dict) else ""
+
+        in_call = False
+        if proc in call_processes:
+            # zoom/teams = unconditional call. slack/discord need a title hint.
+            unconditional_call_apps = {"zoom.exe", "teams.exe"}
+            if proc in unconditional_call_apps:
+                in_call = True
+            elif title and any(kw in title for kw in title_keywords):
+                in_call = True
+
+        if in_call and not self._persona_call_seen:
+            self._persona_call_seen = True
+            try:
+                await self.persona.notify_phone_call_started()
+            except Exception as e:
+                logger.debug(f"[Persona] phone-start notify failed: {e}")
+        elif not in_call and self._persona_call_seen:
+            self._persona_call_seen = False
+            try:
+                await self.persona.notify_phone_call_ended()
+            except Exception as e:
+                logger.debug(f"[Persona] phone-end notify failed: {e}")
+
     @staticmethod
     def _extract_wyze_host(url: str) -> Optional[str]:
         """Pull the host out of an rtsp://user:pass@host:port/path URL.
@@ -2934,6 +3060,15 @@ class Orchestrator:
         try:
             if room is None:
                 room = self._active_user_room
+            # Output leak filter — when persona system is wired, scrub
+            # any hidden-persona name mentions before they reach TTS or
+            # the dashboard log. The filter is a no-op when the active
+            # persona is itself hidden (Cole's already in on it) or
+            # when Cole is reliably alone. Costs ~one regex.subn per
+            # utterance.
+            if self.persona is not None:
+                text = self.persona.filter_output(text)
+
             logger.info(f"[TTS] [{priority}] (→{room}) {text!r}")
 
             if not self.tts:
@@ -3245,6 +3380,8 @@ class Orchestrator:
                 self.dashboard.register_room_settings(self.room_settings)
             if self.wyze_cam_controls and hasattr(self.dashboard, "register_wyze_cam_controls"):
                 self.dashboard.register_wyze_cam_controls(self.wyze_cam_controls)
+            if self.persona is not None and hasattr(self.dashboard, "register_persona"):
+                self.dashboard.register_persona(self.persona)
             if self.reminders_store:
                 self.dashboard.register_reminders_store(self.reminders_store)
             if self.calendar:

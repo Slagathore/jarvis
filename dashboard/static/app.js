@@ -2414,6 +2414,153 @@ function _wireTalkback(room) {
   btn.onpointercancel = () => { if (mediaStream) stop(); };
 }
 
+// ── PERSONA SYSTEM (dropdown + command box + status badge) ────────────────
+//
+// Hidden personas (uwu) intentionally do NOT appear in the dropdown — the
+// /api/personas endpoint filters them out server-side. The only way to
+// activate one is to type the name into the command input. That's the
+// designed safety property; don't add an "advanced" toggle that lists them.
+
+async function loadPersonas() {
+  const sel = document.getElementById("persona-select");
+  const badge = document.getElementById("persona-badge");
+  const status = document.getElementById("persona-status");
+  if (!sel) return;
+  let data;
+  try {
+    const r = await fetch("/api/personas");
+    if (!r.ok) {
+      sel.innerHTML = `<option>persona system not configured</option>`;
+      sel.disabled = true;
+      return;
+    }
+    data = await r.json();
+  } catch (e) {
+    return;
+  }
+  const personas = data.personas || [];
+  const active = data.active || "";
+  sel.disabled = false;
+  sel.innerHTML = personas.map((p) => {
+    const lock = p.requires_privacy ? " 🔒" : "";
+    return `<option value="${escapeHtml(p.name)}" ${p.name === active ? "selected" : ""}>${escapeHtml(p.display)}${lock}</option>`;
+  }).join("");
+  // If the active persona is hidden (e.g. uwu), it WON'T appear in the
+  // dropdown — synthesize a transient option so the user sees the truth.
+  // Marked italic so it's visually distinct from configured options.
+  if (active && !personas.some((p) => p.name === active)) {
+    const opt = document.createElement("option");
+    opt.value = active;
+    opt.textContent = `${active} (hidden)`;
+    opt.selected = true;
+    opt.style.fontStyle = "italic";
+    sel.appendChild(opt);
+  }
+  if (badge) {
+    const lockIcon = data.locked ? " 🔒" : "";
+    badge.textContent = active ? `${active}${lockIcon}` : "";
+  }
+  if (status) status.textContent = "";
+  // Refresh resume offer state alongside
+  await refreshPersonaCurrent();
+}
+
+async function refreshPersonaCurrent() {
+  try {
+    const r = await fetch("/api/persona/current");
+    if (!r.ok) return;
+    const data = await r.json();
+    const resumeEl = document.getElementById("persona-resume");
+    const resumeText = document.getElementById("persona-resume-text");
+    if (data.pending_resume && resumeEl) {
+      resumeEl.hidden = false;
+      if (resumeText) {
+        resumeText.textContent = `Resume '${data.pending_resume}'?`;
+      }
+    } else if (resumeEl) {
+      resumeEl.hidden = true;
+    }
+  } catch {}
+}
+
+const personaSel = document.getElementById("persona-select");
+if (personaSel) {
+  personaSel.addEventListener("change", async (e) => {
+    const name = e.target.value;
+    if (!name) return;
+    const r = await fetch("/api/persona/set", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const status = document.getElementById("persona-status");
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      if (status) status.textContent = `✗ ${j.detail || r.status}`;
+    } else {
+      if (status) status.textContent = `✓ ${name}`;
+    }
+    await loadPersonas();
+  });
+}
+
+const personaCmdBtn = document.getElementById("persona-cmd-btn");
+const personaCmd = document.getElementById("persona-cmd");
+async function runPersonaCommand() {
+  if (!personaCmd) return;
+  const text = (personaCmd.value || "").trim();
+  if (!text) return;
+  const status = document.getElementById("persona-status");
+  const r = await fetch("/api/persona/command", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    if (status) status.textContent = `✗ ${j.detail || r.status}`;
+  } else {
+    const j = await r.json();
+    if (status) status.textContent = `✓ active: ${j.active}${j.locked ? " 🔒" : ""}`;
+    personaCmd.value = "";  // clear so the typed name doesn't linger on screen
+  }
+  await loadPersonas();
+}
+if (personaCmdBtn) personaCmdBtn.addEventListener("click", runPersonaCommand);
+if (personaCmd) {
+  personaCmd.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); runPersonaCommand(); }
+  });
+}
+
+const personaResumeYes = document.getElementById("persona-resume-yes");
+const personaResumeNo = document.getElementById("persona-resume-no");
+if (personaResumeYes) {
+  personaResumeYes.addEventListener("click", async () => {
+    await fetch("/api/persona/command", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "resume" }),
+    });
+    await loadPersonas();
+  });
+}
+if (personaResumeNo) {
+  personaResumeNo.addEventListener("click", async () => {
+    // Clearing pending_resume is a side effect of any non-resume action.
+    // Simplest "decline" = revert to default explicitly.
+    await fetch("/api/persona/command", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "revert" }),
+    });
+    await loadPersonas();
+  });
+}
+
+// Re-fetch personas on connection + every 10s so other sessions
+// (auto-revert, dashboard tabs) stay in sync.
+loadPersonas();
+setInterval(loadPersonas, 10000);
+
 // ── Init ──────────────────────────────────────────────────────────────────
 
 connect();

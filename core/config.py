@@ -41,8 +41,10 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 from typing import Annotated, Any, Literal, Optional, Union
 
+from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
 from core.exceptions import ConfigError
@@ -235,6 +237,100 @@ class RoomConfig(BaseModel):
     fps_idle: Optional[int] = 1
 
 
+# ── Persona system ───────────────────────────────────────────────────────────
+
+
+class PersonaConfig(BaseModel):
+    """One persona = one system-prompt + behavior knob bundle. The active
+    LLM model and TTS voice are NOT per-persona — both are sourced from
+    the global config. Switching personas is purely a prompt-and-state
+    change so it doesn't churn the LLM client or TTS subsystem.
+    """
+    system_prompt: str
+    content_tier: Literal["standard", "unfiltered"] = "standard"
+    response_style: str = "terse"
+    # When False, this persona is hidden from the dashboard dropdown.
+    # Activation still works via the command box — the only safety
+    # property of "hidden" is that the user has to know the persona's
+    # name, not that the network can't reach it.
+    visible_in_ui: bool = True
+    # When True, PersonaManager refuses to activate this persona unless
+    # Cole is alone in his current room. Bypassed only by force=True.
+    requires_privacy: bool = False
+    # Optional pretty name for the dashboard dropdown. Defaults to the
+    # config key (e.g. "default", "uwu") when not set.
+    display_name: Optional[str] = None
+
+
+class PersonaRevertCfg(BaseModel):
+    """Knobs for the auto-revert behavior in PersonaManager. Defaults
+    match the bootstrap doc and Cole's stated preferences.
+    """
+    away_timeout_s: int = 1800        # 30 min before away triggers revert
+    phone_resume_window_s: int = 30   # how long to wait for "yes" after offering resume
+    # Process names whose presence indicates an active phone/voice call.
+    # Kept separate from process_activity_map so we can tune call detection
+    # without altering activity classification.
+    call_processes: list[str] = Field(default_factory=lambda: [
+        "zoom.exe", "teams.exe", "slack.exe", "discord.exe",
+    ])
+    call_window_keywords: list[str] = Field(default_factory=lambda: [
+        "Meeting", "Call", "Huddle",
+    ])
+
+
+def validate_personas(config: dict) -> tuple[dict[str, PersonaConfig], str, PersonaRevertCfg]:
+    """Validate the personas / persona_overlay / persona_revert config.
+    Returns (personas_dict, overlay_str, revert_cfg). Raises ConfigError
+    on missing 'default' or any per-persona validation failure.
+
+    The 'default' persona is mandatory because every revert path (manual,
+    person-entry, away timeout, phone start) lands on it. A missing
+    'default' would make those paths NoneType-crash at runtime; failing
+    fast at boot is infinitely friendlier.
+    """
+    raw = config.get("personas", {})
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"config.yaml: 'personas' must be a mapping, got {type(raw).__name__}"
+        )
+    out: dict[str, PersonaConfig] = {}
+    for name, raw_p in raw.items():
+        if not isinstance(raw_p, dict):
+            raise ConfigError(f"config.yaml: persona '{name}' must be a mapping")
+        try:
+            out[name] = PersonaConfig.model_validate(raw_p)
+        except ValidationError as e:
+            first = e.errors()[0]
+            loc = ".".join(str(p) for p in first.get("loc", ()))
+            msg = first.get("msg", "validation failed")
+            raise ConfigError(
+                f"config.yaml: persona '{name}' failed validation at "
+                f"'{loc}': {msg}"
+            ) from e
+    if "default" not in out:
+        raise ConfigError(
+            "config.yaml: 'personas.default' is required — every revert path "
+            "lands on the default persona, so it can't be missing"
+        )
+    overlay = config.get("persona_overlay", "")
+    if not isinstance(overlay, str):
+        raise ConfigError("config.yaml: 'persona_overlay' must be a string")
+    revert_raw = config.get("persona_revert", {}) or {}
+    if not isinstance(revert_raw, dict):
+        raise ConfigError("config.yaml: 'persona_revert' must be a mapping")
+    try:
+        revert_cfg = PersonaRevertCfg.model_validate(revert_raw)
+    except ValidationError as e:
+        first = e.errors()[0]
+        loc = ".".join(str(p) for p in first.get("loc", ()))
+        raise ConfigError(
+            f"config.yaml: persona_revert validation failed at '{loc}': "
+            f"{first.get('msg', '')}"
+        ) from e
+    return out, overlay.strip(), revert_cfg
+
+
 # ── Public entry points ──────────────────────────────────────────────────────
 
 
@@ -273,10 +369,93 @@ def validate_rooms(config: dict) -> list[RoomConfig]:
     return validated
 
 
+def load_personas_overlay(overlay_path: Path) -> dict[str, Any]:
+    """Read a private personas file and return its `personas` dict (or
+    empty when missing/unparseable). The overlay file is gitignored;
+    it's the user's escape valve for personas they don't want in the
+    public config.
+
+    Format: a YAML file with a top-level `personas:` key. Anything else
+    in the file is ignored (so users can throw notes-to-self in there
+    too without breaking the loader).
+
+    Failure modes are non-fatal — a bad overlay logs a warning and
+    boots without the private personas. The default + focus personas
+    in config.yaml still work, so a syntax error in the overlay
+    degrades the feature, not the whole system.
+    """
+    if not overlay_path.exists():
+        return {}
+    try:
+        import yaml as _yaml
+        with overlay_path.open("r", encoding="utf-8") as f:
+            data = _yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning(
+            f"[Config] Persona overlay {overlay_path} unreadable ({e}); "
+            "private personas not loaded"
+        )
+        return {}
+    if not isinstance(data, dict):
+        logger.warning(
+            f"[Config] Persona overlay {overlay_path} root is not a mapping; ignoring"
+        )
+        return {}
+    overlay_personas = data.get("personas", {})
+    if not isinstance(overlay_personas, dict):
+        logger.warning(
+            f"[Config] Persona overlay {overlay_path}: 'personas' must be a mapping"
+        )
+        return {}
+    if overlay_personas:
+        logger.info(
+            f"[Config] Loaded {len(overlay_personas)} persona(s) from "
+            f"{overlay_path}: {sorted(overlay_personas.keys())}"
+        )
+    return overlay_personas
+
+
 def expand_and_validate(config: dict) -> tuple[dict, list[RoomConfig]]:
-    """One-call helper used by main.py at boot: expands env vars in-place and
-    returns both the mutated dict and the typed room list.
+    """One-call helper used by main.py at boot: expands env vars in-place,
+    validates rooms AND personas, and returns the mutated dict + typed
+    room list. Persona validation is non-blocking (logs and skips) when
+    the personas section is absent — keeps existing configs without a
+    persona section booting cleanly.
+
+    Persona overlay: when `personas_overlay_file` is set, load that
+    file's personas dict and merge it on top of the in-config personas.
+    Overlay entries WIN on key collision — that's the intended override
+    semantic (you can locally tweak a public persona without editing
+    the shared config).
     """
     expanded = expand_env_vars(config)
     rooms = validate_rooms(expanded)
+    # Validate personas if present — stash typed result on the dict so
+    # PersonaManager can pick it up without re-parsing. Missing personas
+    # section is OK on legacy configs; PersonaManager will create a
+    # synthetic default-only setup at construct time.
+    if "personas" in expanded or expanded.get("personas_overlay_file"):
+        # Merge the overlay BEFORE validation so PersonaConfig validation
+        # runs against the final composed dict — surfaces typos in the
+        # overlay file with the same nice error messages.
+        overlay_path_str = expanded.get("personas_overlay_file")
+        if overlay_path_str:
+            from pathlib import Path as _Path
+            overlay_path = _Path(overlay_path_str)
+            if not overlay_path.is_absolute():
+                # Resolve relative to the project root (parent of core/)
+                overlay_path = _Path(__file__).resolve().parents[1] / overlay_path
+            overlay_personas = load_personas_overlay(overlay_path)
+            if overlay_personas:
+                # Deep-ish merge: per-persona dicts get replaced wholesale
+                # rather than merged field-by-field. Keeps the mental model
+                # simple — "the overlay defines this whole persona" vs
+                # "the overlay tweaks one field of this persona."
+                merged = dict(expanded.get("personas", {}))
+                merged.update(overlay_personas)
+                expanded["personas"] = merged
+        personas, overlay, revert_cfg = validate_personas(expanded)
+        expanded["_typed_personas"] = personas
+        expanded["_persona_overlay"] = overlay
+        expanded["_persona_revert_cfg"] = revert_cfg
     return expanded, rooms
