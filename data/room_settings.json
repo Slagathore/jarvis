@@ -1,6 +1,6 @@
 {
   "living_room": {
-    "flip_h": true,
-    "flip_v": true
+    "flip_h": false,
+    "flip_v": false
   }
 }
