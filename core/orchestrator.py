@@ -138,6 +138,16 @@ from modules.voice.wake_word import WakeWordDetector
 from modules.voice.wake_source import WakeSourceManager
 
 
+# Per-room echo suppression: how long after Jarvis finishes speaking
+# in a room we ignore that room's wake events. Tunes the trade-off
+# between "Jarvis hears himself and re-wakes" (too short) and "Cole
+# can't immediately follow up after a reply" (too long). 1.5s is
+# enough for the speaker tail + room reverb to settle on the cam mic
+# without noticeably gating real follow-ups (the in-conversation
+# follow-up listener is already open separately for that case).
+_ECHO_SUPPRESSION_TAIL_S: float = 1.5
+
+
 class Orchestrator:
     def __init__(self, config: dict):
         self.config = config
@@ -266,6 +276,19 @@ class Orchestrator:
         self._active_user_room: str = "office"
         self._wake_lock = asyncio.Lock()
         self._audio_io_active: bool = False
+        # Per-room echo suppression. After Jarvis speaks into a room,
+        # that room's mic will hear Jarvis's own voice and may fire a
+        # wake. We record the wall-clock time we last finished speaking
+        # in each room and ignore wakes from that room until the
+        # window expires. Window = TTS duration + ECHO_SUPPRESSION_TAIL_S
+        # (set when speech starts; expiry stamped when it ends).
+        self._room_speech_until: dict[str, float] = {}
+        # Unified scene snapshot per room. Updated by _vision_loop after
+        # each per-room pass; consumed by build_scene_extras() for LLM
+        # prompts and by the dashboard for the live scene panel. Keys
+        # are room ids; each value is a dict of the most recent
+        # observations (lights, person, posture, last description, ts).
+        self._scene_state: dict[str, dict] = {}
         # Wake-event coalescer: when multiple mics hear the same wake word
         # at nearly the same time (Cole says "Hey Jarvis" between the
         # bedroom and kitchen cams), each MicWakeRunner fires its own
@@ -697,6 +720,20 @@ class Orchestrator:
         a vote in, short enough that the user doesn't perceive a delay
         between saying the wake word and the chime.
         """
+        # Per-room echo suppression: drop wakes from a room we just
+        # spoke into. The Wyze/ESP path puts audio out the cam speaker,
+        # so the SAME cam's mic hears Jarvis and tries to wake on him.
+        room = event.get("room")
+        if room is not None:
+            import time as _time
+            until = self._room_speech_until.get(room, 0.0)
+            if _time.monotonic() < until:
+                logger.debug(
+                    f"[Wake] echo-suppressed: '{room}' is in post-speech "
+                    f"quiet window"
+                )
+                return
+
         self._pending_wakes.append(event)
         if self._wake_window_task is None or self._wake_window_task.done():
             wake_cfg = self.config.get("voice", {}).get("wake_word", {}) or {}
@@ -761,6 +798,11 @@ class Orchestrator:
         # Wake event = strong presence signal. Update the active room so
         # downstream proactive speech follows Cole.
         self._active_user_room = room
+        # Wake = whoever spoke is awake. We don't yet know who (voice ID
+        # happens after STT), so for now clear everyone in this room.
+        # The post-identify path below will be more surgical.
+        if self.sleep_tracker is not None:
+            self.sleep_tracker.record_activity(room=room, signal="wake-word")
 
         # Check interruptibility before responding
         # Guard self.interruptibility (Optional) before member access
@@ -927,6 +969,15 @@ class Orchestrator:
                             f"(sim={match.similarity:.2f}){ambig}"
                         )
                         self._last_wake_audio = audio_data
+                        # Now we know who spoke — clear their sleep
+                        # state across all rooms (they may have an
+                        # entry in another cam from earlier).
+                        if self.sleep_tracker is not None:
+                            self.sleep_tracker.record_activity(
+                                person_id=match.person_id,
+                                person_name=match.name,
+                                signal="voice-id",
+                            )
                     else:
                         logger.debug("[Identity/voice] no match — sample queued in pending")
                 except Exception as e:
@@ -1001,6 +1052,19 @@ class Orchestrator:
 
         # Build activity-history context (predicted remaining + typical-now)
         extras: dict = {}
+
+        # Unified scene snapshot — gives the LLM per-room hardware
+        # capability + presence + sleep-state awareness in one block, so
+        # it can reason about "is anyone in the bedroom?", "who's
+        # napping?", "is the kitchen mic actually a thing here?" without
+        # us inventing a tool call for each.
+        try:
+            scene_extra = self.build_scene_extras()
+            if scene_extra:
+                extras["scene"] = scene_extra
+        except Exception as e:
+            logger.debug(f"[Scene] build_scene_extras failed: {e}")
+
         if self.activity_history is not None and self._current_state is not None:
             try:
                 blurb = await self.activity_history.summary_for_prompt(
@@ -1905,38 +1969,55 @@ class Orchestrator:
 
                 if self.posture and self.cameras:
                     rooms = self.cameras.get_available_rooms()
-                    # Posture / sleep observations come from the camera pointed at Cole's
-                    # desk (the USB webcam), not the ESP32 node camera which may be aimed
-                    # elsewhere in the room.
+                    # Posture surfaced as context for the active room. The
+                    # sleep tracker is now updated per-room from
+                    # _vision_loop (with identity attached), so we don't
+                    # duplicate that work here. We just ask it for the
+                    # current active room's signal.
                     if "office" in rooms:
                         frame = await self.cameras.capture_frame_async("office")
                         if frame is not None:
                             posture_result = await self.posture.analyze_async(frame)
-                            # Posture is context-only — sitting/standing/lying
-                            # isn't itself an activity, so we surface it via
-                            # state.context for the LLM/dashboard but don't
-                            # vote on activity. Sleep tracker consumes posture
-                            # directly and emits the actual sleep activity.
                             signals["posture"] = {
                                 "context": {"posture": posture_result},
                                 "confidence": 0.7 if posture_result != "unknown" else 0.1,
                             }
-                            # Update sleep tracker
-                            sleep_tracker = self.sleep_tracker
-                            if sleep_tracker is not None:
-                                lights_on = (
-                                    self.light_detector.last_state("office")
-                                    if self.light_detector
-                                    else None
-                                )
-                                sleep_tracker.update(
-                                    posture=posture_result,
-                                    lights_on=lights_on,
-                                    room="office",
-                                )
-                                sleep_signal = sleep_tracker.get_sleep_signal()
-                                if sleep_signal:
-                                    signals["sleep"] = sleep_signal
+
+                # Pull the active room's per-person sleep signal — a
+                # napper here means the active state should reflect
+                # 'napping'. Other rooms' sleepers don't show up here;
+                # they're respected at the speech-gating layer instead.
+                sleep_tracker = self.sleep_tracker
+                if sleep_tracker is not None:
+                    sleep_signal = sleep_tracker.get_room_sleep_signal(
+                        self._active_user_room
+                    )
+                    if sleep_signal:
+                        signals["sleep"] = sleep_signal
+
+                # PC activity is Cole's awake signal — clear his sleep
+                # state in any room. Don't touch other people.
+                if signals.get("pc") and sleep_tracker is not None:
+                    sleep_tracker.record_activity(
+                        person_name="Cole", signal="pc-active"
+                    )
+
+                # Audio classifier voice in the active room = someone is
+                # talking there → wake whoever was sleeping in that
+                # room. We don't have identity on this signal, so it
+                # clears all sleepers in the room (room scope only).
+                audio_sig = signals.get("audio") or {}
+                if (
+                    isinstance(audio_sig, dict)
+                    and sleep_tracker is not None
+                    and str(audio_sig.get("activity", "")).lower() in {
+                        "speech", "speech, female", "speech, male",
+                        "conversation", "narration, monologue",
+                    }
+                ):
+                    sleep_tracker.record_activity(
+                        room=self._active_user_room, signal="voice-detected"
+                    )
 
                 # Track activity transitions for predicted-duration / routine learning
                 if (
@@ -2293,6 +2374,25 @@ class Orchestrator:
                             "description": last_desc,
                         })
 
+                        # Refresh the unified scene cache for this room.
+                        # build_scene_extras() and the dashboard's scene
+                        # panel read from here on demand.
+                        scene_posture: Optional[str] = None
+                        if isinstance(posture_result, dict):
+                            scene_posture = posture_result.get("posture")
+                        elif isinstance(posture_result, str):
+                            scene_posture = posture_result
+                        self._scene_state[room_id] = {
+                            "lights_on": lights_on,
+                            "person_present": person_present,
+                            "person_name": recognized_name,
+                            "person_id": recognized_pid,
+                            "posture": scene_posture,
+                            "objects": object_summary,
+                            "description": last_desc,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }
+
                         # Pass vision signal to state fusion — state_fusion still
                         # consumes posture as a string label, so unwrap from the
                         # rich dict if that's what we got.
@@ -2307,6 +2407,23 @@ class Orchestrator:
                                 "person_present": person_present,
                                 "posture": posture_label,
                             })
+
+                        # Per-person sleep tracking. Posture+identity is
+                        # only meaningful when YOLO actually saw someone
+                        # in this room; otherwise we'd accumulate ghost
+                        # state from a frame with no human in it. The
+                        # tracker also handles 'unknown' posture cleanly
+                        # (won't move timers), so brief blind moments
+                        # don't reset a confirmed nap — that's the
+                        # door-disappearance rule in action.
+                        if self.sleep_tracker is not None and person_present:
+                            self.sleep_tracker.update(
+                                room=room_id,
+                                posture=posture_label,
+                                lights_on=lights_on,
+                                person_id=recognized_pid,
+                                person_name=recognized_name,
+                            )
 
                     except Exception as room_err:
                         logger.warning(f"[Vision] Room {room_id} error: {room_err}")
@@ -2544,6 +2661,19 @@ class Orchestrator:
                     "health": health,
                 })
 
+                # Push the unified scene snapshot on the same cadence —
+                # cheaper than a separate loop, and 30s is plenty for
+                # the dashboard's room-overview panel since real-time
+                # changes still come through the per-event 'vision'
+                # broadcast.
+                try:
+                    await self._broadcast({
+                        "type": "scene_snapshot",
+                        "scene": self.get_scene_snapshot(),
+                    })
+                except Exception as e:
+                    logger.debug(f"[Scene] broadcast failed: {e}")
+
             except Exception as e:
                 logger.error(f"[Health] Broadcast error: {e}")
 
@@ -2772,6 +2902,136 @@ class Orchestrator:
                 return "node"
             return "local"
         return "local"
+
+    # ── Unified scene snapshot ─────────────────────────────────────────────
+
+    def get_scene_snapshot(self) -> dict:
+        """Build a single dict describing the current state of the house:
+        per-room hardware capabilities (mic / speaker / cam), latest
+        observations (presence, posture, lights, last description),
+        per-person sleep state, and the active room. Used by the LLM
+        prompt and the dashboard's scene panel.
+
+        Pure function over current state — no awaits, no I/O.
+        """
+        rooms_out: dict[str, dict] = {}
+        for room_cfg in self.config.get("rooms", []):
+            room_id = str(room_cfg.get("id", "unknown"))
+            mic_cfg = room_cfg.get("mic") or {}
+            spk_cfg = room_cfg.get("speaker") or {}
+            vid_cfg = room_cfg.get("video") or {}
+            mic_type = mic_cfg.get("type") if isinstance(mic_cfg, dict) else None
+            spk_type = spk_cfg.get("type") if isinstance(spk_cfg, dict) else None
+            vid_type = vid_cfg.get("type") if isinstance(vid_cfg, dict) else None
+
+            # Local PC = the only path with cross-app audio ducking.
+            # Cam-side speakers (wyze_ssh, esp32) play in isolation.
+            local_pc_speaker = spk_type == "usb_device_spk"
+
+            obs = self._scene_state.get(room_id, {})
+            sleepers: list[dict] = []
+            if self.sleep_tracker is not None:
+                sleepers = self.sleep_tracker.get_sleepers_in(room_id)
+
+            # Per-room mute / volume from RoomSettings
+            tweaks: dict = {}
+            if self.room_settings is not None:
+                try:
+                    tweaks = self.room_settings.get(room_id) or {}
+                except Exception:
+                    tweaks = {}
+
+            rooms_out[room_id] = {
+                "id": room_id,
+                "display_name": room_cfg.get("display_name") or room_id,
+                "is_active": room_id == self._active_user_room,
+                "capabilities": {
+                    "mic": mic_type,
+                    "speaker": spk_type,
+                    "camera": vid_type,
+                    "ducks_pc_audio": local_pc_speaker,
+                    "muted": bool(tweaks.get("muted", False)),
+                    "volume": tweaks.get("volume"),
+                },
+                "observations": {
+                    "lights_on": obs.get("lights_on"),
+                    "person_present": obs.get("person_present"),
+                    "person_name": obs.get("person_name"),
+                    "posture": obs.get("posture"),
+                    "description": obs.get("description"),
+                    "objects": obs.get("objects"),
+                    "updated_at": obs.get("updated_at"),
+                },
+                "sleepers": sleepers,
+            }
+
+        return {
+            "active_room": self._active_user_room,
+            "rooms": rooms_out,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def build_scene_extras(self) -> Optional[str]:
+        """Render the unified scene as a multi-line string for injection
+        into the LLM system prompt via PromptBuilder.extras['scene'].
+        Returns None when nothing meaningful has been observed yet (avoid
+        cluttering the prompt with empty-room boilerplate at boot).
+        """
+        snap = self.get_scene_snapshot()
+        rooms = snap.get("rooms", {})
+        if not rooms:
+            return None
+        lines = ["House scene snapshot (most recent observation per room):"]
+        for room_id, info in rooms.items():
+            caps = info["capabilities"]
+            obs = info["observations"]
+            sleepers = info.get("sleepers") or []
+
+            cap_bits: list[str] = []
+            if caps.get("camera"):
+                cap_bits.append(f"cam={caps['camera']}")
+            if caps.get("mic"):
+                cap_bits.append(f"mic={caps['mic']}")
+            if caps.get("speaker"):
+                cap_bits.append(f"spk={caps['speaker']}")
+            if caps.get("muted"):
+                cap_bits.append("MUTED")
+            cap_str = ", ".join(cap_bits) if cap_bits else "no hardware"
+
+            obs_bits: list[str] = []
+            if obs.get("lights_on") is True:
+                obs_bits.append("lights on")
+            elif obs.get("lights_on") is False:
+                obs_bits.append("lights off")
+            if obs.get("person_present"):
+                who = obs.get("person_name") or "unknown person"
+                obs_bits.append(f"{who} here")
+                if obs.get("posture"):
+                    obs_bits.append(f"posture={obs['posture']}")
+            if sleepers:
+                names = ", ".join(
+                    s.get("person_name") or "someone" for s in sleepers
+                )
+                kinds = {s.get("kind") for s in sleepers}
+                kind = "asleep" if "sleeping" in kinds else "napping"
+                obs_bits.append(f"{names} {kind}")
+
+            tag = " [active]" if info.get("is_active") else ""
+            tail = " | " + "; ".join(obs_bits) if obs_bits else ""
+            lines.append(f"  - {info['display_name']}{tag} ({cap_str}){tail}")
+            if obs.get("description"):
+                desc = str(obs["description"])[:140]
+                lines.append(f"      last seen: {desc}")
+
+        # Append the door-disappearance rule reminder so the LLM doesn't
+        # forget it between turns.
+        lines.append("")
+        lines.append(
+            "Note: if a known person disappears from a camera but didn't "
+            "leave through a known door, assume they're still in the room. "
+            "A blank frame is not an exit."
+        )
+        return "\n".join(lines)
 
     # ── Continuous-conversation follow-up listener ─────────────────────────
 
@@ -3060,6 +3320,29 @@ class Orchestrator:
         try:
             if room is None:
                 room = self._active_user_room
+
+            # Sleep deference: if anyone is napping/sleeping in the
+            # target room, suppress proactive speech. Direct
+            # 'conversation' replies still go through — if someone in
+            # the bedroom said "hey jarvis" while Anna's napping there,
+            # not responding would be worse than the disturbance. Other
+            # priorities (ambient/curiosity/notification/reminder) are
+            # gated. Whisper-mode is a future TODO.
+            if (
+                self.sleep_tracker is not None
+                and self.sleep_tracker.is_anyone_sleeping_in(room)
+                and priority != "conversation"
+            ):
+                sleepers = self.sleep_tracker.get_sleepers_in(room)
+                names = ", ".join(
+                    s.get("person_name") or "someone" for s in sleepers
+                ) or "someone"
+                logger.info(
+                    f"[TTS] suppressed {priority} speech in '{room}' "
+                    f"— {names} sleeping there: {text!r}"
+                )
+                return
+
             # Output leak filter — when persona system is wired, scrub
             # any hidden-persona name mentions before they reach TTS or
             # the dashboard log. The filter is a no-op when the active
@@ -3089,10 +3372,28 @@ class Orchestrator:
                 if self.speaker_manager is not None
                 else "none"
             )
-            if speaker_type == "esp32_i2s_spk" and self.nodes is not None and self.nodes.is_online(room):
-                routed = await self._speak_via_node(text, room)
-            elif speaker_type == "wyze_ssh_aplay":
-                routed = await self._speak_via_speaker_manager(text, room)
+            # Echo suppression for non-local speakers: any room whose
+            # mic will hear Jarvis's own voice (Wyze cam, ESP node)
+            # needs the wake handler to ignore that room while we
+            # speak + a short tail after. Local PC speech doesn't need
+            # this — the office mic + _audio_io_active flag already
+            # handle it. We stamp a far-future expiry up front, then
+            # rewrite to "now + tail" once speech completes.
+            import time as _time
+            uses_room_speaker = speaker_type in ("esp32_i2s_spk", "wyze_ssh_aplay")
+            if uses_room_speaker:
+                self._room_speech_until[room] = _time.monotonic() + 60.0
+
+            try:
+                if speaker_type == "esp32_i2s_spk" and self.nodes is not None and self.nodes.is_online(room):
+                    routed = await self._speak_via_node(text, room)
+                elif speaker_type == "wyze_ssh_aplay":
+                    routed = await self._speak_via_speaker_manager(text, room)
+            finally:
+                if uses_room_speaker:
+                    self._room_speech_until[room] = (
+                        _time.monotonic() + _ECHO_SUPPRESSION_TAIL_S
+                    )
 
             if not routed:
                 # Local playback. Streaming for multi-sentence; quick path for
@@ -3509,6 +3810,26 @@ class Orchestrator:
             for t in running:
                 t.cancel()
             if running:
-                await asyncio.gather(*running, return_exceptions=True)
-            await self._shutdown()
+                # Hard ceiling on cancellation so a stuck to_thread (cv2
+                # FFmpeg release, mic worker.join, ssh teardown) can't
+                # hang Ctrl-C indefinitely. Past this window, tasks
+                # become daemon-thread garbage and the process exits
+                # via _shutdown's resource closes.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*running, return_exceptions=True),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    stuck = [t for t in running if not t.done()]
+                    logger.warning(
+                        f"[Shutdown] {len(stuck)} task(s) didn't cancel "
+                        f"within 5s — proceeding with resource teardown"
+                    )
+            # Bound _shutdown the same way — if a Wyze cap.release() or
+            # mic worker.join() wedges, fall through rather than hang.
+            try:
+                await asyncio.wait_for(self._shutdown(), timeout=8.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Shutdown] resource teardown exceeded 8s budget")
             logger.info("[Orchestrator] All tasks cancelled. Goodbye.")
