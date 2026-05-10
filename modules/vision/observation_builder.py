@@ -143,12 +143,15 @@ class ObservationBuilder:
         if self.snapshot_dir is not None:
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         self._snapshot_last_saved: dict[tuple[str, str, str], float] = {}
+        # Default cadence — keep snapshot disk usage and review-queue churn
+        # under control. Tunable via /api/config (see settings tab); these
+        # are floors, not ceilings.
         self._snapshot_min_interval_s: dict[str, float] = {
-            "person": 30.0,
-            "cat": 30.0,
-            "dog": 30.0,
-            "openvocab": 30.0,
-            "object": 120.0,
+            "person": 120.0,
+            "cat": 120.0,
+            "dog": 120.0,
+            "openvocab": 120.0,
+            "object": 600.0,
         }
         # Track per-room loop tasks so we can cancel on shutdown without
         # leaking. Keyed by room id.

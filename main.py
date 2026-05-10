@@ -87,15 +87,37 @@ def _setup_logging(log_level: str) -> None:
         "<level>{message}</level>"
     )
 
-    # Console (colorized)
+    # Modules that emit one DEBUG line per detection / per frame and would
+    # otherwise drown the console. The file log still records them so the
+    # dashboard "Logs" tab can stream them on demand. Keep this list tight
+    # — only known per-frame spammers.
+    _CONSOLE_DEBUG_BLACKLIST = {
+        "modules.vision.object_detector",
+        "modules.vision.scene_analyzer",
+        "modules.context.state_fusion",
+        "modules.vision.openvocab_detector",
+    }
+
+    def _console_filter(record):
+        if record["level"].no <= 10:  # DEBUG
+            name = record["name"] or ""
+            for prefix in _CONSOLE_DEBUG_BLACKLIST:
+                if name.startswith(prefix):
+                    return False
+        return True
+
+    # Console (colorized) — per-frame DEBUG spam is filtered out; everything
+    # else passes through at log_level.
     logger.add(
         sys.stderr,
         format=log_format,
         level=log_level,
         colorize=True,
+        filter=_console_filter,
     )
 
-    # Rotating file log
+    # Rotating file log — unfiltered, so the dashboard logs tab and
+    # post-mortem debugging see every line.
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger.add(
         str(LOG_DIR / "jarvis_{time:YYYY-MM-DD}.log"),

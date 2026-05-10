@@ -95,21 +95,26 @@ class OpenVocabDetector:
                 target_sizes = self._torch.tensor(
                     [pil.size[::-1]],
                 ).to(self.device)
-                results = self.processor.post_process_object_detection(  # type: ignore[attr-defined]
+                results = self.processor.post_process_grounded_object_detection(  # type: ignore[attr-defined]
                     outputs=outputs,
                     threshold=self.score_threshold,
                     target_sizes=target_sizes,
+                    text_labels=[queries],
                 )[0]
         except Exception as e:
             logger.debug(f"[OpenVocabDetector] inference failed: {e}")
             return []
         out: list[dict] = []
-        for score, label, box in zip(
-            results["scores"], results["labels"], results["boxes"],
-        ):
+        # Newer transformers returns "text_labels" (strings); older builds
+        # still expose integer indices via "labels". Handle both.
+        labels = results.get("text_labels")
+        if labels is None:
+            raw = results.get("labels", [])
+            labels = [queries[int(i)] for i in raw]
+        for score, name, box in zip(results["scores"], labels, results["boxes"]):
             x1, y1, x2, y2 = (int(c) for c in box.tolist())
             out.append({
-                "name": queries[int(label)],
+                "name": str(name),
                 "bbox": (x1, y1, x2, y2),
                 "score": float(score),
             })

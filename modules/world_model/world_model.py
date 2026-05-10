@@ -395,6 +395,10 @@ class WorldModel:
         ent.last_seen_landmark = new_landmark
         ent.confidence = obs.confidence
         ent.last_attribution_confidence = attribution_conf
+        # Reset the visibility-flicker counter on every confirmed match —
+        # see _handle_unmatched_entity for the grace-window logic.
+        if "miss_streak" in ent.metadata:
+            ent.metadata.pop("miss_streak", None)
 
         # Track posture history.
         posture_val = obs.metadata.get("posture")
@@ -722,7 +726,27 @@ class WorldModel:
                 or ent.metadata.get("suspended_due_to_camera_health")):
             return
 
+        # Hysteresis: detectors flicker frame-to-frame (especially YOLO on
+        # cluttered scenes). Without a grace window we'd emit
+        # LOST_VISIBILITY + REAPPEARED dozens of times per second for a
+        # stationary entity. Count consecutive misses; only commit a
+        # state transition once we've missed for `visibility_grace_misses`
+        # batches in a row OR `visibility_grace_seconds` of wall time.
+        # If the entity is near an exit, skip the grace — exits are
+        # deliberate, low-flicker events worth firing fast on.
         exit_match = self._classify_exit(ent.last_seen_bbox, camera)
+        if exit_match is None:
+            grace_misses = int(self.cfg.get("visibility_grace_misses", 3))
+            grace_seconds = float(self.cfg.get("visibility_grace_seconds", 1.5))
+            miss_count = int(ent.metadata.get("miss_streak", 0)) + 1
+            ent.metadata["miss_streak"] = miss_count
+            last_seen = _as_utc(ent.last_seen_ts) if ent.last_seen_ts else None
+            elapsed = (ts - last_seen).total_seconds() if last_seen else 0.0
+            if miss_count < grace_misses and elapsed < grace_seconds:
+                # Below threshold — hold state, no event. Do NOT upsert,
+                # in-memory miss_streak is enough; persistence happens
+                # when we actually transition.
+                return
 
         if exit_match is None:
             # In-frame disappearance — went under desk, behind couch, etc.
@@ -900,6 +924,16 @@ class WorldModel:
     # HELPERS
     # ────────────────────────────────────────────────────────────────────────
 
+    # Event types that are pure noise for anonymous closed-vocab objects
+    # (cups/bottles/chairs). The user-facing world-events feed shouldn't
+    # be flooded with "cup blinked." Open-vocab tracked objects (wallet,
+    # keys) DO have display_name, so they bypass this filter.
+    _ANON_OBJECT_NOISE_EVENTS: frozenset = frozenset({
+        EventType.LOST_VISIBILITY,
+        EventType.REAPPEARED,
+        EventType.MOVED_WITHIN_ROOM,
+    })
+
     async def _emit(
         self,
         event_type: EventType,
@@ -907,6 +941,12 @@ class WorldModel:
         obs: Optional[Observation],
         metadata: Optional[dict] = None,
     ) -> None:
+        # Anonymous closed-vocab object spam suppression — see
+        # _ANON_OBJECT_NOISE_EVENTS above.
+        if (ent.entity_type == "object"
+                and not ent.display_name
+                and event_type in self._ANON_OBJECT_NOISE_EVENTS):
+            return
         ts = _as_utc(obs.ts) if obs else _utcnow()
         # For cat/dog events, blend the observation's visual descriptors
         # into event metadata so §22.5's AnimalClusterBuilder has signal

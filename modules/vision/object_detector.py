@@ -88,6 +88,19 @@ class ObjectDetector:
             return
         try:
             self._model = YOLO(self._model_name)
+            # Single warmup predict on a black frame so ultralytics' lazy
+            # fuse() runs once on a known-safe input. Without this, the
+            # first real frame from cameras can race concurrent calls
+            # mid-fuse and fail with "'Conv' object has no attribute 'bn'".
+            try:
+                import numpy as _np
+                self._model.predict(
+                    _np.zeros((640, 640, 3), dtype=_np.uint8),
+                    conf=self._conf_threshold,
+                    verbose=False,
+                )
+            except Exception as we:
+                logger.debug(f"[ObjectDetector] warmup predict skipped: {we}")
             logger.info(f"[ObjectDetector] YOLOv8 loaded: {self._model_name}")
         except Exception as e:
             logger.error(f"[ObjectDetector] Load failed: {e}")
