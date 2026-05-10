@@ -18,12 +18,10 @@ Modules: modules/world_model/world_model.py
 Classes: WorldModel
 Spec:    new 2.md §13 (Association Algorithm), §17 (Full Code).
 
-#todo: Phase 4 cat cost function fills `_cat_pair_cost`. Today the stub
-       hard-rejects every cat candidate so cats become FIRST_SEEN per
-       observation — fine for Phase 1 (no cats tracked yet), wrong once
-       Phase 4 lands.
-#todo: Phase 4 object cost function fills `_object_pair_cost`. Same
-       caveat as above.
+#todo: Phase 4 object cost function fills `_object_pair_cost`. Today the
+       stub hard-rejects every object candidate so objects become
+       FIRST_SEEN per observation — fine for Phase 1 (no objects
+       tracked yet), wrong once §23 lands.
 """
 from __future__ import annotations
 
@@ -260,12 +258,17 @@ class WorldModel:
     def _pair_cost(self, obs: Observation, ent: WorldEntity) -> float:
         if ent.entity_type != obs.obj_class:
             return self.cfg["cost_reject"] * 2
+        # Archived pet entities never match — they're soft-deleted.
+        if ent.archived_at is not None:
+            return self.cfg["cost_reject"] * 2
         if ent.entity_type == "person":
             return self._person_pair_cost(obs, ent)
         if ent.entity_type == "cat":
-            return self._cat_pair_cost(obs, ent)              # Section 22
+            return self._animal_pair_cost(obs, ent, species="cat")  # §22
+        if ent.entity_type == "dog":
+            return self._animal_pair_cost(obs, ent, species="dog")  # §22
         if ent.entity_type == "object":
-            return self._object_pair_cost(obs, ent)            # Section 23
+            return self._object_pair_cost(obs, ent)            # §23
         return self.cfg["cost_reject"] * 2
 
     def _person_pair_cost(self, obs: Observation, ent: WorldEntity) -> float:
@@ -936,9 +939,163 @@ class WorldModel:
             return None
         return "\n".join(lines)
 
-    # Cat / object cost stubs — Phase 4 fills these in (§22, §23).
-    def _cat_pair_cost(self, obs: Observation, ent: WorldEntity) -> float:
+    # ── Animal cost function (§22.7) ───────────────────────────────────────
+
+    # Per-species component weights. Cat weights match §22.7 exactly.
+    # Dog weights deweight room prior (~30%) and bump size (~50%) per
+    # the §22.7 closing note — Summer-vs-Dalila gets resolved on size +
+    # breed_class alone, so location prior matters less.
+    _COST_WEIGHTS: dict[str, dict[str, float]] = {
+        "cat": {
+            "emb": 0.20, "hist": 0.20, "size": 0.15,
+            "location": 0.30, "time": 0.05,
+        },
+        "dog": {
+            "emb": 0.15, "hist": 0.20, "size": 0.225,
+            "location": 0.20, "time": 0.05,
+        },
+    }
+
+    def _animal_pair_cost(
+        self, obs: Observation, ent: WorldEntity, species: str,
+    ) -> float:
+        """
+        Cats and dogs share structure: hard color filter, then a weighted
+        sum of (visual emb / hist / size / location prior / time gap)
+        plus continuity and co-occurrence bonuses. Weights differ per
+        species (see `_COST_WEIGHTS`).
+        """
+        w = self._COST_WEIGHTS.get(species, self._COST_WEIGHTS["cat"])
+
+        # Color class hard filter — solid-black observation can't be a
+        # tabby resident, etc. unknown ↔ unknown is allowed (no signal).
+        obs_color = obs.metadata.get("color_class", "unknown")
+        ent_color = ent.metadata.get("seed", {}).get("color_class", "unknown")
+        if (obs_color != "unknown" and ent_color != "unknown"
+                and obs_color != ent_color):
+            return self.cfg["cost_reject"] * 2
+
+        # ── Visual: histogram (Bhattacharyya) + embedding (cosine).
+        hist_cost = _hist_bhattacharyya(
+            obs.metadata.get("color_histogram"),
+            ent.metadata.get("color_histogram"),
+        )
+
+        ent_emb = ent.metadata.get("_visual_embedding")
+        obs_emb = obs.visual_embedding
+        if ent_emb is not None and obs_emb is not None:
+            sim = float(
+                np.dot(obs_emb, ent_emb)
+                / (np.linalg.norm(obs_emb) * np.linalg.norm(ent_emb) + 1e-9)
+            )
+            emb_cost = 1.0 - sim
+        else:
+            emb_cost = 0.5
+
+        # ── Size cost: prefer learned per-room stats, fall back to seed tier.
+        profile = ent.metadata.get("behavioral_profile", {}) or {}
+        obs_size = obs.metadata.get("size_normalized")
+        per_room = profile.get("bbox_size_per_room", {}).get(obs.room, {}) or {}
+        if per_room and obs_size is not None and per_room.get("n", 0) >= 5:
+            mean_sz = per_room["mean"]
+            std_sz = max(per_room["std"], 1e-3)
+            z = abs(float(obs_size) - mean_sz) / std_sz
+            size_cost = float(min(z / 3.0, 1.0))
+        else:
+            size_cost = _size_cost_from_seed(
+                obs_size, ent.metadata.get("seed", {})
+            )
+
+        # ── Location prior — heavy hitter for Spooky/Velcro and Smudge/Onyx.
+        hour = obs.ts.hour
+        by_hour = profile.get("room_distribution_by_hour", {}) or {}
+        # JSON keys come back as strings; accept both.
+        hour_dist = by_hour.get(hour) or by_hour.get(str(hour)) or {}
+        room_dist = profile.get("room_distribution", {}) or {}
+        p_room = hour_dist.get(obs.room) or room_dist.get(obs.room) or 0.05
+        location_cost = float(min(-np.log(p_room + 0.01), 2.0))
+
+        # ── Continuity bonus: same camera in last few seconds is a strong
+        # negative-cost (i.e. likely the same animal).
+        if ent.last_seen_ts:
+            seconds_gone = (obs.ts - ent.last_seen_ts).total_seconds()
+        else:
+            seconds_gone = 1e6
+        if obs.camera == ent.last_seen_camera and seconds_gone < 5:
+            continuity = -0.3
+        elif obs.room == ent.last_seen_room and seconds_gone < 30:
+            continuity = -0.15
+        else:
+            continuity = 0.0
+
+        # ── Co-occurrence tie-breaker: if a known partner of this entity
+        # was just seen in a *different* room, that's evidence this is the
+        # entity (because partners typically aren't simultaneously alone
+        # together — they cohabit). The §22.7 note specifically calls this
+        # out for Smudge/Onyx; works for Spooky/Velcro the same way.
+        co_partners = profile.get("co_occurrence_partners", {}) or {}
+        other_seen = self._other_animal_seen_recently(
+            ent, obs.ts, exclude_room=obs.room, lookback_seconds=30,
+        )
+        co_bonus = -0.2 if (other_seen and other_seen in co_partners) else 0.0
+
+        cost = max(0.0, (
+            w["emb"] * emb_cost
+            + w["hist"] * hist_cost
+            + w["size"] * size_cost
+            + w["location"] * location_cost
+            + w["time"] * (min(seconds_gone / 60.0, 1.0))
+            + continuity
+            + co_bonus
+        ))
+        return cost
+
+    def _other_animal_seen_recently(
+        self, ent: WorldEntity, ts: datetime, exclude_room: str,
+        lookback_seconds: int = 30,
+    ) -> Optional[str]:
+        """Did any OTHER same-species entity get observed in a different
+        room within `lookback_seconds`? Returns its display_name or None."""
+        cutoff = ts - timedelta(seconds=lookback_seconds)
+        for other in self.entities.values():
+            if (other.entity_type == ent.entity_type
+                    and other.id != ent.id
+                    and other.last_seen_ts and other.last_seen_ts >= cutoff
+                    and other.last_seen_room
+                    and other.last_seen_room != exclude_room):
+                return other.display_name
+        return None
+
+    # Object cost stub — §23 fills this in.
+    def _object_pair_cost(self, obs: Observation, ent: WorldEntity) -> float:  # noqa: ARG002
         return self.cfg["cost_reject"] * 2
 
-    def _object_pair_cost(self, obs: Observation, ent: WorldEntity) -> float:
-        return self.cfg["cost_reject"] * 2
+
+# ── Module-level helpers (§22.7) ────────────────────────────────────────────
+
+
+def _hist_bhattacharyya(h1: Any, h2: Any) -> float:
+    """Bhattacharyya-derived distance, normalized 0–1. Lower = more similar.
+    Returns 0.5 (neutral) when either side is missing."""
+    if h1 is None or h2 is None:
+        return 0.5
+    a = np.asarray(h1, dtype=np.float32)
+    b = np.asarray(h2, dtype=np.float32)
+    if a.size == 0 or b.size == 0 or a.shape != b.shape:
+        return 0.5
+    bc = float(np.sum(np.sqrt(a * b)))
+    return float(min(1.0, np.sqrt(max(0.0, 1.0 - bc))))
+
+
+def _size_cost_from_seed(obs_size: Optional[float], seed: dict) -> float:
+    """Size cost when learned per-room stats aren't available yet. Maps
+    expected_size string → target normalized-area, returns log-distance."""
+    if obs_size is None:
+        return 0.5
+    expected_size = (seed or {}).get("expected_size", "medium")
+    targets = {
+        "small": 0.02, "small-large": 0.03, "medium": 0.04,
+        "medium-large": 0.06, "large": 0.07, "xl": 0.10,
+    }
+    target = targets.get(str(expected_size), 0.04)
+    return float(min(abs(np.log(max(float(obs_size), 1e-4) / target)) / 2.0, 1.0))

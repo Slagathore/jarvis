@@ -12,6 +12,11 @@ from modules.world_model.types import (
 from modules.world_model.store import WorldStore
 from modules.world_model.world_model import WorldModel
 from modules.world_model.query_tools import WorldQueryTools
+from modules.world_model.pets import (
+    Affinity,
+    BehavioralProfileBuilder,
+    bootstrap_pets_from_config,
+)
 
 __all__ = [
     "EntityState",
@@ -22,4 +27,7 @@ __all__ = [
     "WorldStore",
     "WorldModel",
     "WorldQueryTools",
+    "Affinity",
+    "BehavioralProfileBuilder",
+    "bootstrap_pets_from_config",
 ]
