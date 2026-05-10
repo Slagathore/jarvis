@@ -1441,6 +1441,267 @@ class DashboardServer:
                 logger.warning(f"[/api/world_model/events] {e}")
                 raise HTTPException(status_code=500, detail=str(e)) from e
 
+        # ── §22.5 cluster builder UI ──────────────────────────────────────
+        # Workflow:
+        #   GET  /api/world_model/cluster/known_pets?species=cat → dropdown
+        #   POST /api/world_model/cluster/build {species}        → run K-means
+        #   GET  /api/world_model/cluster/event/{event_id}/image.jpg
+        #   POST /api/world_model/cluster/apply {species, clusters, labels}
+        #   GET  /clusters                                       → SPA page
+
+        @app.get("/api/world_model/cluster/known_pets")
+        async def cluster_known_pets(species: str = "cat"):
+            """List of resident pet display_names for `species`. Used by
+            the cluster-viewer dropdown so the user can label a cluster
+            as e.g. 'Spooky' without having to type."""
+            orch = self._orchestrator
+            wm = getattr(orch, "world_model", None) if orch else None
+            if wm is None:
+                return JSONResponse({"pets": [], "available": False})
+            try:
+                names = sorted({
+                    e.display_name for e in wm.entities.values()
+                    if e.entity_type == species
+                    and e.is_resident
+                    and e.archived_at is None
+                    and e.display_name
+                })
+                return JSONResponse({
+                    "pets": names, "species": species, "available": True,
+                })
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
+        @app.post("/api/world_model/cluster/build")
+        async def cluster_build(payload: dict):
+            """Run AnimalClusterBuilder.cluster_unattributed on demand.
+            Threshold gate is honored — too few unattributed events
+            returns {clusters: {}, ready: false}. When clusters DO come
+            back, we attach a per-cluster sample of event ids + their
+            snapshot_path so the UI can render thumbnails."""
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            wm = getattr(orch, "world_model", None) if orch else None
+            if ws is None or wm is None:
+                raise HTTPException(
+                    status_code=503, detail="World model not registered"
+                )
+            assert orch is not None  # narrowed by the ws/wm check above
+            species = str(payload.get("species") or "cat")
+            n_clusters = payload.get("n_clusters")
+            days_back = int(payload.get("days_back", 7))
+            from modules.world_model.cluster_builder import (
+                AnimalClusterBuilder,
+            )
+            cluster_cfg = (orch.config.get("world_model") or {}).get(
+                "cluster_builder", {}
+            )
+            builder = AnimalClusterBuilder(ws, cluster_cfg)
+            try:
+                clusters = await builder.cluster_unattributed(
+                    species=species,
+                    n_clusters=int(n_clusters) if n_clusters is not None else None,
+                    days_back=days_back,
+                )
+            except Exception as e:
+                logger.warning(f"[cluster/build] {e}")
+                raise HTTPException(status_code=500, detail=str(e)) from e
+            if not clusters:
+                threshold = int(cluster_cfg.get(
+                    "cluster_min_observations", 200,
+                ))
+                # Give the UI useful telemetry on the gate.
+                rows = await ws.search_events(
+                    event_types=["first_seen", "moved_within_room",
+                                 "reappeared", "moved_to"],
+                    limit=threshold,
+                )
+                count_unattrib = sum(
+                    1 for r in rows
+                    if r.get("entity_type") == species
+                    and (r.get("entity_name") is None
+                         or str(r.get("entity_name", "")).startswith("unknown_"))
+                )
+                return JSONResponse({
+                    "ready": False,
+                    "species": species,
+                    "unattributed_count": count_unattrib,
+                    "threshold": threshold,
+                    "clusters": {},
+                })
+            # Hydrate per-cluster samples (event_id + snapshot_path).
+            # Pull the events so we can include thumbnail paths.
+            sample_per_cluster = int(payload.get("samples_per_cluster", 9))
+            event_id_set: set[str] = set()
+            for ids in clusters.values():
+                for eid in ids[:sample_per_cluster]:
+                    event_id_set.add(eid)
+            # No bulk-by-id helper on WorldStore; iterate the recent
+            # window and filter. Cheap on day-1 data sizes.
+            from datetime import datetime, timedelta
+            since = datetime.utcnow() - timedelta(days=max(days_back, 1) + 1)
+            recent = await ws.search_events(
+                event_types=["first_seen", "moved_within_room",
+                             "reappeared", "moved_to"],
+                since=since,
+                limit=20000,
+            )
+            by_id: dict[str, dict] = {
+                r["id"]: r for r in recent if r["id"] in event_id_set
+            }
+            # Decode metadata once.
+            import json as _json
+            for r in by_id.values():
+                raw = r.get("metadata")
+                if isinstance(raw, str) and raw:
+                    try:
+                        r["metadata"] = _json.loads(raw)
+                    except Exception:
+                        r["metadata"] = {}
+                elif raw is None:
+                    r["metadata"] = {}
+            cluster_payload: dict[int, dict] = {}
+            for cluster_id, event_ids in clusters.items():
+                samples: list[dict] = []
+                for eid in event_ids[:sample_per_cluster]:
+                    row = by_id.get(eid)
+                    if row is None:
+                        continue
+                    meta = row.get("metadata") or {}
+                    samples.append({
+                        "event_id": eid,
+                        "room": row.get("room"),
+                        "ts": row.get("ts"),
+                        "color_class": meta.get("color_class"),
+                        "size_normalized": meta.get("size_normalized"),
+                        "snapshot_path": row.get("snapshot_path"),
+                    })
+                cluster_payload[cluster_id] = {
+                    "size": len(event_ids),
+                    "event_ids": list(event_ids),
+                    "samples": samples,
+                }
+            return JSONResponse({
+                "ready": True,
+                "species": species,
+                "clusters": cluster_payload,
+            })
+
+        @app.get("/api/world_model/cluster/event/{event_id}/image.jpg")
+        async def cluster_event_image(event_id: str):
+            """Serve the snapshot JPEG for one event, by id. Resolves
+            the path stored on the event row + a couple of safety
+            checks so we don't serve random files."""
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            if ws is None:
+                raise HTTPException(status_code=503, detail="No world store")
+            row = await ws.db.fetchone(
+                "SELECT snapshot_path FROM world_entity_events WHERE id = ?",
+                (event_id,),
+            )
+            if row is None or not row["snapshot_path"]:
+                raise HTTPException(status_code=404, detail="No snapshot")
+            assert orch is not None  # narrowed by the ws check above
+            from pathlib import Path as _Path
+            path = _Path(row["snapshot_path"])
+            # Constrain to the configured snapshot dir to avoid path
+            # traversal — only serve files under `data/world_snapshots`.
+            data_dir = _Path(
+                (orch.config.get("system") or {}).get("data_dir", "data")
+            ).resolve()
+            try:
+                path = path.resolve()
+                if data_dir not in path.parents:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="snapshot path outside data_dir",
+                    )
+            except OSError as e:
+                raise HTTPException(status_code=404, detail=str(e)) from e
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="File missing")
+            return Response(
+                content=path.read_bytes(),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "max-age=3600"},
+            )
+
+        @app.post("/api/world_model/cluster/apply")
+        async def cluster_apply(payload: dict):
+            """Submit cluster labels — body shape:
+              {species: 'cat',
+               clusters: {0: [event_id, ...], 1: [...]},
+               labels:   {0: 'Spooky', 1: 'Velcro'}}
+            Empty / missing labels are skipped. Triggers a profile
+            rebuild after re-attribution so the dashboard reflects the
+            new attribution immediately."""
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            wm = getattr(orch, "world_model", None) if orch else None
+            if ws is None or wm is None:
+                raise HTTPException(
+                    status_code=503, detail="World model not registered"
+                )
+            species = str(payload.get("species") or "cat")
+            clusters_raw = payload.get("clusters") or {}
+            labels_raw = payload.get("labels") or {}
+            # Coerce keys back to int — JSON only sends string keys.
+            clusters: dict[int, list[str]] = {}
+            for k, v in clusters_raw.items():
+                try:
+                    clusters[int(k)] = list(v)
+                except (TypeError, ValueError):
+                    continue
+            labels: dict[int, str] = {}
+            for k, v in labels_raw.items():
+                try:
+                    if v:
+                        labels[int(k)] = str(v)
+                except (TypeError, ValueError):
+                    continue
+            if not labels:
+                return JSONResponse({"updated": 0, "labels_applied": 0})
+            from modules.world_model.cluster_builder import (
+                apply_cluster_labels,
+            )
+            try:
+                updated = await apply_cluster_labels(
+                    ws, labels, clusters, species=species,
+                )
+            except Exception as e:
+                logger.warning(f"[cluster/apply] {e}")
+                raise HTTPException(status_code=500, detail=str(e)) from e
+            # Trigger a fresh profile build for each newly-attributed
+            # pet so the dashboard reflects the new data immediately.
+            from modules.world_model.pets import BehavioralProfileBuilder
+            builder = BehavioralProfileBuilder()
+            for pet_name in set(labels.values()):
+                ent = wm.find_entity_by_name(pet_name)
+                if ent is None:
+                    continue
+                try:
+                    await builder.rebuild_for(wm, ent, days_back=30)
+                except Exception as e:
+                    logger.debug(
+                        f"[cluster/apply] profile rebuild failed for "
+                        f"'{pet_name}': {e}"
+                    )
+            return JSONResponse({
+                "updated": updated, "labels_applied": len(labels),
+            })
+
+        @app.get("/clusters", response_class=HTMLResponse)
+        async def cluster_viewer_page():
+            """Serve the cluster-viewer SPA page. Static asset; the JS
+            inside fetches everything via the APIs above."""
+            page = STATIC_DIR / "cluster_viewer.html"
+            if not page.exists():
+                raise HTTPException(
+                    status_code=404, detail="cluster_viewer.html missing"
+                )
+            return HTMLResponse(page.read_text(encoding="utf-8"))
+
         @app.post("/api/camera/{room}/reconnect")
         async def camera_reconnect(room: str):
             """Force-reopen a room's RTSP capture. The orchestrator's

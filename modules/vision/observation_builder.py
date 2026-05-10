@@ -439,6 +439,13 @@ class ObservationBuilder:
         coat_texture = _coat_texture_descriptor(crop)
         size_norm = ((x2 - x1) * (y2 - y1)) / max(fw * fh, 1)
 
+        # Persist the crop alongside the metadata so the §22.5 cluster
+        # builder dashboard can show an image grid for human labeling.
+        # Mirrors the person-obs save path; gated on snapshot_dir +
+        # non-empty crop. Failures are non-fatal — we still emit the
+        # observation; the cluster UI just won't have an image for it.
+        crop_path = self._save_animal_crop("cat", crop, room, ts)
+
         return Observation(
             camera=room, room=room, obj_class="cat",
             bbox=tuple(bbox), confidence=det.confidence, ts=ts,
@@ -449,6 +456,7 @@ class ObservationBuilder:
                 "color_histogram": color_hist,
                 "coat_texture": coat_texture,
                 "size_normalized": float(size_norm),
+                "crop_path": str(crop_path) if crop_path else None,
             },
         )
 
@@ -467,6 +475,9 @@ class ObservationBuilder:
         y1 = max(0, min(fh - 1, y1))
         x2 = max(0, min(fw, x2))
         y2 = max(0, min(fh, y2))
+        # Persist the dog crop too — same reasoning as the cat path.
+        # Computed below the bbox-clamp so we don't try to save an empty
+        # slice; saved only if snapshot_dir is set + crop is non-empty.
         crop = frame[y1:y2, x1:x2] if y2 > y1 and x2 > x1 else None
 
         color_class = _classify_dog_color(crop)
@@ -477,6 +488,7 @@ class ObservationBuilder:
         # populated without a heavy classifier in the hot path.
         breed_class = _coarse_breed_class(crop, x2 - x1, y2 - y1)
         size_norm = ((x2 - x1) * (y2 - y1)) / max(fw * fh, 1)
+        crop_path = self._save_animal_crop("dog", crop, room, ts)
 
         return Observation(
             camera=room, room=room, obj_class="dog",
@@ -488,8 +500,40 @@ class ObservationBuilder:
                 "color_histogram": color_hist,
                 "breed_class": breed_class,
                 "size_normalized": float(size_norm),
+                "crop_path": str(crop_path) if crop_path else None,
             },
         )
+
+    def _save_animal_crop(
+        self,
+        species: str,
+        crop: Optional[np.ndarray],
+        room: str,
+        ts: datetime,
+    ) -> Optional[Path]:
+        """Save a cat/dog bbox crop next to the world snapshots so the
+        §22.5 cluster builder dashboard can show the image grid. Same
+        directory + naming convention as the person-obs save path —
+        downstream just sees a JPEG path on the observation. Returns
+        the full Path on success, None on no-op (no snapshot dir set,
+        empty crop, cv2 unavailable, encode failure)."""
+        if self.snapshot_dir is None or crop is None or crop.size == 0:
+            return None
+        try:
+            import cv2  # noqa: E402 — lazy
+            fname = (
+                f"{species}_{room}_{ts.strftime('%Y%m%dT%H%M%S')}_"
+                f"{uuid.uuid4().hex[:6]}.jpg"
+            )
+            path = self.snapshot_dir / fname
+            ok = cv2.imwrite(str(path), crop)
+            return path if ok else None
+        except Exception as e:
+            logger.debug(
+                f"[ObservationBuilder] {species} crop save failed in "
+                f"'{room}': {e}"
+            )
+            return None
 
     def _build_generic_animal_obs(
         self,
