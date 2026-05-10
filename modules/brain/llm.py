@@ -350,20 +350,29 @@ class OllamaLLM:
                     # Workaround: Gemini 3 thinking models via Ollama-cloud
                     # 400 with "thought_signature" on tool-call round-trips
                     # because Ollama-cloud doesn't preserve the signature
-                    # field. Detect that specific error, mark this model
-                    # as needing think=False for future tool turns, and
-                    # retry this turn ONCE with the workaround applied.
+                    # field. Detect the specific error and retry once with
+                    # the trailing assistant/tool messages stripped — the
+                    # poisoned history is the actual root, not just whether
+                    # think was on. Earlier code only retried when
+                    # effective_think was still True; that was wrong, the
+                    # error fires even on think=False because Ollama-cloud
+                    # decorates assistant tool_calls with a signature
+                    # requirement Gemini then complains about on the next
+                    # round-trip. Always retry with stripped history; we
+                    # also keep the model in _tools_force_no_think so a
+                    # restart-re-learn doesn't burn a round-trip.
                     err_text = str(e).lower()
                     looks_like_signature_400 = (
                         "thought_signature" in err_text
                         and "400" in err_text
-                        and effective_think is not False
                     )
                     if looks_like_signature_400:
                         logger.warning(
                             f"[LLM] '{active_model}' tripped Gemini-3 "
-                            "thought_signature 400 — caching think=False "
-                            "for this model's tool-call rounds and retrying"
+                            "thought_signature 400 (effective_think="
+                            f"{effective_think}) — stripping trailing "
+                            "tool/assistant turns and retrying with "
+                            "think=False"
                         )
                         self._tools_force_no_think.add(active_model)
                         chat_kwargs["think"] = False

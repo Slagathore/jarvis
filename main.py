@@ -34,20 +34,26 @@ faulthandler.enable()
 # ── Native library noise suppression ──────────────────────────────────────
 # Both cv2 and PyAV bundle their own copy of libav; both write H.264 decoder
 # warnings (`non-existing PPS X referenced`, `decode_slice_header error`,
-# `no frame!`) directly to stderr while a stream is mid-GOP after a cold
-# open or reconnect. Tens of lines per second can drown the actual log.
-# These env vars MUST be set before the respective libraries import — they
-# tap into libav's static log-level config at first use.
+# `no frame!`, `left block unavailable for requested intra4x4 mode`) directly
+# to stderr while a stream is mid-GOP after a cold open or reconnect. Tens
+# of lines per second can drown the actual log.
 #
-#   OPENCV_FFMPEG_LOGLEVEL   — cv2's bundled libav. Values: "panic" (silent),
-#                              "fatal" (catastrophic only), "error", "warning",
-#                              "info", "debug". "fatal" silences PPS noise but
-#                              keeps real failures.
-#   AV_LOG_FORCE_NOCOLOR=1   — drop ANSI colour codes from any leaked stderr
-#                              so the file log stays readable.
-# (PyAV is configured via av.logging.set_level() in core/orchestrator.py
+# These vars MUST be set before any import that pulls cv2 / PyAV — they
+# tap into libav's static log-level config at first use. We use os.environ
+# direct assignment (not setdefault) because opencv-python on Windows is
+# inconsistent about honoring the string form; the integer form parsed
+# through libav's av_log_set_level is the reliable knob.
+#
+#   OPENCV_FFMPEG_LOGLEVEL=-8   — AV_LOG_QUIET, libav emits NOTHING.
+#                                 Numeric form to avoid the string-parsing
+#                                 inconsistencies on Windows opencv-python.
+#                                 We still get real failures from cv2's
+#                                 own Python-side error returns.
+#   AV_LOG_FORCE_NOCOLOR=1      — drop ANSI colour codes from any leaked
+#                                 stderr so the file log stays readable.
+# (PyAV is configured via av.logging.set_level() in wyze_rtsp_mic.py
 # right after `import av`, since we don't import av here.)
-os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "fatal")
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 os.environ.setdefault("AV_LOG_FORCE_NOCOLOR", "1")
 
 import yaml

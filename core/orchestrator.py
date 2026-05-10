@@ -3412,8 +3412,13 @@ class Orchestrator:
             use_room_tap = room_adapter is not None and hasattr(
                 room_adapter, "attach_recording_tap"
             )
+            logger.info(
+                f"[Followup] lock acquired for '{room}' "
+                f"(use_room_tap={use_room_tap}, depth={self._followup_depth})"
+            )
             if self.wake and not use_room_tap:
                 self.wake.suspend()
+                logger.debug("[Followup] PC wake mic suspended")
                 # Same dance the wake handler does: give wake's InputStream
                 # time to actually close before we open ours. Without this
                 # WASAPI on Windows can deny the second stream silently or
@@ -3434,24 +3439,44 @@ class Orchestrator:
                         if self.wake
                         else recording_cfg.get("silence_threshold_db", -45.0)
                     )
-                    logger.debug(
-                        f"[Followup] record_device={record_device}, "
-                        f"pre-floor={pre_floor:.1f} dBFS"
+                    logger.info(
+                        f"[Followup] starting record_until_silence "
+                        f"(device={record_device}, pre-floor={pre_floor:.1f} dBFS, "
+                        f"speech_start_timeout={listen_seconds}s, "
+                        f"max_dur={recording_cfg.get('max_duration_seconds', 60.0)}s)"
                     )
-                    audio_data = await asyncio.to_thread(
-                        record_until_silence,
-                        silence_threshold_db=pre_floor,
-                        silence_duration_ms=recording_cfg.get(
-                            "silence_duration_ms", 600
-                        ),
-                        max_duration_seconds=recording_cfg.get(
-                            "max_duration_seconds", 60.0
-                        ),
-                        speech_start_timeout_seconds=listen_seconds,
-                        device=record_device,
-                        mode="silence",
-                        adaptive_noise_floor=False,
-                    )
+                    try:
+                        audio_data = await asyncio.to_thread(
+                            record_until_silence,
+                            silence_threshold_db=pre_floor,
+                            silence_duration_ms=recording_cfg.get(
+                                "silence_duration_ms", 600
+                            ),
+                            max_duration_seconds=recording_cfg.get(
+                                "max_duration_seconds", 60.0
+                            ),
+                            speech_start_timeout_seconds=listen_seconds,
+                            device=record_device,
+                            mode="silence",
+                            adaptive_noise_floor=False,
+                        )
+                        logger.info(
+                            f"[Followup] record_until_silence returned: "
+                            f"type={type(audio_data).__name__}, "
+                            f"len={len(audio_data) if audio_data is not None else 'N/A'}"
+                        )
+                    except Exception as rec_e:
+                        # Catch HERE so the exception type is visible —
+                        # without this, an AudioError raised by
+                        # record_until_silence (e.g. portaudio failure)
+                        # propagates past the inner try and the outer
+                        # except at "Pipeline error" only sees the
+                        # message, losing the type info that's diagnostic.
+                        logger.warning(
+                            f"[Followup] record_until_silence raised "
+                            f"{type(rec_e).__name__}: {rec_e}"
+                        )
+                        audio_data = None
                 else:
                     threshold_db = float(
                         recording_cfg.get("silence_threshold_db", -45.0)
@@ -3489,8 +3514,17 @@ class Orchestrator:
         # ── LOCK RELEASED ───────────────────────────────────────────────────
 
         try:
-            if audio_data is None or len(audio_data) == 0:
-                logger.info("[Followup] no audio captured — window closed silently")
+            if audio_data is None:
+                logger.info(
+                    "[Followup] audio_data is None — recording call either "
+                    "raised, returned None, or was never reached"
+                )
+                return
+            if len(audio_data) == 0:
+                logger.info(
+                    "[Followup] audio_data is empty (0 samples) — recording "
+                    "started but timed out before any speech was captured"
+                )
                 return
 
             duration_s = len(audio_data) / SAMPLE_RATE
