@@ -1,58 +1,65 @@
 <!-- markdownlint-disable -->
 # World Model integration — resume notes
 
-Last updated: **2026-05-10** (post-§23: full Phase 4 done — pets, objects, alarms, interactions, clown)
+Last updated: **2026-05-10** (Phase 4 fully complete — §22 pets, §23 objects, §24 interactions, §29 + v4.1 alarms; only §25 + §30 remain)
 
 ## Resume protocol if you're picking up after auto-compaction
 
 1. Read this file end-to-end first.
 2. Run `git log --oneline -15` to see exactly what's landed.
-3. Run all four synthetic suites — should all be green:
-   - `python scripts/test_world_model_synthetic.py` (4 scenarios)
-   - `python scripts/test_pets_synthetic.py` (13 scenarios)
-   - `python scripts/test_review_fixes_synthetic.py` (6 scenarios)
-   - `python scripts/test_interactions_synthetic.py` (7 scenarios)
-4. Check the "What I'm currently in the middle of" section below.
-5. Resume from there.
+3. Run all six synthetic suites — should all be green (44 scenarios total):
+   - `python scripts/test_world_model_synthetic.py` (4 scenarios — Phase 1 state machine)
+   - `python scripts/test_pets_synthetic.py` (13 scenarios — §22 pets)
+   - `python scripts/test_review_fixes_synthetic.py` (6 scenarios — chatgpt review bugs)
+   - `python scripts/test_interactions_synthetic.py` (7 scenarios — §24 hands + pickup/placement/handoff)
+   - `python scripts/test_clown_alarm_synthetic.py` (8 scenarios — v4.1 §29.8 clown)
+   - `python scripts/test_objects_synthetic.py` (6 scenarios — §23 CLIP/objects)
+4. Check the "Where things stand" section below.
+5. Resume from the queue (§25 next, then §30, plus operational items).
 
-## What I'm currently in the middle of (2026-05-10 12:50)
+## Where things stand (2026-05-10, post-§23)
 
-**Implementing v4.1 Clown Alarm.** Spec docs:
-- `v4_1_clown_alarm_micropatch.md` (Cole pasted as conversation message — not a file in the repo)
-- `clown_alarm_patch_patch.md` (correction to the micropatch's `generate_improv` function — Cole pasted too)
+**Phase 4 is fully code-complete.** Six commits this session covered the
+build queue Cole ranked first:
 
-**Apply patch-patch into micropatch first**, then implement. The patch-patch fixes:
-- Removes the broken `count_curated_in_style(style_seed)` reference (it was undefined; just use `len(in_style)`)
-- Adds 3-layer fallback for sparse pools:
-  - Layer 1: ≥3 in-style examples → standard generation
-  - Layer 2: 1-2 in-style → supplement with cross-style examples + marked prompt
-  - Layer 3: 0 in-style → log warning + fall back to curated entry (no LLM call)
-- Adds explicit try/except around the LLM call (timeout/error → curated fallback)
-- Adds `record_improv_event()` at every branch for dashboard observability
-- Adds `_select_curated_fallback()` helper with hardcoded last-resort response
+| Section | Commit | Status |
+|---|---|---|
+| §22 Phase 4 pets-by-name | several earlier | ✅ |
+| §22.5 cluster builder UI | bcba1f8 | ✅ |
+| §22.9 species-specific events | 2dbe09a | ✅ |
+| §10 IdentityManager auto-enrollment | c7887dd | ✅ |
+| §29 alarms framework + cat-escape | 76dc89e | ✅ |
+| §29.3 DoorOpenAlarm | 76dc89e | ✅ |
+| §29.4 FireAlarm (with override / visual confirm / unattended rearm) | 76dc89e | ✅ |
+| §24 interactions (HandDetector + pickup/placement) | 65af7c4 | ✅ |
+| §24.4 HANDED_OFF + §24.6 timeline | e0d43b3 | ✅ |
+| v4.1 §29.8 ClownAlarm + §29 dispatcher wired into orchestrator | 010c3e4 | ✅ |
+| §23 CLIPEncoder + OpenVocabDetector + find_object + dedup + prune | 8361979 | ✅ |
+| Six chatgpt-review correctness bugs | 161cb2a | ✅ |
+| Pydantic validation + §32 schema | c7887dd | ✅ |
 
-**Files to create:**
-- `modules/safety/alarms/clown.py` — ClownAlarm class (subclasses Alarm, PRIORITY=40)
-- `assets/clown_responses.yaml` — curated response pool from §29.8.3 verbatim
-- `prompts/clown_improv.md` — standard generation template
-- `prompts/clown_improv_supplement.md` — variant for thin-pool case
-- `scripts/test_clown_alarm_synthetic.py` — tests for the state machine + selection + fallback
+**Remaining build queue (Cole's ordering):**
+1. **§25 PatternMiner + AnomalyScorer** — high long-term value, but *needs ~30 days of accumulated event data before it's useful*. Heavy chapter (~5h). The classes can be written now and just sit idle until enough data exists.
+2. **§30 multi-persona wake words** — low-effort cosmetic. Existing repo has wake words AND personas; §30 is just the routing function tying them. ~2h.
 
-**Files to modify:**
-- `modules/safety/alarms/__init__.py` — export ClownAlarm
-- `modules/safety/alarms/state.py` — add `AlarmType.CLOWN = "clown"` (priority 40)
-- `modules/safety/alarms/dispatcher.py` — extend priority_order with `AlarmType.CLOWN` at the end
-- `modules/safety/alarms/audio.py` — extend repeat-cadence + add 3-stage clown sequence (horns ×3 → TTS → calliope) — needs a custom path because clown is "play once, end naturally" not the standard "loop forever"
-- `modules/safety/alarms/klaxon.py` — add `(calliope, "calliope")` to `_NAME_TOKENS` so `Circus Calliope.mp3` gets classified
-- `core/orchestrator.py` — wire ClownAlarm at boot, register with dispatcher
-- `dashboard/server.py` — `POST /api/world_model/clown_test` for test fire button
-- `dashboard/static/index.html` + `app.js` + `style.css` — clown alarm card with status + test fire button + recent fires + response pool browser
+**Operational gaps (Cole owns these — not code tasks):**
+- ArcFace face re-enrollment for residents (DB has Facenet + 14 valid ArcFace rows; centroid bank only loads ArcFace).
+- Polygon tuning via `/polygons` viewer (every coord in `config.yaml` is a placeholder).
+- Pet identity bootstrapping — let the system run a few days, then label the clusters via `/clusters` UI.
 
-**After clown alarm → §23 Objects.** Cole picked it (highest daily-use UX value) — CLIP encoder + open-vocab detector (OWLv2 or GroundingDINO) + object cost function + dedup + `find_object` query. Heavy ML deps (~600MB-1GB of new weights). Closed-vocab cost function already done (committed earlier).
+## Klaxon files in modules/safety/alarms/
 
-## Recent commit chain (2026-05-10 session)
+- `catescapealarm.mp3` → cat_escape (loaded ✅)
+- `dooralarm.mp3` → door_open (loaded ✅)
+- `firealarm.wav` → fire (loaded ✅)
+- `clownalarm.wav` → clown (horns; loaded ✅)
+- `Circus Calliope.mp3` → calliope (loaded ✅ — token added in 010c3e4)
+
+## Recent commit chain (2026-05-10 session, newest first)
 
 ```
+8361979 feat(world_model+vision): §23 Phase 4 Objects — CLIP + OWLv2 + find_object
+010c3e4 feat(safety+dashboard): v4.1 Clown Alarm — §29.8 + §29 wired into orchestrator
 e0d43b3 feat(world_model+dashboard): §24 close-outs — HANDED_OFF + interactions timeline
 65af7c4 feat(world_model+vision): §24 Phase 5 — interactions (MediaPipe Hands + pickup/placement)
 bcba1f8 feat(dashboard+vision): §22.5 cluster-builder UI + cat/dog crop persistence
@@ -64,6 +71,17 @@ c7887dd feat(world_model+identity+config): §10 auto-enroll, §32 schema, Pydant
 1217184 feat(world_model): §22 wire-up — orchestrator bootstrap + nightly loop + config
 03043fc feat(world_model): §22.5 cold-start cluster protocol + animal event metadata
 ```
+
+## Recently-installed deps (mid-session)
+
+Cole installed `open_clip_torch` mid-§23 implementation: `ftfy-6.3.1
+open_clip_torch-3.3.0 timm-1.0.27`. CLIP encoder now uses real
+weights when constructed; `try_load()` falls back to NullCLIPEncoder
+on any future failure (weights download issue, CUDA OOM, etc.).
+
+OWLv2 weights download to the HF cache on first construction.
+`transformers` was already installed; OpenVocabDetector should work
+without any further pip work.
 
 This file is the bridge between sessions. The bible is
 `scripts/massive_new_integration/new 2.md`; the **TOC comments at the

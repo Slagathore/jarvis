@@ -55,6 +55,7 @@ Variables:
 """
 
 import asyncio
+import os
 import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -62,6 +63,11 @@ from typing import Any, Optional
 import httpx
 import numpy as np
 from loguru import logger
+
+# OpenCV's FFmpeg bridge writes codec/probe noise directly to stderr during
+# Wyze RTSP cold starts. Keep our application logs readable; CameraManager
+# still logs open/probe failures through loguru.
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")
 
 
 class _RTSPFrameDrainer:
@@ -193,6 +199,7 @@ class CameraManager:
         self._video_kinds: dict[str, str] = {}  # "usb" | "http" | "rtsp"
         # Last source spec (int / url) for diagnostics + reopen
         self._sources: dict[str, Any] = {}
+        self._rtsp_transports: dict[str, str] = {}
         # First-frame cache from probe — consumed once per room
         self._last_frames: dict[str, np.ndarray] = {}
         # Consecutive read-failure count → triggers reopen at threshold
@@ -507,6 +514,9 @@ class CameraManager:
         # the open / probe below fails. _caps only gets populated on
         # success, so get_available_rooms still reflects live streams.
         self._video_kinds[room_id] = "rtsp"
+        self._sources[room_id] = url
+        self._rtsp_transports[room_id] = transport
+        self._read_locks.setdefault(room_id, asyncio.Lock())
         # OpenCV reads FFmpeg options from this env var at capture-open
         # time. There's no first-class API to pass them. Reset it after open
         # so the next room can use a different transport without surprise.
@@ -585,6 +595,7 @@ class CameraManager:
         self._caps[room_id] = cap
         self._video_kinds[room_id] = "rtsp"
         self._sources[room_id] = url
+        self._rtsp_transports[room_id] = transport
         self._fail_counts[room_id] = 0
         self._last_frames[room_id] = frame
         self._read_locks[room_id] = asyncio.Lock()
@@ -614,6 +625,21 @@ class CameraManager:
             {"room": room, "kind": kind}
             for room, kind in self._video_kinds.items()
         ]
+
+    async def reconnect_camera(self, room: str) -> bool:
+        """Force a fresh reconnect for a configured camera.
+
+        Currently only RTSP cameras need this manual path. It is public so the
+        dashboard does not have to reach into private reopen helpers, and it
+        uses the same per-room capture lock as snapshots so reconnect cannot
+        race with the dashboard's polling loop.
+        """
+        kind = self._video_kinds.get(room)
+        if kind != "rtsp":
+            return False
+        lock = self._read_locks.setdefault(room, asyncio.Lock())
+        async with lock:
+            return await asyncio.to_thread(self._force_reconnect_rtsp, room)
 
     def capture_frame(self, room: str) -> Optional[np.ndarray]:
         """
@@ -858,7 +884,18 @@ class CameraManager:
             self._safe_release(old)
         self._try_reopen_rtsp_throttled(room, force=True)
 
-    def _try_reopen_rtsp_throttled(self, room: str, force: bool = False) -> None:
+    def _force_reconnect_rtsp(self, room: str) -> bool:
+        """Manual dashboard reconnect: close old RTSP resources, bypass
+        throttle, and report whether a fresh capture is now live.
+        """
+        self._stop_drainer(room)
+        old = self._caps.pop(room, None)
+        if old is not None:
+            self._safe_release(old)
+        self._last_frames.pop(room, None)
+        return self._try_reopen_rtsp_throttled(room, force=True)
+
+    def _try_reopen_rtsp_throttled(self, room: str, force: bool = False) -> bool:
         """Attempt to (re)connect a Wyze RTSP stream, throttled by
         _wyze_reconnect_delay so we don't hammer the cam during a reboot
         or network outage. force=True bypasses the throttle for the
@@ -867,20 +904,21 @@ class CameraManager:
 
         Runs synchronously — callers (_read_cap_rtsp) are already inside
         asyncio.to_thread, and the throttle is the wait, not a sleep.
-        Returns nothing; the next read will see the new cap if successful.
+        Returns True when a fresh capture was installed.
         """
         if not _HAS_CV2:
-            return
+            return False
         assert cv2 is not None
         source = self._sources.get(room)
         if source is None or not isinstance(source, str):
-            return
+            logger.debug(f"[CameraManager] RTSP reconnect '{room}' has no source URL")
+            return False
         import time as _time
         now = _time.monotonic()
         if not force:
             next_ok = self._next_reopen_attempt.get(room, 0.0)
             if now < next_ok:
-                return  # still throttled; quietly skip this attempt
+                return False  # still throttled; quietly skip this attempt
         # Set throttle BEFORE the attempt so a slow / hung VideoCapture
         # constructor can't get retried in parallel.
         self._next_reopen_attempt[room] = now + self._wyze_reconnect_delay
@@ -888,13 +926,11 @@ class CameraManager:
         # Set the same FFmpeg options as the initial open (stimeout +
         # analyzeduration + probesize) so the reconnect doesn't fall
         # back to FFmpeg defaults that take 15-25s on Wyze's bitrate.
-        # transport defaults to tcp; if the room originally used udp we
-        # don't have that here, but TCP-on-reconnect is a safe choice
-        # (slightly slower but more reliable, and the open succeeds).
+        transport = self._rtsp_transports.get(room, "tcp")
         import os as _os
         prev_opts = _os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
         _os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-            "rtsp_transport;tcp"
+            f"rtsp_transport;{transport}"
             "|stimeout;5000000"
             "|analyzeduration;500000"
             "|probesize;100000"
@@ -903,8 +939,17 @@ class CameraManager:
             cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, self._wyze_buffer_size)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    self._safe_release(cap)
+                    logger.debug(
+                        f"[CameraManager] RTSP reconnect '{room}' opened but "
+                        "did not produce a probe frame"
+                    )
+                    return False
                 self._caps[room] = cap
                 self._fail_counts[room] = 0
+                self._last_frames[room] = frame
                 # Spin up a fresh drainer for the new cap. The previous
                 # drainer (if any) was already stopped by the path that
                 # got us here (_reopen_rtsp via _stop_drainer, or the
@@ -912,6 +957,7 @@ class CameraManager:
                 # registering a new one).
                 self._drainers[room] = _RTSPFrameDrainer(cap, room)
                 logger.info(f"[CameraManager] RTSP reconnected '{room}'")
+                return True
             else:
                 self._safe_release(cap)
                 logger.debug(
@@ -925,6 +971,7 @@ class CameraManager:
                 _os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
             else:
                 _os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = prev_opts
+        return False
 
     @staticmethod
     def _safe_release(cap: Any) -> None:

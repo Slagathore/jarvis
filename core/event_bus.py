@@ -48,6 +48,21 @@ from loguru import logger
 EventHandler = Callable[[dict], Coroutine[Any, Any, None]]
 
 
+class _SubscriptionHandle:
+    """No-op awaitable returned by subscribe().
+
+    Most of the codebase correctly treats EventBus.subscribe() as a synchronous
+    registration call. A few newer modules used `await bus.subscribe(...)`.
+    Returning an already-completed awaitable keeps both call styles valid
+    without delaying registration or forcing every older caller to change.
+    """
+
+    def __await__(self):
+        if False:
+            yield None
+        return None
+
+
 class EventBus:
     """
     Central async publish/subscribe event bus.
@@ -72,7 +87,7 @@ class EventBus:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    def subscribe(self, topic: str, handler: EventHandler) -> None:
+    def subscribe(self, topic: str, handler: EventHandler) -> _SubscriptionHandle:
         """
         Register an async handler for the given topic.
         Multiple handlers per topic are all called concurrently.
@@ -80,6 +95,7 @@ class EventBus:
         """
         self._subscribers[topic].append(handler)
         logger.debug(f"[EventBus] '{topic}' ← {handler.__qualname__}")
+        return _SubscriptionHandle()
 
     async def publish(self, topic: str, payload: dict) -> None:
         """

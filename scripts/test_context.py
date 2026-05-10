@@ -175,7 +175,7 @@ def test_sleep_tracker() -> bool:
         for _ in range(5):
             tracker.update(posture="lying", lights_on=False, room="bedroom")
 
-        signal = tracker.get_sleep_signal()
+        signal = tracker.get_room_sleep_signal("bedroom")
         ok(f"Sleep signal after lying posture: {signal}")
 
         tracker.record_wakeup()

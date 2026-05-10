@@ -28,7 +28,7 @@ Spec:    new 2.md §23.1, §23.4.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 from loguru import logger
@@ -57,8 +57,8 @@ class OpenVocabDetector:
         )
         self.device = device if torch.cuda.is_available() else "cpu"
         self._torch = torch
-        self.processor = Owlv2Processor.from_pretrained(model_name)  # type: ignore[no-untyped-call]
-        self.model = Owlv2ForObjectDetection.from_pretrained(
+        self.processor: Any = Owlv2Processor.from_pretrained(model_name)  # type: ignore[no-untyped-call]
+        self.model: Any = Owlv2ForObjectDetection.from_pretrained(
             model_name,
         ).to(self.device)  # type: ignore[attr-defined,union-attr]
         self.model.eval()

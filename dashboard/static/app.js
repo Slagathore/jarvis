@@ -424,6 +424,13 @@ function updateRooms(rooms) {
             reconnectBtnEl.classList.add("failed");
             setTimeout(() => reconnectBtnEl.classList.remove("failed"), 2000);
           } else {
+            const body = await res.json().catch(() => ({}));
+            if (!body.reconnected) {
+              console.warn(`[reconnect] ${roomId} did not reopen`, body);
+              reconnectBtnEl.classList.add("failed");
+              setTimeout(() => reconnectBtnEl.classList.remove("failed"), 2000);
+              return;
+            }
             // Force a snapshot refresh so the user sees the new feed
             // immediately without waiting for the 250ms poll cycle.
             refreshRoomFeeds();

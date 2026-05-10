@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import time
 import wave
 from typing import Any, Optional
 
@@ -206,7 +207,8 @@ class WyzeSshSpeakerSink(SpeakerSink):
         # both safe to run inside a single to_thread call so we don't burn
         # two thread context-switches per utterance.
         try:
-            await asyncio.to_thread(self._upload_and_play, wav_bytes)
+            timeout_s = self._play_timeout_seconds(wav_bytes, self._cam_rate)
+            await asyncio.to_thread(self._upload_and_play, wav_bytes, timeout_s)
         except AudioError:
             # Mark the connection stale; next play() will reconnect.
             self._safe_close()
@@ -217,12 +219,12 @@ class WyzeSshSpeakerSink(SpeakerSink):
                 f"[WyzeSpeaker:{self._room}] playback failed: {e}"
             ) from e
 
-    def _upload_and_play(self, wav_bytes: bytes) -> None:
+    def _upload_and_play(self, wav_bytes: bytes, timeout_s: float) -> None:
         """Sync helper that runs inside a thread. Uses paramiko's SFTP to
         push the WAV, then exec_command to run audioplay and waits for exit.
         """
         self._sftp_upload(self._remote_path, wav_bytes)
-        self._exec_audioplay(self._remote_path)
+        self._exec_audioplay(self._remote_path, timeout_s=timeout_s)
 
     def _sftp_upload(self, remote_path: str, wav_bytes: bytes) -> None:
         """Push `wav_bytes` to `remote_path` on the cam via SFTP. Caller is
@@ -241,7 +243,7 @@ class WyzeSshSpeakerSink(SpeakerSink):
             except Exception:
                 pass
 
-    def _exec_audioplay(self, remote_path: str) -> None:
+    def _exec_audioplay(self, remote_path: str, timeout_s: float = 10.0) -> None:
         """Run audioplay_t20 against an already-uploaded WAV at `remote_path`
         and wait for it to finish. Raises AudioError on non-zero exit.
         """
@@ -257,8 +259,25 @@ class WyzeSshSpeakerSink(SpeakerSink):
             f"LD_LIBRARY_PATH={_LD_LIBRARY_PATH} "
             f"{_AUDIOPLAY_BIN} {remote_path} {self._volume}"
         )
-        _, stdout, stderr = client.exec_command(cmd, timeout=30.0)
-        rc = stdout.channel.recv_exit_status()
+        _, stdout, stderr = client.exec_command(cmd, timeout=timeout_s)
+        channel = stdout.channel
+        try:
+            channel.settimeout(0.5)
+        except Exception:
+            pass
+        deadline = time.monotonic() + max(1.0, float(timeout_s))
+        while not channel.exit_status_ready():
+            if time.monotonic() >= deadline:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
+                raise AudioError(
+                    f"[WyzeSpeaker:{self._room}] audioplay timed out after "
+                    f"{timeout_s:.1f}s for {remote_path}"
+                )
+            time.sleep(0.05)
+        rc = channel.recv_exit_status()
         if rc != 0:
             err = stderr.read().decode("utf-8", errors="replace")[:300]
             raise AudioError(
@@ -300,8 +319,11 @@ class WyzeSshSpeakerSink(SpeakerSink):
                         f"[WyzeSpeaker:{self._room}] staged chime "
                         f"({len(wav_bytes)} B) at {self._remote_chime_path}"
                     )
+                timeout_s = self._play_timeout_seconds(
+                    wav_bytes, self._cam_rate, padding_s=1.0, minimum_s=1.5
+                )
                 await asyncio.to_thread(
-                    self._exec_audioplay, self._remote_chime_path
+                    self._exec_audioplay, self._remote_chime_path, timeout_s
                 )
             except AudioError:
                 # Stale connection or audioplay failure — drop both the
@@ -351,6 +373,21 @@ class WyzeSshSpeakerSink(SpeakerSink):
             w.setframerate(sample_rate)
             w.writeframes(pcm)
         return buf.getvalue()
+
+    @staticmethod
+    def _play_timeout_seconds(
+        wav_bytes: bytes,
+        sample_rate: int,
+        padding_s: float = 8.0,
+        minimum_s: float = 10.0,
+    ) -> float:
+        """Bound remote playback waits so a stuck cam never blocks wake capture."""
+        if not wav_bytes or sample_rate <= 0:
+            return minimum_s
+        # Minimal WAV header is 44 bytes; the payload is int16 mono.
+        pcm_bytes = max(0, len(wav_bytes) - 44)
+        duration_s = pcm_bytes / float(sample_rate * 2)
+        return max(minimum_s, duration_s + padding_s)
 
     async def close(self) -> None:
         async with self._client_lock:

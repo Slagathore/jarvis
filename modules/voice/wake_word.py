@@ -141,6 +141,36 @@ class WakeWordDetector:
         except Exception as e:
             logger.warning(f"[WakeWord] Could not query input device {self._device!r}: {e}")
 
+    def _publish_threadsafe(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        topic: str,
+        payload: dict,
+    ) -> None:
+        """Schedule EventBus.publish from the PortAudio worker thread.
+
+        During shutdown the event loop can close while the audio callback is
+        still unwinding. If run_coroutine_threadsafe rejects the coroutine, close
+        it explicitly so Python does not warn that EventBus.publish was never
+        awaited.
+        """
+        if loop.is_closed():
+            return
+        coro = self._bus.publish(topic, payload)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:
+            coro.close()
+            return
+
+        def _consume_result(done) -> None:
+            try:
+                done.result()
+            except Exception:
+                pass
+
+        fut.add_done_callback(_consume_result)
+
     def _resolve_device(self, device: Optional[int | str]) -> Optional[int]:
         """
         Resolve a configured device (None | int | str) to a sounddevice index.
@@ -253,12 +283,10 @@ class WakeWordDetector:
                         avg_rms = sum(level_buffer) / len(level_buffer)
                         level_buffer.clear()
                         db = 20.0 * float(np.log10(avg_rms)) if avg_rms > 1e-10 else -100.0
-                        asyncio.run_coroutine_threadsafe(
-                            self._bus.publish(
-                                "audio.level",
-                                {"room": self._room, "db": db},
-                            ),
+                        self._publish_threadsafe(
                             loop,
+                            "audio.level",
+                            {"room": self._room, "db": db},
                         )
 
                     # Get prediction scores for all loaded models
@@ -296,9 +324,8 @@ class WakeWordDetector:
                                 "confidence": score_value,
                                 "model": model_name,
                             }
-                            asyncio.run_coroutine_threadsafe(
-                                self._bus.publish("voice.wake_detected", payload),
-                                loop,
+                            self._publish_threadsafe(
+                                loop, "voice.wake_detected", payload
                             )
 
         except sd.PortAudioError as e:

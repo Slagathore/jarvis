@@ -773,10 +773,9 @@ class Orchestrator:
             localizer than raw mic confidence in that case).
 
         The coalesce window is set in config.voice.wake_word.coalesce_window_ms
-        (default 250 ms). 250 is enough for ~3 OWW prediction cycles per
-        mic — long enough that a quiet mic in another room reliably gets
-        a vote in, short enough that the user doesn't perceive a delay
-        between saying the wake word and the chime.
+        (default 250 ms). Office-first wakes get a longer guard window when
+        vision recently saw Cole elsewhere, because the office studio mic can
+        hear and fire before a Wyze room mic gets its vote onto the bus.
         """
         # Per-room echo suppression: drop wakes from a room we just
         # spoke into. The Wyze/ESP path puts audio out the cam speaker,
@@ -796,10 +795,73 @@ class Orchestrator:
         if self._wake_window_task is None or self._wake_window_task.done():
             wake_cfg = self.config.get("voice", {}).get("wake_word", {}) or {}
             window_ms = int(wake_cfg.get("coalesce_window_ms", 250))
+            prior = self._wake_room_prior()
+            if (
+                event.get("room") == "office"
+                and prior is not None
+                and prior[0] != "office"
+            ):
+                window_ms = max(
+                    window_ms,
+                    int(wake_cfg.get("office_bleed_guard_ms", 1800)),
+                )
+                logger.debug(
+                    f"[Wake] office-first wake; holding {window_ms}ms for "
+                    f"possible local room contender ({prior[0]} via {prior[1]})"
+                )
             window_s = max(0.0, window_ms / 1000.0)
             self._wake_window_task = asyncio.create_task(
                 self._fire_pending_wake_after(window_s)
             )
+
+    def _wake_room_prior(self) -> Optional[tuple[str, str, float]]:
+        """Return a recent non-audio room-localization prior for wake routing.
+
+        Priority:
+          1. `_active_user_room` from recognized face / dashboard chat.
+          2. A single non-office room in `_scene_state` with recent YOLO
+             person presence.
+
+        The second path is deliberately conservative: if two non-office rooms
+        both recently had a person, return None and let OWW confidence decide.
+        """
+        import time as _time
+
+        wake_cfg = self.config.get("voice", {}).get("wake_word", {}) or {}
+        now = _time.monotonic()
+        active_freshness_s = float(wake_cfg.get("vision_prior_freshness_s", 90.0))
+        if (
+            self._active_user_room
+            and (now - self._active_user_room_ts) < active_freshness_s
+        ):
+            return (
+                self._active_user_room,
+                "active",
+                now - self._active_user_room_ts,
+            )
+
+        scene_freshness_s = float(wake_cfg.get("person_presence_prior_freshness_s", 90.0))
+        candidates: list[tuple[str, float]] = []
+        wall_now = datetime.now(timezone.utc)
+        for room_id, obs in self._scene_state.items():
+            if room_id == "office" or not obs.get("person_present"):
+                continue
+            updated_raw = obs.get("updated_at")
+            if not isinstance(updated_raw, str):
+                continue
+            try:
+                updated_at = datetime.fromisoformat(updated_raw)
+            except ValueError:
+                continue
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            age_s = (wall_now - updated_at).total_seconds()
+            if 0.0 <= age_s <= scene_freshness_s:
+                candidates.append((room_id, age_s))
+        if len(candidates) == 1:
+            room_id, age_s = candidates[0]
+            return (room_id, "vision_person", age_s)
+        return None
 
     async def _fire_pending_wake_after(self, delay_s: float) -> None:
         """Sleeps the coalesce window, then fires the winning pending wake.
@@ -826,29 +888,20 @@ class Orchestrator:
         if not pending:
             return
 
-        # Vision-disambiguation tiebreaker: a recent face / wake / chat
-        # signal in a specific room is a stronger localizer than raw OWW
-        # confidence when mic quality varies wildly between rooms (the
-        # office's studio mic regularly outscores Wyze mics on speech
-        # that's actually happening elsewhere). If `_active_user_room`
-        # was set within the freshness window AND it's one of the
-        # candidates, that room wins. Otherwise fall back to plain
-        # confidence.
-        import time as _time
-        VISION_PRIOR_FRESHNESS_S = 30.0
-        VISION_PRIOR_BONUS = 0.5  # > typical mic-quality gap (~0.35)
-        now = _time.monotonic()
-        prior_room: Optional[str] = None
-        if (
-            self._active_user_room
-            and (now - self._active_user_room_ts) < VISION_PRIOR_FRESHNESS_S
-        ):
-            prior_room = self._active_user_room
+        # Vision/person-presence disambiguation: a recent room-local presence
+        # signal is a stronger localizer than raw OWW confidence when mic
+        # quality varies wildly between rooms.
+        wake_cfg = self.config.get("voice", {}).get("wake_word", {}) or {}
+        prior = self._wake_room_prior()
+        prior_room = prior[0] if prior is not None else None
+        prior_source = prior[1] if prior is not None else None
+        prior_age_s = prior[2] if prior is not None else None
+        vision_prior_bonus = float(wake_cfg.get("vision_prior_bonus", 0.5))
 
         def _score(e: dict) -> float:
             base = float(e.get("confidence", 0.0))
             if prior_room is not None and e.get("room") == prior_room:
-                return base + VISION_PRIOR_BONUS
+                return base + vision_prior_bonus
             return base
 
         winner = max(pending, key=_score)
@@ -867,8 +920,8 @@ class Orchestrator:
                 parts.append(f"{room_id}@{conf:.3f}{bonus_tag}")
             rundown = ", ".join(parts)
             prior_age = (
-                f", prior={prior_room}@{now - self._active_user_room_ts:.1f}s"
-                if prior_room else ""
+                f", prior={prior_room}/{prior_source}@{prior_age_s:.1f}s"
+                if prior_room and prior_age_s is not None else ""
             )
             logger.info(
                 f"[Wake] Coalesced {len(pending)} simultaneous wakes "

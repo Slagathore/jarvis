@@ -30,7 +30,7 @@ Spec:    new 2.md §23.3.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Callable, Optional, cast
 
 import numpy as np
 from loguru import logger
@@ -66,12 +66,16 @@ class CLIPEncoder:
         # open_clip returns (model, train_transform, val_transform); we
         # only want the val transform. Pylance can't see the tuple
         # types accurately so we annotate locally.
-        self.model, _, self.preprocess = (  # type: ignore[misc]
-            open_clip.create_model_and_transforms(
-                model_name, pretrained=pretrained, device=self.device,
-            )
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained, device=self.device,
         )
-        self.tokenizer = open_clip.get_tokenizer(model_name)
+        self.model: Any = model
+        self.preprocess: Callable[[Any], Any] = cast(
+            Callable[[Any], Any], preprocess
+        )
+        self.tokenizer: Callable[[list[str]], Any] = cast(
+            Callable[[list[str]], Any], open_clip.get_tokenizer(model_name)
+        )
         self.model.eval()
         # Probe the embedding dimension by encoding a 1×1 black image.
         # Keeps the rest of the system from hardcoding 512.

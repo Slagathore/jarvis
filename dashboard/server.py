@@ -43,7 +43,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional, cast
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -1894,10 +1894,17 @@ class DashboardServer:
                     detail=f"Reconnect only supported for RTSP cameras, '{room}' is {kind}",
                 )
             try:
-                await asyncio.to_thread(cm._try_reopen_rtsp_throttled, room, True)
+                reconnect = getattr(cm, "reconnect_camera", None)
+                if callable(reconnect):
+                    reconnect_camera = cast(
+                        Callable[[str], Awaitable[bool]], reconnect
+                    )
+                    now_open = bool(await reconnect_camera(room))
+                else:
+                    await asyncio.to_thread(cm._reopen_rtsp, room)
+                    now_open = room in cm.get_available_rooms()
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Reconnect failed: {e}") from e
-            now_open = room in cm.get_available_rooms()
             return JSONResponse({"room": room, "reconnected": now_open})
 
         @app.get("/stream/{room}")

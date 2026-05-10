@@ -8,11 +8,11 @@ $killed = $false
 
 # Method 1: PID file
 if (Test-Path $pidFile) {
-    $pid = [int](Get-Content $pidFile -Raw).Trim()
-    $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+    $jarvisPid = [int](Get-Content $pidFile -Raw).Trim()
+    $proc = Get-Process -Id $jarvisPid -ErrorAction SilentlyContinue
     if ($proc) {
-        Write-Host "Stopping Jarvis (PID $pid)..." -ForegroundColor Yellow
-        Stop-Process -Id $pid -Force
+        Write-Host "Stopping Jarvis (PID $jarvisPid)..." -ForegroundColor Yellow
+        Stop-Process -Id $jarvisPid -Force
         $killed = $true
     }
     Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
