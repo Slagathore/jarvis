@@ -919,7 +919,7 @@ function loadConfig() {
   const ta = document.getElementById("config-yaml");
   const status = document.getElementById("config-status");
   if (!ta) return;
-  fetch("/api/config")
+  fetch("/api/tunables")
     .then((r) => r.json())
     .then(({ yaml }) => {
       ta.value = yaml || "";
@@ -941,7 +941,7 @@ function saveConfig() {
   const ta = document.getElementById("config-yaml");
   const status = document.getElementById("config-status");
   if (!ta) return;
-  fetch("/api/config", {
+  fetch("/api/tunables", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ yaml: ta.value }),
@@ -3274,6 +3274,255 @@ setInterval(loadClownStatus, 8000);
       }
     });
   }
+})();
+
+// ── Tabs: Home / Settings / Logs ──────────────────────────────────────────
+
+(function setupTabs() {
+  const bar = document.getElementById("tab-bar");
+  if (!bar) return;
+  const buttons = bar.querySelectorAll(".tab-btn");
+  const panes = {
+    home: document.getElementById("tab-pane-home"),
+    settings: document.getElementById("tab-pane-settings"),
+    logs: document.getElementById("tab-pane-logs"),
+  };
+  buttons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.tab;
+      buttons.forEach((b) => b.classList.toggle("active", b === btn));
+      Object.entries(panes).forEach(([k, el]) => {
+        if (!el) return;
+        el.hidden = k !== target;
+      });
+      if (target === "settings") loadSettings();
+      if (target === "logs") connectLogStream();
+      if (target !== "logs") disconnectLogStream();
+    });
+  });
+})();
+
+// ── Settings tab ──────────────────────────────────────────────────────────
+
+const _SETTINGS_WM_LABELS = {
+  visibility_grace_misses: "Visibility grace (missed frames)",
+  visibility_grace_seconds: "Visibility grace (seconds)",
+  movement_jitter_threshold: "Movement jitter threshold (0-1)",
+  posture_debounce_frames: "Posture debounce (frames)",
+  interaction_debounce_frames: "Interaction debounce (frames)",
+  landmark_dwell_frames: "Landmark dwell (frames)",
+  T_handoff_seconds: "Hand-off window (seconds)",
+  stationary_long_minutes: "Stationary threshold (minutes)",
+};
+
+let _settingsState = null;
+
+async function loadSettings() {
+  const status = document.getElementById("settings-status");
+  if (status) { status.textContent = "loading…"; status.className = "settings-status"; }
+  try {
+    const res = await fetch("/api/tunables");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    _settingsState = await res.json();
+    renderSettings(_settingsState);
+    if (status) { status.textContent = ""; }
+  } catch (e) {
+    if (status) { status.textContent = `failed: ${e.message || e}`; status.className = "settings-status err"; }
+  }
+}
+
+function renderSettings(state) {
+  const wm = state.world_model || {};
+  const snap = state.snapshots || {};
+  const logs = (state.logs && state.logs.console_debug_blacklist) || [];
+
+  const wmEl = document.getElementById("settings-wm");
+  if (wmEl) {
+    wmEl.innerHTML = Object.entries(_SETTINGS_WM_LABELS)
+      .map(([k, label]) => {
+        const v = wm[k];
+        const step = (k === "movement_jitter_threshold" || k.endsWith("_seconds"))
+          ? "0.1" : "1";
+        return `<label>
+          <span>${escapeHtml(label)}</span>
+          <input type="number" step="${step}" data-key="${k}" value="${v !== undefined ? v : ""}" />
+        </label>`;
+      })
+      .join("");
+  }
+
+  const snapEl = document.getElementById("settings-snap");
+  if (snapEl) {
+    snapEl.innerHTML = Object.entries(snap)
+      .map(([k, v]) => `<label>
+          <span>${escapeHtml(k)}</span>
+          <input type="number" step="1" data-key="${k}" value="${v}" />
+        </label>`)
+      .join("");
+  }
+
+  const logsEl = document.getElementById("settings-logs");
+  if (logsEl) {
+    const rows = logs.map((mod, i) => `
+      <div class="log-mod-row">
+        <input type="text" value="${escapeHtml(mod)}" data-idx="${i}" />
+        <button class="dev-btn log-mod-remove" data-idx="${i}">Remove</button>
+      </div>
+    `).join("");
+    const addRow = `
+      <div class="log-mod-row">
+        <input type="text" id="log-mod-add" placeholder="modules.something.module" />
+        <button class="dev-btn" id="log-mod-add-btn">Add</button>
+      </div>`;
+    logsEl.innerHTML = rows + addRow;
+    logsEl.querySelectorAll(".log-mod-remove").forEach((b) => {
+      b.addEventListener("click", () => {
+        const i = Number(b.dataset.idx);
+        const updated = logs.filter((_, j) => j !== i);
+        applyLogBlacklist(updated);
+      });
+    });
+    const addBtn = document.getElementById("log-mod-add-btn");
+    const addInput = document.getElementById("log-mod-add");
+    if (addBtn && addInput) {
+      addBtn.addEventListener("click", () => {
+        const v = addInput.value.trim();
+        if (!v) return;
+        applyLogBlacklist([...logs, v]);
+      });
+    }
+  }
+}
+
+function _collectSettingsForm() {
+  const wm = {};
+  document.querySelectorAll("#settings-wm input[data-key]").forEach((el) => {
+    const k = el.dataset.key;
+    const v = el.value.trim();
+    if (v === "") return;
+    wm[k] = Number(v);
+  });
+  const snap = {};
+  document.querySelectorAll("#settings-snap input[data-key]").forEach((el) => {
+    const k = el.dataset.key;
+    const v = el.value.trim();
+    if (v === "") return;
+    snap[k] = Number(v);
+  });
+  return { world_model: wm, snapshots: snap };
+}
+
+async function _patchConfig(body) {
+  const status = document.getElementById("settings-status");
+  try {
+    const res = await fetch("/api/tunables", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const out = await res.json();
+    _settingsState = out.state || _settingsState;
+    renderSettings(_settingsState);
+    if (status) {
+      if (out.errors && out.errors.length) {
+        status.textContent = `applied with ${out.errors.length} error(s)`;
+        status.className = "settings-status err";
+        console.warn("[config] errors:", out.errors);
+      } else {
+        status.textContent = "applied ✓";
+        status.className = "settings-status ok";
+      }
+    }
+  } catch (e) {
+    if (status) { status.textContent = `failed: ${e.message || e}`; status.className = "settings-status err"; }
+  }
+}
+
+async function applyLogBlacklist(list) {
+  await _patchConfig({ logs: { console_debug_blacklist: list } });
+}
+
+(function wireSettingsButtons() {
+  const save = document.getElementById("settings-save");
+  const reload = document.getElementById("settings-reload");
+  if (save) save.addEventListener("click", () => _patchConfig(_collectSettingsForm()));
+  if (reload) reload.addEventListener("click", () => loadSettings());
+})();
+
+// ── Logs tab — WebSocket stream ──────────────────────────────────────────
+
+let _logSocket = null;
+let _logBuffer = [];
+let _logPaused = false;
+const LOG_MAX_LINES = 2000;
+
+function connectLogStream() {
+  if (_logSocket && _logSocket.readyState <= 1) return;
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  _logSocket = new WebSocket(`${proto}://${location.host}/ws/logs`);
+  _logSocket.addEventListener("open", () => {
+    _sendLogFilter();
+  });
+  _logSocket.addEventListener("message", (ev) => {
+    if (_logPaused) return;
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type !== "log" || !msg.record) return;
+    appendLogLine(msg.record);
+  });
+  _logSocket.addEventListener("close", () => { _logSocket = null; });
+}
+
+function disconnectLogStream() {
+  if (_logSocket) {
+    try { _logSocket.close(); } catch {}
+    _logSocket = null;
+  }
+}
+
+function _sendLogFilter() {
+  if (!_logSocket || _logSocket.readyState !== 1) return;
+  const minLevel = (document.getElementById("logs-min-level") || {}).value || "INFO";
+  const includeRaw = (document.getElementById("logs-include") || {}).value || "";
+  const include = includeRaw.split(",").map((s) => s.trim()).filter(Boolean);
+  _logSocket.send(JSON.stringify({ min_level: minLevel, include }));
+}
+
+function appendLogLine(rec) {
+  const pre = document.getElementById("logs-stream");
+  if (!pre) return;
+  const ts = (rec.ts || "").slice(11, 19);
+  const levelCls = `log-${(rec.level || "info").toLowerCase()}`;
+  const line = `${ts} [<span class="${levelCls}">${escapeHtml(rec.level)}</span>] ` +
+               `<span class="log-name">${escapeHtml(rec.name || "")}:${rec.line || 0}</span> ${escapeHtml(rec.message || "")}\n`;
+  _logBuffer.push(line);
+  if (_logBuffer.length > LOG_MAX_LINES) {
+    _logBuffer = _logBuffer.slice(-LOG_MAX_LINES);
+  }
+  // Append the new line at the end without rebuilding the whole pane.
+  const wasAtBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
+  pre.insertAdjacentHTML("beforeend", line);
+  // Trim the head if we're over the limit.
+  if (pre.childNodes.length > LOG_MAX_LINES * 2) {
+    pre.innerHTML = _logBuffer.join("");
+  }
+  if (wasAtBottom) pre.scrollTop = pre.scrollHeight;
+}
+
+(function wireLogButtons() {
+  const apply = document.getElementById("logs-apply");
+  const clear = document.getElementById("logs-clear");
+  const pause = document.getElementById("logs-pause");
+  if (apply) apply.addEventListener("click", () => _sendLogFilter());
+  if (clear) clear.addEventListener("click", () => {
+    _logBuffer = [];
+    const pre = document.getElementById("logs-stream");
+    if (pre) pre.innerHTML = "";
+  });
+  if (pause) pause.addEventListener("change", () => {
+    _logPaused = pause.checked;
+  });
 })();
 
 // ── Init ──────────────────────────────────────────────────────────────────

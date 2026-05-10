@@ -66,6 +66,17 @@ DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 LOG_DIR             = Path(__file__).parent / "data"
 PID_FILE            = Path(__file__).parent / "data" / "jarvis.pid"
 
+# Modules whose DEBUG output is one-per-frame and would otherwise drown
+# the console. The rotating file log stays unfiltered (the dashboard
+# Logs tab streams from it). Mutable so /api/config can toggle entries
+# at runtime — see dashboard/server.py:_gather_config_state / PATCH.
+_CONSOLE_DEBUG_BLACKLIST: set[str] = {
+    "modules.vision.object_detector",
+    "modules.vision.scene_analyzer",
+    "modules.context.state_fusion",
+    "modules.vision.openvocab_detector",
+}
+
 
 def _configure_event_loop_policy() -> None:
     """Use the selector loop on Windows for libraries that need add_reader/add_writer."""
@@ -87,18 +98,10 @@ def _setup_logging(log_level: str) -> None:
         "<level>{message}</level>"
     )
 
-    # Modules that emit one DEBUG line per detection / per frame and would
-    # otherwise drown the console. The file log still records them so the
-    # dashboard "Logs" tab can stream them on demand. Keep this list tight
-    # — only known per-frame spammers.
-    _CONSOLE_DEBUG_BLACKLIST = {
-        "modules.vision.object_detector",
-        "modules.vision.scene_analyzer",
-        "modules.context.state_fusion",
-        "modules.vision.openvocab_detector",
-    }
-
     def _console_filter(record):
+        # Module-level _CONSOLE_DEBUG_BLACKLIST is mutable so the
+        # dashboard /api/config endpoint can toggle entries at runtime
+        # without re-installing the loguru sink.
         if record["level"].no <= 10:  # DEBUG
             name = record["name"] or ""
             for prefix in _CONSOLE_DEBUG_BLACKLIST:

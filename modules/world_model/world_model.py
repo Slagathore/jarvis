@@ -86,6 +86,15 @@ class WorldModel:
             "snapshot_interval_seconds": 30.0,
             "timer_tick_seconds": 2.0,
             "boot_resolution_seconds": 30,
+            # Visibility-flicker hysteresis. An entity must miss
+            # `visibility_grace_misses` consecutive observation batches
+            # OR `visibility_grace_seconds` of wall time before we
+            # transition state out of PRESENT and emit LOST_VISIBILITY.
+            # Without this, YOLO false-negatives produce ~25 lost/
+            # reappeared events per second per entity.
+            "visibility_grace_misses": 3,
+            "visibility_grace_seconds": 1.5,
+            "landmark_dwell_frames": 3,
             **(config or {}),
         }
 

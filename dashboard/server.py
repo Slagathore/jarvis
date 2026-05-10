@@ -303,6 +303,75 @@ class DashboardServer:
                     f"[Dashboard] Client disconnected ({len(self._clients)} remaining)"
                 )
 
+        @app.websocket("/ws/logs")
+        async def logs_endpoint(ws: WebSocket):
+            """Stream loguru records to the dashboard Logs tab. The
+            client may send a JSON filter once on connect:
+              {"min_level": "INFO", "include": ["modules.world_model"]}
+            (include is a prefix list; empty = all). The server installs
+            a per-client loguru sink so filters apply at source, not on
+            the wire."""
+            await ws.accept()
+            queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
+            filt = {"min_level_no": 0, "include": []}
+
+            def _sink(message):
+                try:
+                    r = message.record
+                    if r["level"].no < filt["min_level_no"]:
+                        return
+                    name = r["name"] or ""
+                    inc = filt["include"]
+                    if inc and not any(name.startswith(p) for p in inc):
+                        return
+                    payload = {
+                        "ts": r["time"].isoformat(),
+                        "level": r["level"].name,
+                        "name": name,
+                        "function": r["function"],
+                        "line": r["line"],
+                        "message": r["message"],
+                    }
+                    try:
+                        queue.put_nowait(payload)
+                    except asyncio.QueueFull:
+                        pass
+                except Exception:
+                    pass
+
+            sink_id = logger.add(_sink, level="DEBUG", enqueue=False)
+
+            async def _drain():
+                while True:
+                    item = await queue.get()
+                    await ws.send_json({"type": "log", "record": item})
+
+            sender = asyncio.create_task(_drain())
+            try:
+                while True:
+                    raw = await ws.receive_text()
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    lv = str(msg.get("min_level", "DEBUG")).upper()
+                    name_to_no = {
+                        "TRACE": 5, "DEBUG": 10, "INFO": 20,
+                        "SUCCESS": 25, "WARNING": 30, "ERROR": 40,
+                        "CRITICAL": 50,
+                    }
+                    filt["min_level_no"] = name_to_no.get(lv, 0)
+                    inc = msg.get("include") or []
+                    filt["include"] = [str(p) for p in inc if isinstance(p, str)]
+            except WebSocketDisconnect:
+                pass
+            finally:
+                sender.cancel()
+                try:
+                    logger.remove(sink_id)
+                except Exception:
+                    pass
+
         @app.get("/api/state")
         async def get_state():
             return JSONResponse({
@@ -1682,6 +1751,128 @@ class DashboardServer:
             except Exception as e:
                 logger.warning(f"[/api/world_model/events] {e}")
                 raise HTTPException(status_code=500, detail=str(e)) from e
+
+        # ── Live tunables (Settings tab) ─────────────────────────────────
+        # GET  /api/tunables       → return all tunable groups
+        # PATCH /api/tunables      → merge updates into runtime state
+        #
+        # Distinct from /api/config which dumps the full YAML. This one
+        # is the curated, hot-reloadable knob surface that the dashboard
+        # Settings tab edits. Changes are runtime-only and revert on
+        # restart; persistent edits should go through the YAML directly.
+        _LOG_FILTER_MODULES_ATTR = "_console_debug_blacklist"
+
+        def _gather_config_state() -> dict:
+            orch = self._orchestrator
+            wm = getattr(orch, "world_model", None) if orch else None
+            ob = getattr(orch, "observation_builder", None) if orch else None
+            wm_cfg = dict(wm.cfg) if wm and isinstance(wm.cfg, dict) else {}
+            snap_intervals = (
+                dict(ob._snapshot_min_interval_s)
+                if ob is not None
+                else {}
+            )
+            try:
+                from main import _CONSOLE_DEBUG_BLACKLIST as _blk
+                log_blacklist = sorted(_blk)
+            except Exception:
+                log_blacklist = []
+            return {
+                "world_model": {
+                    "visibility_grace_misses": int(wm_cfg.get(
+                        "visibility_grace_misses", 3
+                    )),
+                    "visibility_grace_seconds": float(wm_cfg.get(
+                        "visibility_grace_seconds", 1.5
+                    )),
+                    "movement_jitter_threshold": float(wm_cfg.get(
+                        "movement_jitter_threshold", 0.08
+                    )),
+                    "posture_debounce_frames": int(wm_cfg.get(
+                        "posture_debounce_frames", 3
+                    )),
+                    "interaction_debounce_frames": int(wm_cfg.get(
+                        "interaction_debounce_frames", 3
+                    )),
+                    "landmark_dwell_frames": int(wm_cfg.get(
+                        "landmark_dwell_frames", 3
+                    )),
+                    "T_handoff_seconds": float(wm_cfg.get(
+                        "T_handoff_seconds", 8.0
+                    )),
+                    "stationary_long_minutes": float(wm_cfg.get(
+                        "stationary_long_minutes", 5.0
+                    )),
+                },
+                "snapshots": snap_intervals,
+                "logs": {"console_debug_blacklist": log_blacklist},
+            }
+
+        @app.get("/api/tunables")
+        async def tunables_get():
+            return JSONResponse(_gather_config_state())
+
+        @app.patch("/api/tunables")
+        async def tunables_patch(request: Request):
+            body = await request.json()
+            orch = self._orchestrator
+            wm = getattr(orch, "world_model", None) if orch else None
+            ob = getattr(orch, "observation_builder", None) if orch else None
+            applied: dict = {"world_model": {}, "snapshots": {}, "logs": {}}
+            errors: list[str] = []
+
+            wm_updates = body.get("world_model") or {}
+            if wm is not None and isinstance(wm_updates, dict):
+                for k, v in wm_updates.items():
+                    # Allow-list the keys we expose. Avoids accidental
+                    # blast-radius on unrelated cfg entries.
+                    if k not in {
+                        "visibility_grace_misses", "visibility_grace_seconds",
+                        "movement_jitter_threshold", "posture_debounce_frames",
+                        "interaction_debounce_frames", "landmark_dwell_frames",
+                        "T_handoff_seconds", "stationary_long_minutes",
+                    }:
+                        errors.append(f"unknown world_model key: {k}")
+                        continue
+                    try:
+                        wm.cfg[k] = (
+                            int(v) if k.endswith("_misses") or k.endswith("_frames")
+                            else float(v)
+                        )
+                        applied["world_model"][k] = wm.cfg[k]
+                    except (TypeError, ValueError) as e:
+                        errors.append(f"world_model.{k}: {e}")
+
+            snap_updates = body.get("snapshots") or {}
+            if ob is not None and isinstance(snap_updates, dict):
+                for k, v in snap_updates.items():
+                    if k not in ob._snapshot_min_interval_s:
+                        errors.append(f"unknown snapshot kind: {k}")
+                        continue
+                    try:
+                        ob._snapshot_min_interval_s[k] = max(0.0, float(v))
+                        applied["snapshots"][k] = ob._snapshot_min_interval_s[k]
+                    except (TypeError, ValueError) as e:
+                        errors.append(f"snapshots.{k}: {e}")
+
+            log_updates = body.get("logs") or {}
+            if isinstance(log_updates, dict):
+                bl = log_updates.get("console_debug_blacklist")
+                if isinstance(bl, list):
+                    try:
+                        from main import _CONSOLE_DEBUG_BLACKLIST as _blk
+                        _blk.clear()
+                        for m in bl:
+                            if isinstance(m, str) and m:
+                                _blk.add(m)
+                        applied["logs"]["console_debug_blacklist"] = sorted(_blk)
+                    except Exception as e:
+                        errors.append(f"logs.console_debug_blacklist: {e}")
+
+            return JSONResponse({
+                "applied": applied, "errors": errors,
+                "state": _gather_config_state(),
+            })
 
         # ── §22.5 cluster builder UI ──────────────────────────────────────
         # Workflow:
