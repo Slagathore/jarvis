@@ -716,3 +716,44 @@ outdoor_pets:
     breed: sulcata
     typical_zones: [backyard]
     household_owner: cole
+
+# ── World Model §23 tracked_objects ───────────────────────────────────────
+# Open-vocabulary objects use OWLv2 every
+# detection_interval_seconds.open_vocabulary (default 30s). The
+# `description` is what gets fed to OWLv2 as a text query (more visual =
+# better recall); the `name` is the friendly handle used in events + the
+# find_object("wallet") query. typical_rooms biases the cost function so
+# a YOLO-detected rectangle that *might* be a wallet gets a higher prior
+# in the office.
+#
+# Closed-vocabulary list restricts which YOLO COCO classes get tracked
+# as world-model entities — leaving it empty tracks all 80, which is
+# noisy. Detection runs every frame for these (interval=0).
+#
+# Open-vocab tracking requires `open_clip_torch` and `transformers`
+# installed; OWLv2 + CLIP weights download to the HF cache on first boot.
+tracked_objects:
+  open_vocabulary:
+    - name: wallet
+      description: "a small leather wallet"
+      typical_rooms: [office, bedroom, living_room]
+    - name: keys
+      description: "house keys on a keyring"
+      typical_rooms: [kitchen, living_room, office]
+    - name: glasses
+      description: "eyeglasses with black frames"
+      typical_rooms: [bedroom, office]
+    - name: leash
+      description: "a dog leash"
+      typical_rooms: [living_room, kitchen]
+  closed_vocabulary:
+    - cell phone
+    - cup
+    - book
+    - laptop
+    - bottle
+    - remote
+    - backpack
+  detection_interval_seconds:
+    open_vocabulary: 30
+    closed_vocabulary: 0

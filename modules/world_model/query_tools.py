@@ -30,7 +30,7 @@ Spec:    new 2.md §20 (Query Layer).
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from modules.world_model.world_model import WorldModel
 
@@ -212,6 +212,110 @@ class WorldQueryTools:
             "unmonitored_home": unmon,
             "owner_person_id": ent.household_owner_id,
             "is_archived": ent.archived_at is not None,
+        }
+
+    # ── §23.7 find_object — CLIP text-query over tracked objects ──────────
+
+    async def find_object(
+        self,
+        description: str,
+        k: int = 3,
+    ) -> dict:
+        """Embed `description` with CLIP and return the top-k most-
+        similar tracked objects. Hedges when the top similarity is
+        borderline so the LLM phrases the answer as a guess instead
+        of an assertion. Returns {found: false} when no encoder is
+        wired or no entities have visual embeddings — the LLM should
+        then say something like 'I don't have a tracked object that
+        looks like X'."""
+        encoder = getattr(self.world, "clip_encoder", None)
+        if encoder is None:
+            return {
+                "found": False,
+                "message": (
+                    "Object visual search isn't available "
+                    "(CLIP encoder not loaded)."
+                ),
+            }
+        try:
+            text_emb = encoder.encode_text(description)
+        except Exception as e:
+            return {
+                "found": False,
+                "message": f"CLIP text encode failed: {e}",
+            }
+        if text_emb is None:
+            return {
+                "found": False,
+                "message": (
+                    "Object visual search isn't available "
+                    "(CLIP encoder is a no-op stub)."
+                ),
+            }
+
+        import numpy as _np
+        candidates: list[tuple[float, Any]] = []
+        for e in self.world.entities.values():
+            if e.entity_type != "object":
+                continue
+            if e.metadata.get("pruned"):
+                continue
+            emb = e.metadata.get("_visual_embedding")
+            if emb is None:
+                continue
+            sim = float(
+                _np.dot(text_emb, emb)
+                / (_np.linalg.norm(text_emb)
+                   * _np.linalg.norm(emb) + 1e-9)
+            )
+            candidates.append((sim, e))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        threshold = float(
+            (self.world.cfg or {}).get("clip_match_threshold", 0.25)
+        )
+        if not candidates or candidates[0][0] < threshold:
+            return {
+                "found": False,
+                "message": (
+                    f"I don't have a tracked object that looks like "
+                    f"'{description}'."
+                ),
+                "checked_entities": len(candidates),
+            }
+        top = candidates[: max(1, int(k))]
+        primary_sim, primary = top[0]
+        return {
+            "found": True,
+            "name": (
+                primary.display_name
+                or primary.metadata.get("detected_class")
+                or "object"
+            ),
+            "last_seen_room": primary.last_seen_room,
+            "last_seen_landmark": primary.last_seen_landmark,
+            "last_seen_ts": (
+                primary.last_seen_ts.isoformat()
+                if primary.last_seen_ts else None
+            ),
+            "match_similarity": primary_sim,
+            "alternatives": [
+                {
+                    "name": (
+                        e.display_name
+                        or e.metadata.get("detected_class")
+                        or "object"
+                    ),
+                    "room": e.last_seen_room,
+                    "similarity": s,
+                }
+                for s, e in top[1:]
+            ],
+            # If primary similarity is borderline, the LLM should
+            # phrase the answer with explicit hedge.
+            "hedge": primary_sim < float(
+                (self.world.cfg or {}).get("clip_hedge_threshold", 0.32)
+            ),
         }
 
     # ── §24.5 Interaction queries ──────────────────────────────────────────

@@ -1,7 +1,7 @@
 <!-- markdownlint-disable -->
 # World Model integration — resume notes
 
-Last updated: **2026-05-10** (mid-session: §24 fully closed; mid-implementing v4.1 clown alarm; §23 next)
+Last updated: **2026-05-10** (post-§23: full Phase 4 done — pets, objects, alarms, interactions, clown)
 
 ## Resume protocol if you're picking up after auto-compaction
 

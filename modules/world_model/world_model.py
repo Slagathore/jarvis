@@ -85,6 +85,11 @@ class WorldModel:
         self.entities: dict[str, WorldEntity] = {}
         self._lock = asyncio.Lock()
         self._unhealthy_cameras: set[str] = set()
+        # §23 — optional CLIP encoder for find_object text-query
+        # similarity. None / NullCLIPEncoder → text-query path
+        # short-circuits to "no match" (correct behavior; nothing
+        # crashes).
+        self.clip_encoder: Optional[Any] = None
         # Background tasks the model owns; cancelled in stop().
         self._timer_task: Optional[asyncio.Task] = None
         self._snapshot_task: Optional[asyncio.Task] = None
@@ -596,12 +601,26 @@ class WorldModel:
 
         # Wider pool for cats/objects: same-type entity with strong
         # embedding match. People are caught by the person_id path above.
+        # §23.8 — for objects we additionally lower the threshold when
+        # an existing same-class same-room entity matches, so a phone
+        # repeatedly detected on the same desk doesn't proliferate
+        # into a new entity per frame.
         if obs.obj_class in ("cat", "object") and obs.visual_embedding is not None:
             best: Optional[WorldEntity] = None
             best_sim = 0.0
+            obs_class = (
+                obs.metadata.get("detected_class") or ""
+                if obs.obj_class == "object" else None
+            )
             for ent in self.entities.values():
                 if ent.entity_type != obs.obj_class:
                     continue
+                # Same-class hard filter for objects — different
+                # detected_class can never match.
+                if obs.obj_class == "object":
+                    ent_class = ent.metadata.get("detected_class") or ""
+                    if obs_class and ent_class and obs_class != ent_class:
+                        continue
                 emb = ent.metadata.get("_visual_embedding")
                 if emb is None:
                     continue
@@ -610,10 +629,19 @@ class WorldModel:
                     / (np.linalg.norm(obs.visual_embedding)
                        * np.linalg.norm(emb) + 1e-9)
                 )
-                if sim > best_sim:
+                # §23.8 — lower threshold for same-class same-room.
+                if obs.obj_class == "object" and ent.last_seen_room == obs.room:
+                    threshold = self.cfg.get(
+                        "cosine_match_strong_same_room", 0.45,
+                    )
+                else:
+                    threshold = self.cfg.get("cosine_match_strong", 0.6)
+                if sim > best_sim and sim >= threshold:
                     best, best_sim = ent, sim
-            if best is not None and best_sim >= self.cfg.get("cosine_match_strong", 0.6):
-                await self._update_matched(best, obs, ts, attribution_conf=best_sim)
+            if best is not None:
+                await self._update_matched(
+                    best, obs, ts, attribution_conf=best_sim,
+                )
                 return
 
         # Genuinely new entity.
@@ -1082,6 +1110,32 @@ class WorldModel:
             return None
         return "\n".join(lines)
 
+    # ── Object cost function (§23.6) ──────────────────────────────────────
+
+    def _typical_rooms_for(self, obj_class: Optional[str]) -> list[str]:
+        """Lookup of typical_rooms[] for an object class. Built lazily
+        from config.tracked_objects.open_vocabulary on first call so
+        the WorldModel doesn't have to know about the open-vocab
+        config at construct time."""
+        if not hasattr(self, "_typical_rooms_cache"):
+            self._typical_rooms_cache: dict[str, list[str]] = {}
+            cfg_objects = (
+                (self.cfg.get("tracked_objects") or {}).get(
+                    "open_vocabulary",
+                ) or []
+            )
+            for entry in cfg_objects:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if name:
+                    self._typical_rooms_cache[name] = list(
+                        entry.get("typical_rooms") or [],
+                    )
+        if not obj_class:
+            return []
+        return self._typical_rooms_cache.get(obj_class, [])
+
     # ── Animal cost function (§22.7) ───────────────────────────────────────
 
     # Per-species component weights. Cat weights match §22.7 exactly.
@@ -1209,59 +1263,136 @@ class WorldModel:
                 return other.display_name
         return None
 
-    # ── Object cost (§23 closed-vocab portion) ────────────────────────────
+    # ── §23.8 stale-object pruning ────────────────────────────────────────
+
+    async def prune_stale_objects(
+        self, max_age_days: int = 30,
+    ) -> int:
+        """Soft-delete object entities that haven't been seen in
+        `max_age_days` AND have no INTERACTED_WITH / PICKED_UP /
+        PLACED_DOWN events in their history. Touched objects keep
+        their row even when invisible — story value matters. Marked
+        with metadata.pruned=True so the candidate-pool filter
+        excludes them; the row itself stays for query history.
+
+        Called nightly off the orchestrator's daily-task loop alongside
+        BehavioralProfileBuilder. Returns the count of pruned entities."""
+        now = datetime.utcnow()
+        cutoff = now - timedelta(days=max_age_days)
+        pruned = 0
+        async with self._lock:
+            for ent in list(self.entities.values()):
+                if ent.entity_type != "object":
+                    continue
+                if ent.metadata.get("pruned"):
+                    continue
+                if ent.last_seen_ts is not None and ent.last_seen_ts >= cutoff:
+                    continue
+                # Check for any interaction history before pruning.
+                interactions = await self.store.search_events(
+                    entity_id=ent.id,
+                    event_types=[
+                        "interacted_with", "picked_up", "placed_down",
+                    ],
+                    limit=1,
+                )
+                if interactions:
+                    continue
+                ent.metadata["pruned"] = True
+                await self.store.upsert_entity(ent)
+                pruned += 1
+        if pruned:
+            logger.info(
+                f"[WorldModel] prune_stale_objects: marked {pruned} "
+                f"object entit(y/ies) as pruned (≥{max_age_days}d, "
+                "no interaction history)"
+            )
+        return pruned
+
+    # ── Object cost (§23.6) ───────────────────────────────────────────────
 
     def _object_pair_cost(self, obs: Observation, ent: WorldEntity) -> float:
-        """Closed-vocab object association — for the YOLO-detected
-        TRACKED_OBJECT_CLASSES (cell phone, cup, book, laptop, bottle,
-        remote). Open-vocab + CLIP embedding matching is §23.4-§23.6
-        and lands when the encoder is bootstrapped.
+        """§23.6 — full object association cost. When CLIP embeddings
+        are available on both sides, the visual signal dominates;
+        without them the cost falls through to the closed-vocab
+        spatial-temporal continuity logic that landed earlier (a
+        same-class same-room recent match wins, otherwise reject).
 
         Cost components:
-          - Class match (hard): a phone observation can't link to a cup
-            entity. Class is read from obs.metadata.detected_class /
-            ent.metadata.detected_class because obs.obj_class is the
-            generic "object" label.
-          - Same-room continuity: an object is overwhelmingly likely
-            to be the same instance if observed in the same room
-            within the candidate-lookback window (default 2 minutes).
-          - Bbox-center distance + IoU: tighter spatial match wins.
-          - Time gap penalty.
+          • Class match (hard reject) — a wallet obs cannot match a
+            phone entity even if their CLIP embeddings happen to
+            cluster.
+          • CLIP cosine similarity (when both sides have an embedding).
+          • Room prior — same room is essentially free; a typical-
+            rooms hit is a soft penalty; otherwise expensive (objects
+            don't relocate themselves).
+          • Time decay — entities not seen in days lose match priority
+            so finding a similar object after a long gap doesn't
+            silently re-attribute it.
         """
         obs_class = obs.metadata.get("detected_class")
         ent_class = ent.metadata.get("detected_class")
         if (obs_class and ent_class and obs_class != ent_class):
             return self.cfg["cost_reject"] * 2
 
+        ent_emb = ent.metadata.get("_visual_embedding")
+        obs_emb = obs.visual_embedding
+
+        # Path A — both sides have CLIP embeddings: the spec's full
+        # §23.6 cost function (emb 0.55 · room 0.30 · time 0.15).
+        if ent_emb is not None and obs_emb is not None:
+            sim = float(
+                np.dot(obs_emb, ent_emb)
+                / (np.linalg.norm(obs_emb)
+                   * np.linalg.norm(ent_emb) + 1e-9)
+            )
+            emb_cost = 1.0 - sim
+            if ent.last_seen_room == obs.room:
+                room_cost = 0.0
+            elif (obs_class and obs.room
+                    and obs.room in self._typical_rooms_for(obs_class)):
+                room_cost = 0.25
+            else:
+                room_cost = 0.5
+            if ent.last_seen_ts:
+                days_gone = (
+                    (obs.ts - ent.last_seen_ts).total_seconds() / 86400.0
+                )
+                time_cost = float(min(days_gone / 14.0, 0.5))
+            else:
+                time_cost = 0.5
+            return float(max(0.0, (
+                0.55 * emb_cost
+                + 0.30 * room_cost
+                + 0.15 * time_cost
+            )))
+
+        # Path B — closed-vocab spatial-temporal fallback (the original
+        # logic that landed before CLIP). Used when one or both sides
+        # lack a visual embedding (Null encoder, embed compute failed).
         if not ent.last_seen_ts:
-            # No history → fresh object, let the unmatched path pick it up.
             return self.cfg["cost_reject"] * 2
         seconds_gone = (obs.ts - ent.last_seen_ts).total_seconds()
-        # Objects don't move themselves — broad lookback is fine, but
-        # stale entities (>15 min idle) shouldn't capture new sightings.
         if seconds_gone > 15 * 60:
             return self.cfg["cost_reject"] * 2
 
         if obs.room == ent.last_seen_room:
-            room_cost = 0.0
+            room_cost_b = 0.0
         else:
-            # Different room is a strong negative — a coffee cup
-            # appearing on a different camera is more likely a new
-            # cup than the old one teleporting.
-            room_cost = 0.7
+            room_cost_b = 0.7
 
         spatial = self._spatial_distance(obs, ent)
-        iou = bbox_iou(obs.bbox, ent.last_seen_bbox) if ent.last_seen_bbox else 0.0
-        # IoU is a positive bonus — higher overlap, lower cost.
+        iou = (
+            bbox_iou(obs.bbox, ent.last_seen_bbox)
+            if ent.last_seen_bbox else 0.0
+        )
         iou_term = 1.0 - float(iou)
-
-        time_cost = min(seconds_gone / (15 * 60.0), 1.0)
-
+        time_cost_b = min(seconds_gone / (15 * 60.0), 1.0)
         return float(max(0.0, (
-            0.5 * room_cost
+            0.5 * room_cost_b
             + 0.25 * spatial
             + 0.15 * iou_term
-            + 0.10 * time_cost
+            + 0.10 * time_cost_b
         )))
 
 

@@ -107,6 +107,10 @@ class ObservationBuilder:
         rooms_config: list[dict],
         snapshot_dir: Optional[Path] = None,
         hand_detector: Optional[Any] = None,
+        clip_encoder: Optional[Any] = None,
+        openvocab_detector: Optional[Any] = None,
+        tracked_objects_open_vocab: Optional[list[dict]] = None,
+        openvocab_interval_seconds: float = 30.0,
     ) -> None:
         self.bus = bus
         self.cm = camera_manager
@@ -119,6 +123,19 @@ class ObservationBuilder:
         # PICKED_UP / PLACED_DOWN events never fire (state machine
         # safely degrades). NullHandDetector is the standard test stub.
         self.hand_detector = hand_detector
+        # §23 — CLIP encoder + OWLv2 detector. NullCLIPEncoder /
+        # NullOpenVocabDetector are the no-op fallbacks the orchestrator
+        # passes when the heavy ML deps aren't installed; the system
+        # boots without them, just no object visual-embedding dedup
+        # and no open-vocab "where's my wallet" tracking.
+        self.clip_encoder = clip_encoder
+        self.openvocab = openvocab_detector
+        self.tracked_objects_open_vocab: list[dict] = list(
+            tracked_objects_open_vocab or []
+        )
+        self._openvocab_interval_s = float(openvocab_interval_seconds)
+        # Per-room open-vocab loop tasks; cancelled in stop().
+        self._openvocab_tasks: dict[str, asyncio.Task] = {}
         # Index rooms by id for fast `_loop_for_room` lookups; preserve
         # the original dicts so loop reads fps_active etc. directly.
         self.rooms: dict[str, dict] = {r["id"]: r for r in rooms_config}
@@ -162,21 +179,32 @@ class ObservationBuilder:
                 self._loop_for_room(room_id),
                 name=f"observation_builder:{room_id}",
             )
+            # §23 — additional low-frequency loop per room for OWLv2.
+            # Skipped silently when no detector / no queries declared.
+            if (self.openvocab is not None
+                    and self.tracked_objects_open_vocab):
+                self._openvocab_tasks[room_id] = asyncio.create_task(
+                    self._open_vocab_loop_for_room(room_id),
+                    name=f"observation_builder_openvocab:{room_id}",
+                )
         logger.info(
             f"[ObservationBuilder] started on {len(self._tasks)} room(s): "
             + ", ".join(sorted(self._tasks.keys()))
+            + (f"; open-vocab loops on {len(self._openvocab_tasks)} room(s)"
+               if self._openvocab_tasks else "")
         )
 
     async def stop(self) -> None:
         """Cancel all per-room loops. Safe to call before start()."""
         self._stopped = True
-        for room_id, task in list(self._tasks.items()):
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._tasks.clear()
+        for tasks_dict in (self._tasks, self._openvocab_tasks):
+            for _, task in list(tasks_dict.items()):
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            tasks_dict.clear()
 
     # ── Per-room frame pump ────────────────────────────────────────────────
 
@@ -604,15 +632,145 @@ class ObservationBuilder:
         fw: int,
         fh: int,
     ) -> Observation:
-        # Phase 4 — full enrichment in §23.5 (CLIP embeddings, dedup).
+        """§23.5 — YOLO-detected object + CLIP visual embedding for
+        WorldModel object dedup and find_object query similarity.
+        When clip_encoder is None / NullCLIPEncoder, visual_embedding
+        comes back None and the cost function falls back to spatial-
+        temporal continuity (which is what landed in the closed-vocab
+        commit earlier)."""
+        bbox = det.bbox
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+        x1 = max(0, min(fw - 1, x1))
+        y1 = max(0, min(fh - 1, y1))
+        x2 = max(0, min(fw, x2))
+        y2 = max(0, min(fh, y2))
+        crop = frame[y1:y2, x1:x2] if y2 > y1 and x2 > x1 else None
+        visual_emb = None
+        if self.clip_encoder is not None and crop is not None:
+            try:
+                visual_emb = self.clip_encoder.encode_image(crop)
+            except Exception as e:
+                logger.debug(
+                    f"[ObservationBuilder] CLIP encode failed in '{room}' "
+                    f"for {det.class_name}: {e}"
+                )
+        crop_path = self._save_animal_crop("object", crop, room, ts)
         return Observation(
             camera=room, room=room, obj_class="object",
-            bbox=tuple(det.bbox), confidence=det.confidence, ts=ts,
+            bbox=tuple(bbox), confidence=det.confidence, ts=ts,
+            visual_embedding=visual_emb,
             metadata={
                 "detected_class": det.class_name,
                 "frame_width": fw, "frame_height": fh,
+                "source": "yolo",
+                "crop_path": str(crop_path) if crop_path else None,
             },
         )
+
+    # ── §23.4 open-vocab loop (low-frequency OWLv2) ────────────────────────
+
+    async def _open_vocab_loop_for_room(self, room_id: str) -> None:
+        """Per-room background loop that runs OWLv2 every
+        `_openvocab_interval_s` seconds against the user-declared
+        open-vocab queries. Each detection becomes an
+        Observation(obj_class='object', source='owlv2') with a CLIP
+        embedding attached, published on the same vision.observation
+        topic as the YOLO path so the WorldModel cost function +
+        dedup logic handle them uniformly.
+
+        Skipped entirely when no queries are declared, when OWLv2
+        isn't loaded, or when the camera isn't currently streaming.
+        """
+        if (self.openvocab is None
+                or not self.tracked_objects_open_vocab):
+            return
+        queries = [
+            t.get("description") or t.get("name")
+            for t in self.tracked_objects_open_vocab
+            if t.get("description") or t.get("name")
+        ]
+        if not queries:
+            return
+        # Map description → friendly name for the metadata.
+        name_for_query: dict[str, str] = {}
+        for t in self.tracked_objects_open_vocab:
+            q = t.get("description") or t.get("name")
+            n = t.get("name") or q
+            if q and n:
+                name_for_query[str(q)] = str(n)
+        logger.info(
+            f"[ObservationBuilder] open-vocab loop on '{room_id}' — "
+            f"{len(queries)} queries, every {self._openvocab_interval_s:.0f}s"
+        )
+        while not self._stopped:
+            try:
+                await asyncio.sleep(self._openvocab_interval_s)
+            except asyncio.CancelledError:
+                return
+            try:
+                frame = await self.cm.capture_frame_async(room_id)
+                if frame is None:
+                    continue
+                ts = datetime.now(timezone.utc)
+                # OWLv2 inference is sync + heavy — run in a worker
+                # thread so we don't block the event loop.
+                results = await asyncio.to_thread(
+                    self.openvocab.detect, frame, queries,
+                )
+                if not results:
+                    continue
+                fh, fw = frame.shape[:2]
+                observations: list[Observation] = []
+                for r in results:
+                    x1, y1, x2, y2 = r["bbox"]
+                    x1 = max(0, min(fw - 1, int(x1)))
+                    y1 = max(0, min(fh - 1, int(y1)))
+                    x2 = max(0, min(fw, int(x2)))
+                    y2 = max(0, min(fh, int(y2)))
+                    crop = (
+                        frame[y1:y2, x1:x2]
+                        if y2 > y1 and x2 > x1 else None
+                    )
+                    visual_emb = None
+                    if self.clip_encoder is not None and crop is not None:
+                        try:
+                            visual_emb = self.clip_encoder.encode_image(crop)
+                        except Exception as e:
+                            logger.debug(
+                                f"[ObservationBuilder] CLIP encode "
+                                f"failed in open-vocab '{room_id}': {e}"
+                            )
+                    crop_path = self._save_animal_crop(
+                        "openvocab", crop, room_id, ts,
+                    )
+                    friendly = name_for_query.get(r["name"], r["name"])
+                    observations.append(Observation(
+                        camera=room_id, room=room_id, obj_class="object",
+                        bbox=(x1, y1, x2, y2),
+                        confidence=float(r["score"]), ts=ts,
+                        visual_embedding=visual_emb,
+                        metadata={
+                            "detected_class": friendly,
+                            "openvocab_query": r["name"],
+                            "frame_width": fw, "frame_height": fh,
+                            "source": "owlv2",
+                            "crop_path": (
+                                str(crop_path) if crop_path else None
+                            ),
+                        },
+                    ))
+                if observations:
+                    await self.bus.publish("vision.observation", {
+                        "camera": room_id, "room": room_id, "ts": ts,
+                        "observations": observations,
+                    })
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.exception(
+                    f"[ObservationBuilder] open-vocab loop error in "
+                    f"'{room_id}': {e}"
+                )
 
 
 # ── Animal descriptor helpers (§22.3) ───────────────────────────────────────

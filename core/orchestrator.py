@@ -2348,6 +2348,46 @@ class Orchestrator:
                 },
             },
         },
+        # ── Object find (§23.7) ─────────────────────────────────────────
+        {
+            "type": "function",
+            "function": {
+                "name": "find_object",
+                "description": (
+                    "Find a tracked object by free-text description "
+                    "(visual + semantic match via CLIP). Use for "
+                    "'where's my wallet', 'find my keys', 'where did I "
+                    "leave the leash', 'where's the brown box that came "
+                    "yesterday'. Description can be specific "
+                    "('a small leather wallet') or generic ('keys'). "
+                    "Returns the best-match entity + alternatives. When "
+                    "the response carries `hedge: true`, phrase the "
+                    "answer as a guess ('I think it's...', 'might be in "
+                    "the office') rather than a definite assertion."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["description"],
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": (
+                                "Free-text describing the object. Best "
+                                "results are concrete + visual: 'orange "
+                                "pill bottle', 'brown leather wallet'."
+                            ),
+                        },
+                        "k": {
+                            "type": "integer",
+                            "description": (
+                                "How many alternatives to return "
+                                "alongside the primary match. Default 3."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
     ]
 
     def _world_tool_handlers(self) -> dict:
@@ -2403,6 +2443,9 @@ class Orchestrator:
         async def _last_touched(object_name: str) -> dict:
             return await wq.who_last_touched(object_name)
 
+        async def _find_object(description: str, k: int = 3) -> dict:
+            return await wq.find_object(description, k=k)
+
         return {
             "get_entity_status":         _entity,
             "list_entities_in_room":     _in_room,
@@ -2413,6 +2456,7 @@ class Orchestrator:
             "pet_care_summary":          _pet_care,
             "what_did_someone_do_with":  _did_with,
             "who_last_touched":          _last_touched,
+            "find_object":               _find_object,
         }
 
     _GET_SNAPSHOT_TOOL = {
@@ -3660,6 +3704,25 @@ class Orchestrator:
                     f"[WorldModel] nightly: rebuilt {rebuilt}/"
                     f"{len(targets)} pet profiles"
                 )
+                # §23.8 — prune stale, untouched object entities. Drops
+                # the "every cup is a new cup" stragglers without
+                # losing anything Cole ever interacted with.
+                try:
+                    object_max_age = int(cfg.get(
+                        "object_prune_max_age_days", 30,
+                    ))
+                    pruned = await world.prune_stale_objects(
+                        max_age_days=object_max_age,
+                    )
+                    if pruned:
+                        logger.info(
+                            f"[WorldModel] nightly: pruned {pruned} "
+                            "stale object entit(y/ies)"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[WorldModel] object prune failed: {e}"
+                    )
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -4888,6 +4951,56 @@ class Orchestrator:
                         f"[Init] HandDetector unavailable; interactions "
                         f"will not fire ({e})"
                     )
+                # §23 — CLIP encoder + OWLv2 open-vocab detector. Both
+                # `try_load` to a Null* fallback when their heavy ML
+                # deps are missing; the rest of the pipeline degrades
+                # cleanly (no object dedup signal, no open-vocab
+                # tracking) without crashing.
+                from modules.vision.clip_encoder import (
+                    try_load as try_load_clip,
+                )
+                from modules.vision.openvocab_detector import (
+                    try_load as try_load_openvocab,
+                )
+                clip_cfg = (
+                    self.config.get("world_model", {}) or {}
+                ).get("clip_encoder", {}) or {}
+                openvocab_cfg = (
+                    self.config.get("world_model", {}) or {}
+                ).get("openvocab_detector", {}) or {}
+                clip_encoder = try_load_clip(
+                    model_name=clip_cfg.get(
+                        "model_name", "ViT-B-32",
+                    ),
+                    pretrained=clip_cfg.get(
+                        "pretrained", "laion2b_s34b_b79k",
+                    ),
+                    device=clip_cfg.get("device", "cuda"),
+                )
+                openvocab_detector = try_load_openvocab(
+                    model_name=openvocab_cfg.get(
+                        "model_name",
+                        "google/owlv2-base-patch16-ensemble",
+                    ),
+                    device=openvocab_cfg.get("device", "cuda"),
+                    score_threshold=float(
+                        openvocab_cfg.get("score_threshold", 0.20),
+                    ),
+                )
+                tracked_objects_cfg = (
+                    self.config.get("tracked_objects", {}) or {}
+                )
+                tracked_open_vocab = (
+                    tracked_objects_cfg.get("open_vocabulary") or []
+                )
+                openvocab_interval = float(
+                    (tracked_objects_cfg.get(
+                        "detection_interval_seconds", {},
+                    ) or {}).get("open_vocabulary", 30.0)
+                )
+                # Hand the CLIP encoder to the WorldModel so find_object
+                # can encode text queries against the same model.
+                self.world_model.clip_encoder = clip_encoder
                 self.observation_builder = ObservationBuilder(
                     bus=self.bus,
                     camera_manager=self.cameras,
@@ -4898,6 +5011,10 @@ class Orchestrator:
                     rooms_config=ob_rooms,
                     snapshot_dir=snapshot_dir,
                     hand_detector=hand_detector,
+                    clip_encoder=clip_encoder,
+                    openvocab_detector=openvocab_detector,
+                    tracked_objects_open_vocab=tracked_open_vocab,
+                    openvocab_interval_seconds=openvocab_interval,
                 )
                 # Wire the camera-health publisher so WorldModel can
                 # suspend its state machine for offline rooms.

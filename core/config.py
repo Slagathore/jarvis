@@ -403,6 +403,34 @@ class WorldModelCfg(BaseModel):
     )
 
 
+# ── §23 tracked_objects: ─────────────────────────────────────────────────────
+
+
+class TrackedOpenVocabObject(BaseModel):
+    """One open-vocab object the system should track via OWLv2 +
+    CLIP. `description` is what gets fed to OWLv2 as the text query
+    (more visual = better recall). `name` is the friendly handle
+    used in events + queries."""
+    name: str
+    description: str
+    typical_rooms: list[str] = Field(default_factory=list)
+
+
+class DetectionIntervalCfg(BaseModel):
+    open_vocabulary: float = 30.0
+    closed_vocabulary: float = 0.0
+
+
+class TrackedObjectsCfg(BaseModel):
+    open_vocabulary: list[TrackedOpenVocabObject] = Field(
+        default_factory=list,
+    )
+    closed_vocabulary: list[str] = Field(default_factory=list)
+    detection_interval_seconds: DetectionIntervalCfg = Field(
+        default_factory=DetectionIntervalCfg,
+    )
+
+
 class ResidentCfg(BaseModel):
     """One human resident — links a config-level token (cole/anna/jeff)
     to a display_name + primary_room. The token is what pets reference
@@ -458,6 +486,57 @@ class PetDogCfg(PetCommonCfg):
 class PetsCfg(BaseModel):
     cats: list[PetCatCfg] = Field(default_factory=list)
     dogs: list[PetDogCfg] = Field(default_factory=list)
+
+
+def validate_tracked_objects(
+    config: dict,
+    rooms_known: set[str],
+) -> Optional[TrackedObjectsCfg]:
+    """Validate the §23 tracked_objects: block + its cross-references.
+    Returns None when the block is absent (not all installs care).
+    Cross-references enforced (HARD errors at boot):
+      • open_vocabulary[*].typical_rooms ⊆ {rooms.id}
+    Soft warnings:
+      • Missing description (logged, but pydantic catches it as required).
+    """
+    raw = config.get("tracked_objects")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            "config.yaml: 'tracked_objects' must be a mapping, got "
+            f"{type(raw).__name__}"
+        )
+    try:
+        cfg = TrackedObjectsCfg.model_validate(raw)
+    except ValidationError as e:
+        first = e.errors()[0]
+        loc = ".".join(str(p) for p in first.get("loc", ()))
+        raise ConfigError(
+            f"config.yaml: 'tracked_objects.{loc}' invalid: "
+            f"{first.get('msg', 'validation failed')}"
+        ) from e
+
+    seen_names: set[str] = set()
+    for obj in cfg.open_vocabulary:
+        if obj.name in seen_names:
+            raise ConfigError(
+                f"config.yaml: duplicate tracked_objects open_vocabulary "
+                f"name '{obj.name}'"
+            )
+        seen_names.add(obj.name)
+        # Typical-rooms cross-reference — warn-only via the logger
+        # rather than fail-fast. A typo here just means the room
+        # prior won't apply for that object class; the tracking
+        # still functions otherwise.
+        unknown = [r for r in obj.typical_rooms if r not in rooms_known]
+        if unknown:
+            logger.warning(
+                f"[Config] tracked_objects.{obj.name}.typical_rooms "
+                f"references unknown room(s) {unknown} "
+                f"(known: {sorted(rooms_known)})"
+            )
+    return cfg
 
 
 def validate_world_model_config(
@@ -804,5 +883,21 @@ def expand_and_validate(config: dict) -> tuple[dict, list[RoomConfig]]:
         # Re-raise so boot fails fast — but log the section first so the
         # error message in the user's terminal makes it obvious WHY.
         logger.error("[Config] world_model / residents / pets validation failed")
+        raise
+    # §23 tracked_objects validation. Independent of world_model so a
+    # household can declare objects without having pet config, and
+    # vice versa.
+    try:
+        rooms_known = {
+            r.get("id") for r in expanded.get("rooms", [])
+            if isinstance(r, dict) and r.get("id")
+        }
+        rooms_known.discard(None)
+        tracked_objects_cfg = validate_tracked_objects(
+            expanded, rooms_known,  # type: ignore[arg-type]
+        )
+        expanded["_typed_tracked_objects"] = tracked_objects_cfg
+    except ConfigError:
+        logger.error("[Config] tracked_objects validation failed")
         raise
     return expanded, rooms
