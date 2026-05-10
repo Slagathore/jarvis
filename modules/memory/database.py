@@ -300,6 +300,12 @@ class DatabaseManager:
                 # they were written by the DeepFace/Facenet pipeline. New
                 # ArcFace samples write 'arcface_buffalo_l_v1'.
                 "ALTER TABLE face_samples ADD COLUMN model_version TEXT NOT NULL DEFAULT 'facenet_v1'",
+                # Pending-review face bbox so the dashboard can draw a
+                # highlight around the actual face being attributed when
+                # a capture frame contains multiple people. JSON text
+                # of [x1, y1, x2, y2] in image-pixel coords, or NULL
+                # when we don't have it (legacy rows / face-less audio).
+                "ALTER TABLE identity_pending ADD COLUMN face_bbox TEXT",
             ):
                 try:
                     await conn.execute(migration_sql)

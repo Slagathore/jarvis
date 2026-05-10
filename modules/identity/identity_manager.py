@@ -31,6 +31,7 @@ Classes: IdentityManager, PersonMatch (dataclass)
 
 import asyncio
 import io
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -454,13 +455,24 @@ class IdentityManager:
         return match
 
     async def identify_face(self, frame: np.ndarray) -> Optional[PersonMatch]:
-        emb = await self._face.embed_frame(frame) if self._face is not None else None
+        # Use the bbox-aware variant so we can persist *which* face the
+        # embedding came from. Lets the dashboard pending-review modal
+        # draw a highlight around the targeted face when the frame
+        # contains multiple people.
+        full = (
+            await self._face.embed_largest_face_full(frame)
+            if self._face is not None else None
+        )
+        if full is None:
+            return None
+        emb = full.get("embedding")
         if emb is None:
             return None
+        face_bbox = full.get("bbox")
         match = self._match_against("face", emb)
         if match is None:
             await self._add_to_pending_cluster(
-                "face", emb, image_jpeg=_jpeg(frame)
+                "face", emb, image_jpeg=_jpeg(frame), face_bbox=face_bbox,
             )
         else:
             self._verify_pending[match.person_id] = "voice"
@@ -961,6 +973,7 @@ class IdentityManager:
         emb: np.ndarray,
         image_jpeg: Optional[bytes] = None,
         audio_pcm16: Optional[bytes] = None,
+        face_bbox: Optional[tuple] = None,
     ) -> None:
         """An unknown sample (below match threshold but possibly a new person)."""
         # Don't pollute pending with garbage — drop samples below stranger floor
@@ -1000,6 +1013,7 @@ class IdentityManager:
                 cluster_id=cluster_id,
                 image_jpeg=image_jpeg,
                 audio_pcm16=audio_pcm16,
+                face_bbox=face_bbox,
             )
             return
         else:
@@ -1020,6 +1034,7 @@ class IdentityManager:
             image_jpeg=image_jpeg,
             audio_pcm16=audio_pcm16,
             cluster_id=cluster_id,
+            face_bbox=face_bbox,
         )
 
     async def _attach_pending_preview(
@@ -1028,6 +1043,7 @@ class IdentityManager:
         cluster_id: int,
         image_jpeg: Optional[bytes],
         audio_pcm16: Optional[bytes],
+        face_bbox: Optional[tuple] = None,
     ) -> None:
         """Fill a missing preview on an existing unresolved cluster row."""
         changed = False
@@ -1037,6 +1053,14 @@ class IdentityManager:
                 "WHERE kind = ? AND cluster_id = ? AND resolved = 0 "
                 "AND image_jpeg IS NULL",
                 (image_jpeg, kind, cluster_id),
+            )
+            changed = True
+        if face_bbox is not None:
+            await self._db.execute(
+                "UPDATE identity_pending SET face_bbox = ? "
+                "WHERE kind = ? AND cluster_id = ? AND resolved = 0 "
+                "AND face_bbox IS NULL",
+                (json.dumps(list(face_bbox)), kind, cluster_id),
             )
             changed = True
         if audio_pcm16 is not None:
@@ -1067,12 +1091,14 @@ class IdentityManager:
         image_jpeg: Optional[bytes],
         audio_pcm16: Optional[bytes],
         cluster_id: Optional[int],
+        face_bbox: Optional[tuple] = None,
     ) -> int:
+        bbox_json = json.dumps(list(face_bbox)) if face_bbox else None
         pending_id = await self._db.execute(
             "INSERT INTO identity_pending "
             "(kind, person_id, cluster_id, embedding, image_jpeg, audio_pcm16, "
-            " similarity, anchored_via, captured_at, resolved) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            " similarity, anchored_via, captured_at, resolved, face_bbox) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
             (
                 kind,
                 person_id,
@@ -1083,6 +1109,7 @@ class IdentityManager:
                 float(similarity),
                 anchored_via,
                 _now_iso(),
+                bbox_json,
             ),
         )
         # Live-refresh the dashboard's pending-review list. Without this the
@@ -1268,7 +1295,7 @@ class IdentityManager:
         face is borderline."""
         rows = await self._db.fetchall(
             "SELECT id, kind, person_id, cluster_id, embedding, similarity, "
-            "anchored_via, captured_at, "
+            "anchored_via, captured_at, face_bbox, "
             "image_jpeg IS NOT NULL AS has_image, "
             "audio_pcm16 IS NOT NULL AS has_audio "
             "FROM identity_pending WHERE resolved = 0 "
@@ -1311,6 +1338,13 @@ class IdentityManager:
                             f"[Identity] pending suggestion failed for "
                             f"row {r['id']}: {e}"
                         )
+            face_bbox_raw = r["face_bbox"]
+            face_bbox = None
+            if face_bbox_raw:
+                try:
+                    face_bbox = json.loads(face_bbox_raw)
+                except (ValueError, TypeError):
+                    face_bbox = None
             out.append({
                 "id": int(r["id"]),
                 "kind": kind,
@@ -1322,6 +1356,7 @@ class IdentityManager:
                 "captured_at": r["captured_at"],
                 "has_image": bool(r["has_image"]),
                 "has_audio": bool(r["has_audio"]),
+                "face_bbox": face_bbox,
                 "suggested_person_id": suggested_id,
                 "suggested_person_name": suggested_name,
                 "suggested_similarity": suggested_sim,

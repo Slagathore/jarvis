@@ -1495,6 +1495,117 @@ class DashboardServer:
                 logger.warning(f"[/api/world_model/pets] {e}")
                 raise HTTPException(status_code=500, detail=str(e)) from e
 
+        @app.post("/api/world_model/events/{event_id}/relabel")
+        async def world_model_event_relabel(
+            event_id: str, request: Request,
+        ):
+            """Reattribute a single world event to a named resident pet
+            (or to a different named resident). The body is
+            {"pet_name": "Sneaky"}. Used by the dashboard's "click a
+            cat/dog event in the live feed to tell Jarvis what it is"
+            workflow. The event's entity_id + entity_name are updated;
+            future cost-function decisions for the affected entity are
+            unchanged (this is event-history relabel, not centroid
+            retrain — that comes from cluster-build).
+            """
+            orch = self._orchestrator
+            wq = getattr(orch, "world_query_tools", None) if orch else None
+            ws = getattr(orch, "world_store", None) if orch else None
+            if wq is None or ws is None:
+                raise HTTPException(status_code=503, detail="World model offline")
+            body = await request.json()
+            pet_name = (body.get("pet_name") or "").strip()
+            if not pet_name:
+                raise HTTPException(status_code=400, detail="pet_name required")
+            target = wq.world.find_entity_by_name(pet_name)
+            if target is None or target.entity_type not in ("cat", "dog"):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"no resident pet named '{pet_name}'",
+                )
+            row = await ws.db.fetchone(
+                "SELECT entity_type FROM world_entity_events WHERE id = ?",
+                (event_id,),
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="event not found")
+            if row["entity_type"] not in ("cat", "dog"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "only cat/dog events can be relabeled here; "
+                        "use the identity flow for people"
+                    ),
+                )
+            await ws.db.execute(
+                "UPDATE world_entity_events "
+                "SET entity_id = ?, entity_name = ? WHERE id = ?",
+                (target.id, target.display_name, event_id),
+            )
+            await self.broadcast({
+                "type": "world_event_relabeled",
+                "event_id": event_id,
+                "pet_name": target.display_name,
+            })
+            return JSONResponse({
+                "ok": True,
+                "event_id": event_id,
+                "pet_name": target.display_name,
+                "entity_id": target.id,
+            })
+
+        @app.get("/api/world_model/pets/{name}/thumbnails")
+        async def world_model_pet_thumbnails(
+            name: str, limit: int = 8, hours_ago: int = 168,
+        ):
+            """Return up to `limit` recent event ids for a named pet
+            whose row has a snapshot_path on disk. The lore-card modal
+            renders each via /api/world_model/cluster/event/{id}/image.jpg
+            so the user sees what the pet actually looks like, not just
+            a glyph + lore text."""
+            orch = self._orchestrator
+            wq = getattr(orch, "world_query_tools", None) if orch else None
+            ws = getattr(orch, "world_store", None) if orch else None
+            if wq is None or ws is None:
+                return JSONResponse({"thumbnails": [], "available": False})
+            try:
+                limit = max(1, min(int(limit), 30))
+                hours_ago = max(1, min(int(hours_ago), 24 * 30))
+                ent = wq.world.find_entity_by_name(name)
+                if ent is None:
+                    return JSONResponse({"thumbnails": [], "available": True})
+                from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                cutoff = (
+                    _dt.now(_tz.utc) - _td(hours=hours_ago)
+                ).isoformat()
+                rows = await ws.db.fetchall(
+                    "SELECT id, ts, room, event_type "
+                    "FROM world_entity_events "
+                    "WHERE entity_id = ? AND ts >= ? "
+                    "AND snapshot_path IS NOT NULL "
+                    "ORDER BY ts DESC LIMIT ?",
+                    (ent.id, cutoff, limit),
+                )
+                out = [
+                    {
+                        "event_id": r["id"],
+                        "ts": r["ts"],
+                        "room": r["room"],
+                        "event_type": r["event_type"],
+                        "url": (
+                            "/api/world_model/cluster/event/"
+                            f"{r['id']}/image.jpg"
+                        ),
+                    }
+                    for r in rows
+                ]
+                return JSONResponse({"thumbnails": out, "available": True})
+            except Exception as e:
+                logger.warning(
+                    f"[/api/world_model/pets/{name}/thumbnails] {e}"
+                )
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
         @app.get("/api/world_model/pets/{name}/events")
         async def world_model_pet_events(
             name: str, limit: int = 30, hours_ago: int = 168

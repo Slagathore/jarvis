@@ -74,8 +74,13 @@ class ObjectDetector:
 
     def __init__(self, config: dict) -> None:
         vision_cfg = config.get("vision", {})
-        self._model_name: str = vision_cfg.get("yolo_model", "yolov8n.pt")
-        self._conf_threshold: float = float(vision_cfg.get("yolo_confidence", 0.35))
+        # YOLOv8m default: nano was missing partially-occluded animals
+        # in dim Wyze frames (cat on patterned tablecloth, dog under
+        # sheets). Medium is ~8x slower than nano (~12ms on a 4070 Ti);
+        # still well within budget at 5fps. Conf threshold lowered to
+        # 0.20 to catch low-confidence pet detections.
+        self._model_name: str = vision_cfg.get("yolo_model", "yolov8m.pt")
+        self._conf_threshold: float = float(vision_cfg.get("yolo_confidence", 0.20))
         self._model: Optional[Any] = None
 
     @property

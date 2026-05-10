@@ -472,6 +472,24 @@ function refreshRoomFeeds() {
       if (card) card.classList.remove("offline");
     };
     img.src = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?t=${stamp}`;
+    // Wire click → lightbox (once). The dashboard down-scales 1080p
+    // Wyze frames to ~640px; the lightbox shows the original snapshot
+    // URL at full resolution.
+    if (!img.dataset.lightboxWired) {
+      img.dataset.lightboxWired = "1";
+      img.classList.add("room-feed-clickable");
+      img.title = "Click for full-resolution snapshot";
+      img.addEventListener("click", () => {
+        const ts = new Date().toISOString();
+        // Pull a fresh frame so the lightbox shows current state, not
+        // whatever the polling loop happened to have cached.
+        openImageLightbox(
+          `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?lb=${Date.now()}`,
+          room.replace(/_/g, " "),
+          ts,
+        );
+      });
+    }
   });
 }
 
@@ -1378,7 +1396,21 @@ function renderPending(items) {
     }
     let preview = "";
     if (p.has_image) {
-      preview = `<img class="pending-thumb pending-thumb-clickable" src="/api/identity/pending/${p.id}/image.jpg" alt="capture" title="Click to enlarge" />`;
+      // Wrap thumb in a positioning shell so we can overlay a face-bbox
+      // highlight when multiple people are in the capture frame.
+      const bboxJson = p.face_bbox ? JSON.stringify(p.face_bbox) : "";
+      preview = `
+        <div class="pending-thumb-wrap" data-bbox='${escapeHtml(bboxJson)}'>
+          <img class="pending-thumb pending-thumb-clickable"
+               src="/api/identity/pending/${p.id}/image.jpg"
+               alt="capture" title="Click to enlarge" />
+          ${p.face_bbox
+            ? `<div class="face-bbox-overlay"
+                  data-x1="${p.face_bbox[0]}" data-y1="${p.face_bbox[1]}"
+                  data-x2="${p.face_bbox[2]}" data-y2="${p.face_bbox[3]}"></div>`
+            : ""
+          }
+        </div>`;
     } else if (p.has_audio) {
       preview = `<audio controls class="pending-audio" src="/api/identity/pending/${p.id}/audio.wav"></audio>`;
     }
@@ -1462,11 +1494,47 @@ function renderPending(items) {
           `/api/identity/pending/${p.id}/image.jpg`,
           caption,
           p.captured_at,
+          p.face_bbox || null,
         );
       });
+      // Position the bbox overlay relative to the image's rendered
+      // dimensions. Stored bbox is in source-pixel coords; we scale
+      // it to the displayed size on every layout. Recompute on load
+      // and on window resize.
+      const overlay = thumb.parentElement.querySelector(".face-bbox-overlay");
+      if (overlay) {
+        const positionOverlay = () => _positionFaceBbox(thumb, overlay);
+        if (thumb.complete && thumb.naturalWidth > 0) positionOverlay();
+        else thumb.addEventListener("load", positionOverlay);
+        window.addEventListener("resize", positionOverlay);
+      }
     }
     el.appendChild(row);
   });
+}
+
+function _positionFaceBbox(img, overlay) {
+  // bbox stored as [x1, y1, x2, y2] in source-image pixel coords.
+  // Scale into the <img>'s displayed pixel coords using the
+  // natural-vs-rendered ratio. Both images use object-fit:contain so
+  // the ratio is uniform.
+  const x1 = parseFloat(overlay.dataset.x1);
+  const y1 = parseFloat(overlay.dataset.y1);
+  const x2 = parseFloat(overlay.dataset.x2);
+  const y2 = parseFloat(overlay.dataset.y2);
+  if (!Number.isFinite(x1)) return;
+  const natW = img.naturalWidth, natH = img.naturalHeight;
+  if (!natW || !natH) return;
+  const rect = img.getBoundingClientRect();
+  // contain-fit: actual rendered image area inside the box.
+  const scale = Math.min(rect.width / natW, rect.height / natH);
+  const renderW = natW * scale, renderH = natH * scale;
+  const offsetX = (rect.width - renderW) / 2;
+  const offsetY = (rect.height - renderH) / 2;
+  overlay.style.left = `${offsetX + x1 * scale}px`;
+  overlay.style.top = `${offsetY + y1 * scale}px`;
+  overlay.style.width = `${(x2 - x1) * scale}px`;
+  overlay.style.height = `${(y2 - y1) * scale}px`;
 }
 
 function loadPending() {
@@ -2874,6 +2942,43 @@ async function _fetchPetEvents(name) {
   }
 }
 
+async function _fetchPetThumbnails(name) {
+  try {
+    const res = await fetch(
+      `/api/world_model/pets/${encodeURIComponent(name)}/thumbnails?limit=8`,
+    );
+    if (!res.ok) return [];
+    const body = await res.json();
+    return Array.isArray(body.thumbnails) ? body.thumbnails : [];
+  } catch (e) {
+    console.warn("[fetchPetThumbnails] failed:", e);
+    return [];
+  }
+}
+
+function _renderPetThumbnailStrip(thumbs, petName) {
+  if (!thumbs || thumbs.length === 0) {
+    return '<div class="who-empty">No snapshots yet. Run the cluster builder or wait for more captures.</div>';
+  }
+  return `<div class="lore-thumbs">` +
+    thumbs.map((t) => {
+      const ts = t.ts ? new Date(t.ts).toLocaleString() : "";
+      const room = escapeHtml(t.room || "?");
+      return `
+        <div class="lore-thumb" data-event-id="${escapeHtml(t.event_id || "")}"
+             title="${escapeHtml(petName)} · ${room} · ${escapeHtml(ts)}">
+          <img src="${t.url}" alt="${escapeHtml(petName)}"
+               loading="lazy"
+               onerror="this.parentElement.classList.add('lore-thumb-broken');" />
+          <div class="lore-thumb-meta">
+            <span class="lore-thumb-room">${room}</span>
+            <span class="lore-thumb-ago">${formatRelativeTs(t.ts)}</span>
+          </div>
+        </div>`;
+    }).join("") +
+    `</div>`;
+}
+
 function _renderPetEventList(events) {
   if (!events || events.length === 0) {
     return '<div class="who-empty">No events in the last week.</div>';
@@ -2941,6 +3046,12 @@ async function openPetLoreModal(pet) {
           </div>
         </div>
         <div class="modal-section">
+          <div class="modal-section-label">SNAPSHOTS</div>
+          <div class="lore-thumbs-slot" id="lore-thumbs-slot">
+            <div class="who-empty">Loading…</div>
+          </div>
+        </div>
+        <div class="modal-section">
           <div class="modal-section-label">LORE</div>
           <div class="lore-rows">${_kvRows(seed) ||
             '<div class="who-empty">No seed metadata in config.yaml for this pet.</div>'
@@ -2964,9 +3075,27 @@ async function openPetLoreModal(pet) {
   document.body.appendChild(overlay);
   document.addEventListener("keydown", _petLoreKeydown);
 
-  const events = await _fetchPetEvents(pet.name);
-  const slot = overlay.querySelector("#lore-events-list");
-  if (slot) slot.innerHTML = _renderPetEventList(events);
+  // Fire both fetches in parallel — the events list is the longer
+  // wait (DB scan); thumbnails come back fast.
+  const [events, thumbs] = await Promise.all([
+    _fetchPetEvents(pet.name),
+    _fetchPetThumbnails(pet.name),
+  ]);
+  const eventsSlot = overlay.querySelector("#lore-events-list");
+  if (eventsSlot) eventsSlot.innerHTML = _renderPetEventList(events);
+  const thumbsSlot = overlay.querySelector("#lore-thumbs-slot");
+  if (thumbsSlot) {
+    thumbsSlot.innerHTML = _renderPetThumbnailStrip(thumbs, pet.name);
+    // Click thumbnail → lightbox at full resolution.
+    thumbsSlot.querySelectorAll(".lore-thumb img").forEach((img) => {
+      img.style.cursor = "zoom-in";
+      img.addEventListener("click", () => openImageLightbox(
+        img.src,
+        `${pet.name} · ${img.parentElement.parentElement.querySelector(".lore-thumb-room").textContent}`,
+        img.parentElement.parentElement.dataset.eventTs || null,
+      ));
+    });
+  }
 }
 
 // ── World Events tail (live tail of world_entity_events) ──────────────────
@@ -3009,13 +3138,142 @@ function renderEventRow(ev) {
     : "";
   const div = document.createElement("div");
   div.className = `event-row event-type-${ev.event_type || "unknown"}`;
+  // Cat/dog events get a click target — opens the relabel modal so the
+  // user can fix mis-attributions ("this 'Serval' was actually Socks").
+  const isAnimal = ev.entity_type === "cat" || ev.entity_type === "dog";
+  const tagBtn = isAnimal
+    ? `<button class="event-tag-btn" title="Tag this as a specific pet">tag</button>`
+    : "";
   div.innerHTML = `
     <span class="event-glyph">${glyph}</span>
     <span class="event-name">${escapeHtml(name)}</span>
     <span class="event-label">${escapeHtml(label)}</span>${countBadge}${room}${lm}
-    <span class="event-ago">${ago}</span>
+    <span class="event-ago">${ago}</span>${tagBtn}
   `;
+  if (isAnimal) {
+    div.querySelector(".event-tag-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      openPetTagModal(ev);
+    });
+  }
   return div;
+}
+
+// ── Pet tag modal ─────────────────────────────────────────────────────────
+// Dropdown of resident pets (filtered to the event's species) +
+// thumbnail of the event being relabeled, if a snapshot exists. Hits
+// POST /api/world_model/events/{id}/relabel.
+
+let _petsCacheForTagging = null;
+async function _ensurePetsCacheForTagging() {
+  if (_petsCacheForTagging) return _petsCacheForTagging;
+  try {
+    const res = await fetch("/api/world_model/pets");
+    if (!res.ok) return [];
+    const body = await res.json();
+    _petsCacheForTagging = Array.isArray(body.pets) ? body.pets : [];
+    return _petsCacheForTagging;
+  } catch {
+    return [];
+  }
+}
+
+function closePetTagModal() {
+  const m = document.getElementById("pet-tag-modal");
+  if (m) m.remove();
+  document.removeEventListener("keydown", _petTagKeydown);
+}
+function _petTagKeydown(e) {
+  if (e.key === "Escape") closePetTagModal();
+}
+
+async function openPetTagModal(ev) {
+  closePetTagModal();
+  const pets = await _ensurePetsCacheForTagging();
+  const species = ev.entity_type;
+  const candidates = pets.filter((p) => p.species === species);
+  if (candidates.length === 0) {
+    openImageLightbox(
+      null,
+      `No resident ${species}s configured to tag this as.`,
+      ev.ts,
+    );
+    return;
+  }
+  const thumbUrl = ev.id
+    ? `/api/world_model/cluster/event/${encodeURIComponent(ev.id)}/image.jpg`
+    : null;
+  const overlay = document.createElement("div");
+  overlay.id = "pet-tag-modal";
+  overlay.className = "modal-overlay";
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) closePetTagModal();
+  });
+  const opts = candidates.map((p) =>
+    `<option value="${escapeHtml(p.name)}"${
+      p.name === ev.entity_name ? " selected" : ""
+    }>${escapeHtml(p.name)}</option>`,
+  ).join("");
+  overlay.innerHTML = `
+    <div class="modal-card pet-tag-card">
+      <div class="modal-head">
+        <span class="modal-title">Tag ${escapeHtml(species)} event</span>
+        <button class="modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="pet-tag-current">
+          Currently labeled <b>${escapeHtml(ev.entity_name || "?")}</b>
+          in <b>${escapeHtml(ev.room || "?")}</b>
+          (${escapeHtml(ev.event_type || "?")}).
+        </div>
+        ${thumbUrl
+          ? `<img class="pet-tag-thumb" src="${thumbUrl}"
+                  onerror="this.outerHTML='<div class=\\'pet-tag-noimg\\'>No snapshot stored for this event.</div>'"
+                  alt="snapshot" />`
+          : `<div class="pet-tag-noimg">No snapshot for this event.</div>`
+        }
+        <label class="pet-tag-label">
+          This is actually:
+          <select class="dev-select" id="pet-tag-select">${opts}</select>
+        </label>
+        <div class="pet-tag-actions">
+          <button class="dev-btn" id="pet-tag-save">Save</button>
+          <span class="pet-tag-status" id="pet-tag-status"></span>
+        </div>
+      </div>
+    </div>`;
+  overlay.querySelector(".modal-close").addEventListener("click", closePetTagModal);
+  document.body.appendChild(overlay);
+  document.addEventListener("keydown", _petTagKeydown);
+
+  overlay.querySelector("#pet-tag-save").addEventListener("click", async () => {
+    const sel = overlay.querySelector("#pet-tag-select");
+    const status = overlay.querySelector("#pet-tag-status");
+    const target = sel.value;
+    if (!target) return;
+    status.textContent = "saving…";
+    try {
+      const res = await fetch(
+        `/api/world_model/events/${encodeURIComponent(ev.id)}/relabel`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pet_name: target }),
+        },
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      status.textContent = "saved ✓";
+      status.classList.add("ok");
+      // Refresh the events panel so the relabel is visible.
+      setTimeout(() => { closePetTagModal(); loadWorldEvents(); }, 600);
+    } catch (e) {
+      status.textContent = `failed: ${e.message || e}`;
+      status.classList.add("err");
+    }
+  });
 }
 
 function _coalesceEvents(events, maxGapSeconds = 30) {
@@ -3169,7 +3427,7 @@ function closeImageLightbox() {
   document.removeEventListener("keydown", _imgLightboxKeydown);
 }
 
-function openImageLightbox(url, caption, ts) {
+function openImageLightbox(url, caption, ts, faceBbox = null) {
   closeImageLightbox();
   const overlay = document.createElement("div");
   overlay.id = "img-lightbox";
@@ -3181,9 +3439,18 @@ function openImageLightbox(url, caption, ts) {
   // The image may not exist (event predates snapshot, or no snapshot
   // was saved for this event). Render it anyway and rely on onerror
   // to swap in a "no image" placeholder so the lightbox still opens.
+  const bboxAttrs = faceBbox && faceBbox.length === 4
+    ? ` data-x1="${faceBbox[0]}" data-y1="${faceBbox[1]}" data-x2="${faceBbox[2]}" data-y2="${faceBbox[3]}"`
+    : "";
+  const bboxHtml = faceBbox && faceBbox.length === 4
+    ? `<div class="face-bbox-overlay face-bbox-lightbox"${bboxAttrs}></div>`
+    : "";
   const imgHtml = url
-    ? `<img class="lightbox-img" src="${url}" alt="snapshot"
-            onerror="this.outerHTML='<div class=\\'lightbox-noimg\\'>No snapshot stored for this event.</div>'" />`
+    ? `<div class="lightbox-img-wrap">
+         <img class="lightbox-img" src="${url}" alt="snapshot"
+              onerror="this.outerHTML='<div class=\\'lightbox-noimg\\'>No snapshot stored for this event.</div>'" />
+         ${bboxHtml}
+       </div>`
     : `<div class="lightbox-noimg">No snapshot stored for this event.</div>`;
   overlay.innerHTML = `
     <div class="lightbox-card">
@@ -3199,6 +3466,17 @@ function openImageLightbox(url, caption, ts) {
   );
   document.body.appendChild(overlay);
   document.addEventListener("keydown", _imgLightboxKeydown);
+  // Position the bbox after the image lays out.
+  if (faceBbox) {
+    const img = overlay.querySelector(".lightbox-img");
+    const ov = overlay.querySelector(".face-bbox-lightbox");
+    if (img && ov) {
+      const reposition = () => _positionFaceBbox(img, ov);
+      if (img.complete && img.naturalWidth > 0) reposition();
+      else img.addEventListener("load", reposition);
+      window.addEventListener("resize", reposition);
+    }
+  }
 }
 
 async function loadInteractions() {

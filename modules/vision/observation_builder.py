@@ -144,12 +144,14 @@ class ObservationBuilder:
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         self._snapshot_last_saved: dict[tuple[str, str, str], float] = {}
         # Default cadence — keep snapshot disk usage and review-queue churn
-        # under control. Tunable via /api/config (see settings tab); these
-        # are floors, not ceilings.
+        # under control. Cat/dog get a tight 10s cadence because the
+        # cluster builder needs lots of crops to label; person stays
+        # at 120s because we already have face-enrollment thumbs.
+        # All values are tunable via /api/tunables (Settings tab).
         self._snapshot_min_interval_s: dict[str, float] = {
             "person": 120.0,
-            "cat": 120.0,
-            "dog": 120.0,
+            "cat": 10.0,
+            "dog": 10.0,
             "openvocab": 120.0,
             "object": 600.0,
         }
