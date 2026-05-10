@@ -68,10 +68,15 @@ class WorldEntity:
     metadata: dict = field(default_factory=dict)
     # metadata can include:
     #   posture_history, stable_posture, hand_overlap_frames
-    #   cat-specific: color_class, color_histogram, behavioral_profile, seed
+    #   cat/dog-specific: color_class, color_histogram, behavioral_profile, seed,
+    #     coat_texture, breed_class, affinities (list of {person_id,strength,contexts})
     #   object-specific: detected_class, last_clip_embedding, last_snapshot_path
     #   state-specific: entered_unmonitored_via, departed_via, departed_ts
     #   suspended_due_to_camera_health (bool)
+    # ── Phase 4 (§22.0a, §32) — pet ownership / unmonitored-home / archive ──
+    household_owner_id: Optional[int] = None     # FK to persons.id (pets only)
+    unmonitored_home_room: Optional[str] = None  # default unmonitored room (e.g. Velcro→jeff_room)
+    archived_at: Optional[datetime] = None       # rehomed / passed away — soft-delete
 
 
 @dataclass
