@@ -293,6 +293,13 @@ class DatabaseManager:
             for migration_sql in (
                 "ALTER TABLE reminders ADD COLUMN recurrence_seconds INTEGER",
                 "ALTER TABLE face_samples ADD COLUMN image_jpeg BLOB",
+                # World Model §11 (ArcFace migration). Tags each face_sample
+                # row with the encoder that produced it so IdentityManager
+                # can filter to the active model_version when computing
+                # centroids. Existing rows default to 'facenet_v1' since
+                # they were written by the DeepFace/Facenet pipeline. New
+                # ArcFace samples write 'arcface_buffalo_l_v1'.
+                "ALTER TABLE face_samples ADD COLUMN model_version TEXT NOT NULL DEFAULT 'facenet_v1'",
             ):
                 try:
                     await conn.execute(migration_sql)

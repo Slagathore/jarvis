@@ -47,10 +47,21 @@ from loguru import logger
 #             sits the "loose match" zone used for drift auto-capture.
 # margin:     when 2+ persons enrolled, best score must beat second-best by
 #             at least this much, otherwise the match is flagged ambiguous.
+# Face thresholds are ArcFace-tuned (cosines on InsightFace `buffalo_l`).
+# match=0.5 / margin=0.10 are the values §11 of the World Model spec calls
+# out — both are looser than Facenet would have wanted but appropriate
+# for ArcFace's L2-normalized 512-dim space, and the margin gate is the
+# real safety net for resident-vs-resident misidentification.
 DEFAULTS = {
     "voice": {"match": 0.75, "stranger": 0.55, "margin": 0.05},
-    "face":  {"match": 0.70, "stranger": 0.40, "margin": 0.05},
+    "face":  {"match": 0.50, "stranger": 0.35, "margin": 0.10},
 }
+
+# Active face encoder. Stamped on every face_samples row written by this
+# module so the centroid bank can filter to the live model. Kept in sync
+# with FaceRecognizer.MODEL_VERSION — when ArcFace is replaced (e.g. by a
+# future buffalo_xl), bump both in lockstep.
+ACTIVE_FACE_MODEL_VERSION = "arcface_buffalo_l_v1"
 
 # Pending-cluster merge threshold — if a new unknown sample's cosine to an
 # existing pending-cluster centroid is at least this, fold into that cluster
@@ -220,9 +231,9 @@ class IdentityManager:
             if seen is not None:
                 continue
             await self._db.execute(
-                "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source) "
-                "VALUES (?, ?, ?, ?, 'migration')",
-                (pid, emb_blob, "candid", _now_iso()),
+                "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source, model_version) "
+                "VALUES (?, ?, ?, ?, 'migration', ?)",
+                (pid, emb_blob, "candid", _now_iso(), ACTIVE_FACE_MODEL_VERSION),
             )
 
     async def _reload_caches(self) -> None:
@@ -244,8 +255,12 @@ class IdentityManager:
                     self._voice_samples[pid].append(emb)
             except Exception:
                 continue
+        # Filter to the active face model — old facenet_v1 (128-dim) rows
+        # stay in the DB for history but don't enter the live centroid
+        # bank since they're incomparable with current ArcFace embeddings.
         for r in await self._db.fetchall(
-            "SELECT person_id, embedding FROM face_samples"
+            "SELECT person_id, embedding FROM face_samples WHERE model_version = ?",
+            (ACTIVE_FACE_MODEL_VERSION,),
         ):
             pid = int(r["person_id"])
             try:
@@ -292,6 +307,32 @@ class IdentityManager:
         else:
             self._verify_pending[match.person_id] = "voice"
             match.pending_verification = "voice"
+        return match
+
+    async def identify_from_embedding_async(
+        self, embedding: np.ndarray, modality: str = "face"
+    ) -> Optional[PersonMatch]:
+        """
+        Match an already-extracted embedding against the centroid bank.
+
+        Used by ObservationBuilder when the caller has already cropped the
+        face out of the room frame and embedded it via FaceRecognizer.
+        Skipping the embed step here means we don't do face detection
+        twice (once for the person crop, once inside identify_face).
+
+        Behavior mirrors `identify_face`: pending-cluster write on miss,
+        voice-verification scheduling on hit. Differs in that no image is
+        attached to the pending row (caller has the crop).
+        """
+        if embedding is None:
+            return None
+        match = self._match_against(modality, embedding)
+        if match is None:
+            await self._add_to_pending_cluster(modality, embedding)
+        else:
+            other = "voice" if modality == "face" else "face"
+            self._verify_pending[match.person_id] = other
+            match.pending_verification = other
         return match
 
     def _match_against(
@@ -362,9 +403,12 @@ class IdentityManager:
             return None
         pid = await self.ensure_person(name)
         sample_id = await self._db.execute(
-            "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source, image_jpeg) "
-            "VALUES (?, ?, ?, ?, 'enroll', ?)",
-            (pid, emb.astype(np.float32).tobytes(), pose, _now_iso(), _jpeg(frame)),
+            "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source, image_jpeg, model_version) "
+            "VALUES (?, ?, ?, ?, 'enroll', ?, ?)",
+            (
+                pid, emb.astype(np.float32).tobytes(), pose, _now_iso(),
+                _jpeg(frame), ACTIVE_FACE_MODEL_VERSION,
+            ),
         )
         self._face_samples.setdefault(pid, []).append(emb.astype(np.float32))
         logger.info(f"[Identity] Enrolled face for '{name}' (pose={pose}, id={sample_id})")
@@ -543,9 +587,12 @@ class IdentityManager:
             self._voice_samples.setdefault(person_id, []).append(emb_f32)
         else:
             await self._db.execute(
-                "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source, image_jpeg) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (person_id, emb_f32.tobytes(), pose or "candid", _now_iso(), source, image_jpeg),
+                "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source, image_jpeg, model_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    person_id, emb_f32.tobytes(), pose or "candid", _now_iso(),
+                    source, image_jpeg, ACTIVE_FACE_MODEL_VERSION,
+                ),
             )
             self._face_samples.setdefault(person_id, []).append(emb_f32)
 

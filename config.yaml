@@ -102,6 +102,32 @@ rooms:
     channels: 1
   fps_active: 30
   fps_idle: 30
+  # World Model geometry. Polygon coordinates below are PLACEHOLDERS — the
+  # actual desk / under_desk / door regions need to be drawn against a real
+  # frame from this camera (Phase 3.4 dashboard polygon viewer). Bbox
+  # coordinates are camera pixel space (origin top-left).
+  world_model:
+    enabled: true
+    frame_width: 640    # REPLACE_ME: confirm with `cv2.VideoCapture(0).get(...)`
+    frame_height: 480
+    exits:
+      # Right edge → hallway / living_room. Adjust polygon so a person
+      # walking out of frame on the right has bbox center over this region.
+      - kind: to_room
+        to: living_room   # REPLACE_ME: this Office cam doesn't physically
+                          # see a doorway; remove this exit if office is
+                          # an isolated work area, or change `to` to the
+                          # correct neighbor room id.
+        polygon: [[600, 0], [640, 0], [640, 480], [600, 480]]
+    landmarks:
+      # The under_desk landmark is the one Phase 1.7's verify gate cares
+      # about — Cole crouching here = IN_ROOM_UNSEEN, not DEPARTED.
+      - name: desk
+        polygon: [[200, 250], [450, 250], [450, 400], [200, 400]]
+      - name: under_desk
+        polygon: [[200, 380], [450, 380], [450, 480], [200, 480]]
+      - name: bookshelf
+        polygon: [[0, 100], [150, 100], [150, 350], [0, 350]]
 - id: laundry_room
   display_name: Laundry Room
   video:
@@ -115,6 +141,21 @@ rooms:
     mqtt_topic: jarvis/nodes/laundry_room/audio/out
   fps_active: 5
   fps_idle: 1
+  world_model:
+    enabled: true
+    frame_width: 800    # REPLACE_ME: confirm ESP32-CAM resolution
+    frame_height: 600
+    exits:
+      - kind: to_room
+        to: kitchen     # REPLACE_ME: confirm laundry-room neighbor
+        polygon: [[0, 200], [80, 200], [80, 500], [0, 500]]
+    landmarks:
+      - name: washer
+        polygon: [[200, 300], [450, 300], [450, 550], [200, 550]]
+      - name: dryer
+        polygon: [[450, 300], [700, 300], [700, 550], [450, 550]]
+      # Litterbox + food_dish landmarks here would feed §22.9
+      # cat-specific events. Add when polygon viewer is built.
 - id: bedroom
   display_name: Bedroom
   video:
@@ -138,6 +179,27 @@ rooms:
     sample_rate_hz: 8000
   fps_active: 5
   fps_idle: 1
+  world_model:
+    enabled: true
+    frame_width: 1920
+    frame_height: 1080
+    exits:
+      # Bedroom → hallway / living_room handoff. Adjust to whichever
+      # camera's FOV picks Cole up next when he walks out.
+      - kind: to_room
+        to: living_room   # REPLACE_ME: confirm
+        polygon: [[0, 400], [150, 400], [150, 1080], [0, 1080]]
+      # Two unmonitored bedrooms / bathroom adjacent — ESP/Wyze blindspots.
+      # Coarse polygon: anything along that wall counts as transit into
+      # the unmonitored zone. Refine with polygon viewer.
+      - kind: to_unmonitored_zone
+        to: bathroom_master   # REPLACE_ME
+        polygon: [[1700, 200], [1920, 200], [1920, 700], [1700, 700]]
+    landmarks:
+      - name: bed
+        polygon: [[600, 500], [1400, 500], [1400, 950], [600, 950]]
+      - name: closet
+        polygon: [[1500, 700], [1920, 700], [1920, 1080], [1500, 1080]]
 - id: kitchen
   display_name: Kitchen
   video:
@@ -161,6 +223,27 @@ rooms:
     sample_rate_hz: 8000
   fps_active: 5
   fps_idle: 1
+  world_model:
+    enabled: true
+    frame_width: 1920
+    frame_height: 1080
+    exits:
+      - kind: to_room
+        to: living_room
+        polygon: [[0, 0], [200, 0], [200, 1080], [0, 1080]]
+      # Back door — exterior_exit polygons are CRUCIAL for DEPARTED state.
+      # Polygon should cover the actual door region; current value is a
+      # conservative lower-right corner. REPLACE_ME via polygon viewer.
+      - kind: exterior_exit
+        name: back_door
+        polygon: [[1700, 800], [1920, 800], [1920, 1080], [1700, 1080]]
+    landmarks:
+      - name: stove
+        polygon: [[800, 200], [1100, 200], [1100, 600], [800, 600]]
+      - name: fridge
+        polygon: [[1400, 100], [1700, 100], [1700, 700], [1400, 700]]
+      # Per §22.1, kitchen-fridge-top is a Velcro perch; that's a 3D
+      # region that may need a separate polygon once we add multi-cam.
 - id: living_room
   display_name: Living Room
   video:
@@ -184,6 +267,35 @@ rooms:
     sample_rate_hz: 8000
   fps_active: 5
   fps_idle: 1
+  world_model:
+    enabled: true
+    frame_width: 1920
+    frame_height: 1080
+    exits:
+      - kind: to_room
+        to: bedroom
+        polygon: [[0, 400], [200, 400], [200, 1080], [0, 1080]]
+      - kind: to_room
+        to: kitchen
+        polygon: [[1700, 0], [1920, 0], [1920, 600], [1700, 600]]
+      # Front door — main exterior_exit. Crucial for DEPARTED state.
+      - kind: exterior_exit
+        name: front_door
+        polygon: [[800, 800], [1100, 800], [1100, 1080], [800, 1080]]
+      # Two unmonitored bedrooms (no cams facing those doors). Coarse
+      # region polygons — the doc (§7) calls these "best-effort";
+      # falling-back to IN_ROOM_UNSEEN is the acceptable fail mode.
+      - kind: to_unmonitored_zone
+        to: spare_bedroom_1   # REPLACE_ME
+        polygon: [[1500, 600], [1700, 600], [1700, 900], [1500, 900]]
+      - kind: to_unmonitored_zone
+        to: jeff_room         # Per §22.0a — Velcro lives in this room
+        polygon: [[200, 600], [400, 600], [400, 900], [200, 900]]
+    landmarks:
+      - name: couch
+        polygon: [[600, 600], [1400, 600], [1400, 950], [600, 950]]
+      - name: tv
+        polygon: [[700, 100], [1300, 100], [1300, 450], [700, 450]]
 # Auxiliary ESP32 nodes — boxes physically present in rooms whose primary
 # mic/cam is *not* an esp32_* driver. NodeManager would auto-register these
 # on first MQTT heartbeat with a warning; listing them here acknowledges the

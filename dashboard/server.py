@@ -1302,6 +1302,60 @@ class DashboardServer:
                 return JSONResponse({"cameras": []})
             return JSONResponse({"cameras": cm.get_configured_rooms()})
 
+        @app.get("/api/world_model/rooms")
+        async def world_model_rooms():
+            """List rooms with a world_model: block enabled. Used by the
+            polygon viewer dropdown."""
+            orch = self._orchestrator
+            if orch is None:
+                return JSONResponse({"rooms": []})
+            out = []
+            for r in (getattr(orch, "config", {}) or {}).get("rooms", []):
+                wm = r.get("world_model") or {}
+                if wm.get("enabled", True) is False:
+                    continue
+                if not wm:
+                    continue
+                out.append({"id": r.get("id"), "display_name": r.get("display_name")})
+            return JSONResponse({"rooms": out})
+
+        @app.get("/api/world_model/rooms/{room}/polygons")
+        async def world_model_polygons(room: str):
+            """Return the configured exits + landmarks for a room — JSON
+            payload the polygon viewer overlays on the live snapshot.
+
+            Empty `polygons` block when the room has no `world_model:`
+            section. Includes `frame_width` / `frame_height` so the
+            viewer can rescale polygons to the actual rendered image
+            size in the browser.
+            """
+            orch = self._orchestrator
+            if orch is None:
+                raise HTTPException(status_code=503, detail="Orchestrator not registered")
+            for r in (getattr(orch, "config", {}) or {}).get("rooms", []):
+                if r.get("id") != room:
+                    continue
+                wm = r.get("world_model") or {}
+                return JSONResponse({
+                    "room": room,
+                    "display_name": r.get("display_name"),
+                    "enabled": bool(wm.get("enabled", True)),
+                    "frame_width": int(wm.get("frame_width", 640)),
+                    "frame_height": int(wm.get("frame_height", 480)),
+                    "exits": list(wm.get("exits", [])),
+                    "landmarks": list(wm.get("landmarks", [])),
+                })
+            raise HTTPException(status_code=404, detail=f"No room '{room}' in config")
+
+        @app.get("/polygons", response_class=HTMLResponse)
+        async def polygon_viewer_page():
+            """Serve the polygon-viewer SPA page. Static asset; the JS
+            inside fetches snapshot + polygons via the APIs above."""
+            page = STATIC_DIR / "polygon_viewer.html"
+            if not page.exists():
+                raise HTTPException(status_code=404, detail="polygon_viewer.html missing")
+            return HTMLResponse(page.read_text(encoding="utf-8"))
+
         @app.post("/api/camera/{room}/reconnect")
         async def camera_reconnect(room: str):
             """Force-reopen a room's RTSP capture. The orchestrator's

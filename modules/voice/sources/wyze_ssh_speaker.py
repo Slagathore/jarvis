@@ -257,7 +257,7 @@ class WyzeSshSpeakerSink(SpeakerSink):
             f"LD_LIBRARY_PATH={_LD_LIBRARY_PATH} "
             f"{_AUDIOPLAY_BIN} {remote_path} {self._volume}"
         )
-        _stdin, stdout, stderr = client.exec_command(cmd, timeout=30.0)
+        _, stdout, stderr = client.exec_command(cmd, timeout=30.0)
         rc = stdout.channel.recv_exit_status()
         if rc != 0:
             err = stderr.read().decode("utf-8", errors="replace")[:300]

@@ -1,3 +1,4 @@
+<!-- markdownlint-disable -->
 # §22+ Generalization Patch — v4 (FINAL)
 
 Supersedes v1, v2, and v3 entirely for all conflicting EDITs. v4 is self-contained — apply this patch alone against the original `new_2.md` and ignore prior versions.

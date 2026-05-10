@@ -119,7 +119,9 @@ from modules.vision.light_detector import LightDetector
 from modules.vision.mess_detector import MessDetector
 from modules.vision.object_detector import ObjectDetector
 from modules.vision.posture_analyzer import PostureAnalyzer
+from modules.vision.observation_builder import ObservationBuilder
 from modules.layout import DoorMap
+from modules.world_model import WorldModel, WorldQueryTools, WorldStore
 from modules.vision.scene_analyzer import SceneAnalyzer
 from modules.vision.wyze_cam_control import WyzeCamControl
 from core.room_settings import RoomSettings
@@ -244,6 +246,19 @@ class Orchestrator:
         # House-layout door graph. Built in _init_voice (after data_dir is
         # known) and consumed by _try_layout_teach + future transit-inference.
         self.door_map: Optional[DoorMap] = None
+        # World Model — persistent entity registry + bounded-house state
+        # machine. Built in run() after IdentityManager so the
+        # ObservationBuilder can call into it for face-embedding identity
+        # matches. None when init fails (e.g. DB unavailable); the
+        # orchestrator runs without it.
+        self.world_store: Optional[WorldStore] = None
+        self.world_model: Optional[WorldModel] = None
+        self.observation_builder: Optional[ObservationBuilder] = None
+        # LLM-facing query layer — built alongside WorldModel. The four
+        # tools (get_entity_status, list_entities_in_room, who_is_home,
+        # search_recent_events) ride into _build_tool_registry when this
+        # is non-None.
+        self.world_query_tools: Optional[WorldQueryTools] = None
         self.object_detector: Optional[ObjectDetector] = None
         self.scene_analyzer: Optional[SceneAnalyzer] = None
         self.face_recognizer: Optional[FaceRecognizer] = None
@@ -1037,6 +1052,7 @@ class Orchestrator:
                         f"[Wake] room='{room}' using static floor: "
                         f"{threshold_db:.1f} dBFS"
                     )
+                    assert room_adapter is not None  # use_room_tap implies non-None
                     try:
                         audio_data = await record_until_silence_from_chunks(
                             attach_tap=room_adapter.attach_recording_tap,
@@ -1276,6 +1292,19 @@ class Orchestrator:
                     extras["activity_history"] = blurb
             except Exception as e:
                 logger.debug(f"[ActivityHistory] prompt summary failed: {e}")
+
+        # World Model snapshot — top-N currently-tracked entities + last
+        # few state changes. Capped at ~200 tokens (8 entities, 3 events
+        # by default) so it doesn't crowd out memories / scene / activity.
+        # Skipped when the world is empty (no entities + no events) so
+        # cold-boot prompts don't get a useless header.
+        if self.world_model is not None:
+            try:
+                world_snapshot = await self.world_model.build_snapshot_for_prompt()
+                if world_snapshot:
+                    extras["world_snapshot"] = world_snapshot
+            except Exception as e:
+                logger.debug(f"[WorldModel] prompt snapshot failed: {e}")
 
         # Memory v2: retrieve top-K relevant memories from semantic store and
         # inject as additional system-prompt context so the LLM has long-term
@@ -2029,7 +2058,184 @@ class Orchestrator:
         if self.cameras is not None:
             tools.append(self._GET_SNAPSHOT_TOOL)
             handlers["get_room_snapshot"] = self._tool_get_room_snapshot
+        # World Model query layer — persistent presence + bounded-house
+        # state. The LLM picks these for "where is X", "who's home",
+        # "what happened in <room>" patterns. Only registered when
+        # WorldModel actually came up successfully.
+        if self.world_query_tools is not None:
+            tools.extend(self._WORLD_TOOLS)
+            handlers.update(self._world_tool_handlers())
         return tools, handlers
+
+    # ── World Model query tools (Phase 3.2) ─────────────────────────────────
+    # Schemas the LLM sees. Descriptions are tuned to nudge tool-selection:
+    # "where is X" → get_entity_status, "anyone home" → who_is_home,
+    # "who's in <room>" → list_entities_in_room, narrative recall →
+    # search_recent_events.
+    _WORLD_TOOLS: list[dict] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_entity_status",
+                "description": (
+                    "Look up where a specific PERSON, CAT, or named OBJECT is "
+                    "right now from the persistent world model. Use this for "
+                    "any 'where is X', 'is X home', 'is X still in the kitchen' "
+                    "question. Returns last-seen room/landmark/timestamp + "
+                    "current state (present, in_room_unseen, in_house_unmonitored, "
+                    "departed, transitioning). PREFER this over guessing or "
+                    "asking for a fresh snapshot — the world model is the "
+                    "ground truth for presence."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Display name of the entity to look up. "
+                                "Case-insensitive. Examples: 'Cole', 'Anna', "
+                                "'Spooky', 'wallet'."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_entities_in_room",
+                "description": (
+                    "Return everyone (people, cats, named objects) currently "
+                    "PRESENT in the given room. Use for 'who's in the "
+                    "bedroom', 'is anyone in the kitchen'. Excludes entities "
+                    "that have left or are hidden — only counts live "
+                    "observations."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["room"],
+                    "properties": {
+                        "room": {
+                            "type": "string",
+                            "description": (
+                                "Room ID — one of the configured rooms "
+                                "(office, bedroom, kitchen, living_room, "
+                                "laundry_room)."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "who_is_home",
+                "description": (
+                    "Return the residents currently considered 'home' — any "
+                    "in-house state including under-desk hiding or in an "
+                    "unmonitored bedroom. Use for 'is anyone home', 'who's "
+                    "around', 'who else is in the house'."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_recent_events",
+                "description": (
+                    "Search the world model's event log for recent state "
+                    "changes (entered/left/moved/disappeared/etc.). Use for "
+                    "'when did Cole get home', 'has anyone been in the "
+                    "kitchen tonight', 'what happened in the bedroom this "
+                    "afternoon'. All filters are optional — combine them to "
+                    "narrow the result."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "entity_name": {
+                            "type": "string",
+                            "description": (
+                                "Optional display name. Filters to events "
+                                "for this entity."
+                            ),
+                        },
+                        "room": {
+                            "type": "string",
+                            "description": (
+                                "Optional room ID. Filters to events that "
+                                "occurred in this room."
+                            ),
+                        },
+                        "event_types": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Optional event type filter. Common values: "
+                                "first_seen, name_linked, moved_to, "
+                                "moved_within_room, lost_visibility, "
+                                "reappeared, departed, entered_unmonitored, "
+                                "stationary_long."
+                            ),
+                        },
+                        "hours_ago": {
+                            "type": "integer",
+                            "description": (
+                                "Search window in hours back from now. "
+                                "Default 24."
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max rows. Default 20.",
+                        },
+                    },
+                },
+            },
+        },
+    ]
+
+    def _world_tool_handlers(self) -> dict:
+        """Bind each schema name to a coroutine that calls into
+        WorldQueryTools. Tiny wrappers so the LLM tool-call dict shape
+        (kwargs) lines up with the keyword params on each method.
+        """
+        wq = self.world_query_tools
+        if wq is None:
+            return {}
+
+        async def _entity(name: str) -> dict:
+            return await wq.get_entity_status(name)
+
+        async def _in_room(room: str) -> list[dict]:
+            return await wq.list_entities_in_room(room)
+
+        async def _home() -> list[dict]:
+            return await wq.who_is_home()
+
+        async def _events(
+            entity_name: Optional[str] = None,
+            room: Optional[str] = None,
+            event_types: Optional[list[str]] = None,
+            hours_ago: int = 24,
+            limit: int = 20,
+        ) -> list[dict]:
+            return await wq.search_recent_events(
+                entity_name=entity_name, room=room,
+                event_types=event_types, hours_ago=hours_ago, limit=limit,
+            )
+
+        return {
+            "get_entity_status":     _entity,
+            "list_entities_in_room": _in_room,
+            "who_is_home":           _home,
+            "search_recent_events":  _events,
+        }
 
     _GET_SNAPSHOT_TOOL = {
         "type": "function",
@@ -3730,6 +3936,7 @@ class Orchestrator:
                         f"[Followup] room='{room}' tap, static floor: "
                         f"{threshold_db:.1f} dBFS"
                     )
+                    assert room_adapter is not None  # use_room_tap implies non-None
                     try:
                         audio_data = await record_until_silence_from_chunks(
                             attach_tap=room_adapter.attach_recording_tap,
@@ -4353,6 +4560,70 @@ class Orchestrator:
             except Exception as e:
                 logger.warning(f"[Init] Identity manager init failed: {e}")
                 self.identity = None
+
+        # World Model + ObservationBuilder. Built after IdentityManager
+        # so person-observation enrichment can route faces through it.
+        # Skip if any of the dependencies failed (DB, identity, cameras) —
+        # the system degrades to "no persistent presence tracking" rather
+        # than crashing.
+        if (self.db is not None and self.identity is not None
+                and self.cameras is not None and self.object_detector is not None
+                and self.face_recognizer is not None):
+            try:
+                self.world_store = WorldStore(self.db)
+                self.world_model = WorldModel(
+                    bus=self.bus,
+                    store=self.world_store,
+                    rooms_config=self.config.get("rooms", []),
+                    identity_manager=self.identity,
+                    config=self.config.get("world_model", {}),
+                )
+                # Build a config-shape ObservationBuilder needs from the
+                # rooms list, with `world_model` enabled per-room. Default
+                # to enabled so vision gets ingested everywhere — opt-out
+                # by setting `world_model.enabled: false` on a room.
+                ob_rooms = []
+                for r in self.config.get("rooms", []):
+                    rcopy = dict(r)
+                    rcopy["world_model"] = {
+                        "enabled": True,
+                        **(r.get("world_model") or {}),
+                    }
+                    ob_rooms.append(rcopy)
+                from pathlib import Path as _Path
+                data_dir = _Path(
+                    self.config.get("system", {}).get("data_dir", "data")
+                )
+                snapshot_dir = data_dir / "world_snapshots"
+                self.observation_builder = ObservationBuilder(
+                    bus=self.bus,
+                    camera_manager=self.cameras,
+                    object_detector=self.object_detector,
+                    face_recognizer=self.face_recognizer,
+                    identity_manager=self.identity,
+                    posture_analyzer=self.posture,
+                    rooms_config=ob_rooms,
+                    snapshot_dir=snapshot_dir,
+                )
+                # Wire the camera-health publisher so WorldModel can
+                # suspend its state machine for offline rooms.
+                if hasattr(self.cameras, "attach_bus"):
+                    self.cameras.attach_bus(self.bus)
+                # Subscribe + spawn timers; ObservationBuilder spawns its
+                # per-room polling tasks in its own start().
+                await self.world_model.start()
+                await self.observation_builder.start()
+                # Query layer over the live model — registered into the
+                # LLM tool registry by _build_tool_registry below.
+                self.world_query_tools = WorldQueryTools(self.world_model)
+                logger.info("[Init] World Model + ObservationBuilder started")
+            except Exception as e:
+                logger.warning(
+                    f"[Init] World Model init failed (continuing without): {e}"
+                )
+                self.world_store = None
+                self.world_model = None
+                self.observation_builder = None
 
         try:
             await self._init_network()

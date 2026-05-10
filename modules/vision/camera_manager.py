@@ -56,6 +56,7 @@ Variables:
 
 import asyncio
 import threading
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -224,6 +225,24 @@ class CameraManager:
         # because httpx's client requires an event loop on init for some
         # transport configs.
         self._http_client: Optional[httpx.AsyncClient] = None
+
+        # Camera-health publishing (World Model §14). Wired late via
+        # `attach_bus(bus)`; before that, transitions are computed but
+        # not emitted. Each room moves through healthy → degraded → down
+        # → degraded → healthy. WorldModel subscribes to the resulting
+        # `camera.health` events to suspend its state-machine for the
+        # affected room while the camera is offline.
+        self._bus: Optional[Any] = None
+        # Per-room published status. Used to detect transitions and
+        # avoid republishing the same status on every loop iteration.
+        self._room_health: dict[str, str] = {}
+        self._health_task: Optional[asyncio.Task] = None
+        self._health_check_interval_s: float = 5.0
+        # Down threshold = how many consecutive fails before we declare
+        # a camera 'down'. Higher than the cap-reopen threshold so a
+        # transient drop that resolves via reopen doesn't fire a
+        # spurious down→degraded→healthy transition.
+        self._health_down_threshold: int = max(self._reopen_threshold * 2, 6)
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -917,7 +936,16 @@ class CameraManager:
 
     async def close(self) -> None:
         """Release every cv2.VideoCapture and the shared httpx client."""
-        # Drainers first, then caps — see _stop_drainer for why.
+        # Stop health publisher first so it doesn't try to read state
+        # mid-shutdown.
+        if self._health_task is not None:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._health_task = None
+        # Drainers, then caps — see _stop_drainer for why.
         for room in list(self._drainers.keys()):
             self._stop_drainer(room)
         for room, cap in self._caps.items():
@@ -933,3 +961,94 @@ class CameraManager:
             except Exception:
                 pass
             self._http_client = None
+
+    # ── Health publishing (World Model §14) ──────────────────────────────────
+
+    def attach_bus(self, bus: Any) -> None:
+        """Wire an EventBus so per-room health transitions get published as
+        `camera.health` events. WorldModel subscribes to those and suspends
+        its state machine for an offline camera's room — without this hook,
+        a brief Wyze drop would (incorrectly) demote every PRESENT entity
+        in that room to IN_ROOM_UNSEEN. Late-binding because the bus is
+        constructed after CameraManager in the orchestrator boot order.
+        Safe to call at most once; subsequent calls log + replace.
+        """
+        if self._bus is not None:
+            logger.debug("[CameraManager] attach_bus called twice; replacing")
+        self._bus = bus
+        # Spawn the health loop on first attach. Idempotent across reconnects.
+        if self._health_task is None:
+            self._health_task = asyncio.create_task(
+                self._health_loop(), name="camera_manager:health"
+            )
+
+    async def _health_loop(self) -> None:
+        """Periodic per-room health classifier. Wakes every
+        `_health_check_interval_s` seconds, computes a status per
+        configured room, publishes `camera.health` ONLY on transitions.
+        First publication on the first tick brings every known room
+        from "" → its current status (effectively "init → healthy").
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._health_check_interval_s)
+                if self._bus is None:
+                    continue
+                # Snapshot the rooms we know about — caps + http URLs cover
+                # every successfully-opened source. Skip rooms that were
+                # never registered (mis-config / failed-to-open at boot).
+                known_rooms = set(self._caps.keys()) | set(self._http_urls.keys())
+                for room in known_rooms:
+                    new_status = self._classify_health(room)
+                    prev = self._room_health.get(room)
+                    if prev == new_status:
+                        continue
+                    self._room_health[room] = new_status
+                    payload = {
+                        "camera_id": room,
+                        "status": new_status,
+                        "reason": self._health_reason(new_status),
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }
+                    try:
+                        await self._bus.publish("camera.health", payload)
+                    except Exception as e:
+                        logger.debug(
+                            f"[CameraManager] health publish failed for "
+                            f"'{room}': {e}"
+                        )
+                    logger.info(
+                        f"[CameraManager] '{room}' health "
+                        f"{prev or 'init'} → {new_status}"
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[CameraManager] health loop iteration failed")
+
+    def _classify_health(self, room: str) -> str:
+        """Map per-room failure state to one of healthy / degraded / down.
+        Pure read; side-effect-free. Hysteresis (down → degraded → healthy)
+        is enforced by the loop only publishing on transitions.
+        """
+        fails = self._fail_counts.get(room, 0)
+        if fails >= self._health_down_threshold:
+            return "down"
+        if fails >= self._reopen_threshold:
+            return "degraded"
+        # No recent failures. If the previous status was 'down', step
+        # through 'degraded' for one cycle before returning to 'healthy'
+        # — the §14 spec wants sustained-success confirmation, not a
+        # snap-back the moment one frame succeeds.
+        prev = self._room_health.get(room)
+        if prev == "down":
+            return "degraded"
+        return "healthy"
+
+    @staticmethod
+    def _health_reason(status: str) -> str:
+        return {
+            "healthy":  "frame reads succeeding",
+            "degraded": "consecutive failed reads",
+            "down":     "camera unreachable",
+        }.get(status, "unknown")

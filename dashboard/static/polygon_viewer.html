@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<!--
+JARVIS — World Model
+====================
+Polygon viewer (Phase 3.4). A small standalone page that overlays the
+configured `world_model:` exit + landmark polygons on top of a live
+camera frame. Lets Cole eyeball whether the placeholders in config.yaml
+line up with reality, then tune coordinates manually until they do.
+
+Spec: new 2.md §26 Phase 3.4. The verify gate is "pull up office page,
+see `under_desk` and `door_to_hallway` polygons drawn on a recent
+frame."
+
+This is render-only for now — editing/dragging polygons can come
+later as a separate POST endpoint. For Cole's first pass: see what's
+configured, snap a screenshot, edit config.yaml by hand against the
+visible numbers, reload.
+
+Routes used:
+  GET /polygons                                       — this page
+  GET /api/world_model/rooms                          — populate dropdown
+  GET /api/world_model/rooms/{room}/polygons          — fetch overlays
+  GET /api/camera/{room}/snapshot.jpg                 — background frame
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Jarvis — Polygon Viewer</title>
+  <style>
+    body {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: #0e0f14;
+      color: #d8dce3;
+      margin: 0;
+      padding: 0;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 16px;
+      background: #161821;
+      border-bottom: 1px solid #232633;
+    }
+    header h1 {
+      font-size: 14px;
+      margin: 0;
+      font-weight: 500;
+      letter-spacing: 0.5px;
+      color: #9ba3b4;
+    }
+    select, button {
+      background: #1d212b;
+      color: #d8dce3;
+      border: 1px solid #2a2f3d;
+      padding: 4px 10px;
+      font-family: inherit;
+      font-size: 13px;
+      border-radius: 3px;
+    }
+    button { cursor: pointer; }
+    button:hover { background: #252a36; }
+    .stage {
+      position: relative;
+      margin: 16px;
+      display: inline-block;
+      max-width: calc(100vw - 32px);
+    }
+    .stage img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      background: #000;
+    }
+    .stage svg {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    .legend {
+      margin: 8px 16px 16px;
+      font-size: 12px;
+      color: #9ba3b4;
+      line-height: 1.6;
+    }
+    .legend .swatch {
+      display: inline-block;
+      width: 12px; height: 12px;
+      vertical-align: middle;
+      margin-right: 5px;
+      border-radius: 2px;
+    }
+    .info {
+      font-size: 12px;
+      color: #6f7787;
+    }
+    .err {
+      color: #e88080;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>POLYGON VIEWER</h1>
+    <select id="room-select"></select>
+    <button id="refresh">Refresh frame</button>
+    <span id="status" class="info"></span>
+  </header>
+
+  <div class="stage" id="stage">
+    <img id="frame" alt="camera snapshot">
+    <svg id="overlay" preserveAspectRatio="none"></svg>
+  </div>
+
+  <div class="legend">
+    <span><span class="swatch" style="background:#3aa0ff"></span>to_room exit</span>
+    &nbsp;&nbsp;
+    <span><span class="swatch" style="background:#ff8a3a"></span>to_unmonitored_zone exit</span>
+    &nbsp;&nbsp;
+    <span><span class="swatch" style="background:#ff4d4d"></span>exterior_exit</span>
+    &nbsp;&nbsp;
+    <span><span class="swatch" style="background:#7dd87d"></span>landmark</span>
+  </div>
+
+  <script>
+    const roomSelect = document.getElementById("room-select");
+    const refreshBtn = document.getElementById("refresh");
+    const status = document.getElementById("status");
+    const frame = document.getElementById("frame");
+    const overlay = document.getElementById("overlay");
+
+    // Color per kind. Matches the legend.
+    const KIND_COLOR = {
+      "to_room":              "#3aa0ff",
+      "to_unmonitored_zone":  "#ff8a3a",
+      "exterior_exit":        "#ff4d4d",
+    };
+    const LANDMARK_COLOR = "#7dd87d";
+
+    async function fetchJson(url) {
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) throw new Error(`${url} → ${r.status}`);
+      return r.json();
+    }
+
+    async function loadRoomList() {
+      try {
+        const data = await fetchJson("/api/world_model/rooms");
+        const rooms = data.rooms || [];
+        roomSelect.innerHTML = "";
+        if (rooms.length === 0) {
+          const opt = document.createElement("option");
+          opt.textContent = "(no world_model: rooms configured)";
+          roomSelect.appendChild(opt);
+          status.textContent = "Add a world_model: block to a room in config.yaml.";
+          return null;
+        }
+        for (const r of rooms) {
+          const opt = document.createElement("option");
+          opt.value = r.id;
+          opt.textContent = r.display_name || r.id;
+          roomSelect.appendChild(opt);
+        }
+        return rooms[0].id;
+      } catch (e) {
+        status.textContent = "Failed to load room list: " + e.message;
+        status.className = "err";
+        return null;
+      }
+    }
+
+    async function loadRoom(roomId) {
+      if (!roomId) return;
+      status.textContent = `Loading ${roomId}…`;
+      status.className = "info";
+
+      // Background frame: bypass cache via timestamp query param.
+      frame.src = `/api/camera/${encodeURIComponent(roomId)}/snapshot.jpg?t=${Date.now()}`;
+
+      // Polygons.
+      let data;
+      try {
+        data = await fetchJson(`/api/world_model/rooms/${encodeURIComponent(roomId)}/polygons`);
+      } catch (e) {
+        status.textContent = `No polygon data for ${roomId}: ${e.message}`;
+        status.className = "err";
+        clearOverlay();
+        return;
+      }
+
+      const fw = data.frame_width || 640;
+      const fh = data.frame_height || 480;
+      // SVG viewBox uses the camera's pixel space so polygon coords
+      // match config.yaml directly. preserveAspectRatio="none" lets the
+      // SVG stretch with the rendered image (which scales to fit the
+      // page width).
+      overlay.setAttribute("viewBox", `0 0 ${fw} ${fh}`);
+      overlay.innerHTML = "";
+
+      const exits = data.exits || [];
+      const landmarks = data.landmarks || [];
+
+      for (const ex of exits) {
+        const color = KIND_COLOR[ex.kind] || "#888";
+        const label = ex.name || ex.to || ex.kind;
+        drawPolygon(ex.polygon || [], color, `${ex.kind}: ${label}`);
+      }
+      for (const lm of landmarks) {
+        drawPolygon(lm.polygon || [], LANDMARK_COLOR, `landmark: ${lm.name}`);
+      }
+
+      status.textContent =
+        `${roomId}: ${exits.length} exits, ${landmarks.length} landmarks (${fw}×${fh})`;
+      status.className = "info";
+    }
+
+    function drawPolygon(points, color, label) {
+      if (!Array.isArray(points) || points.length < 3) return;
+      const svgns = "http://www.w3.org/2000/svg";
+      const poly = document.createElementNS(svgns, "polygon");
+      poly.setAttribute(
+        "points",
+        points.map(p => `${p[0]},${p[1]}`).join(" ")
+      );
+      poly.setAttribute("fill", color);
+      poly.setAttribute("fill-opacity", "0.22");
+      poly.setAttribute("stroke", color);
+      poly.setAttribute("stroke-width", "3");
+      poly.setAttribute("vector-effect", "non-scaling-stroke");
+      overlay.appendChild(poly);
+
+      // Label at the polygon's first point. Use a darker shadow rect
+      // so the text is readable over light frame regions.
+      const [tx, ty] = points[0];
+      const text = document.createElementNS(svgns, "text");
+      text.setAttribute("x", tx + 6);
+      text.setAttribute("y", ty + 18);
+      text.setAttribute("fill", "#fff");
+      text.setAttribute("stroke", "#000");
+      text.setAttribute("stroke-width", "0.5");
+      text.setAttribute("font-size", "16");
+      text.setAttribute("font-family", "ui-monospace, Menlo, Consolas, monospace");
+      text.textContent = label;
+      overlay.appendChild(text);
+    }
+
+    function clearOverlay() {
+      overlay.innerHTML = "";
+    }
+
+    roomSelect.addEventListener("change", () => loadRoom(roomSelect.value));
+    refreshBtn.addEventListener("click", () => loadRoom(roomSelect.value));
+
+    (async () => {
+      const initial = await loadRoomList();
+      if (initial) await loadRoom(initial);
+    })();
+  </script>
+</body>
+</html>
