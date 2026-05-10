@@ -542,3 +542,148 @@ persona_revert:
     - Meeting
     - Call
     - Huddle
+
+# ── World Model — Phase 4 (§22) bootstrap ─────────────────────────────────
+# These blocks declare the household residents and resident pets so the
+# world model can materialize entity rows for them on every boot.
+# Polygon coordinates and other per-room geometry stay in `rooms.*.world_model`
+# above — this block is purely for "who lives here, what pets, who owns whom".
+#
+# Editing pets/residents is hot-reload-safe IF you call the dashboard's
+# "reload pets" hook. tracked_species changes (adding/removing a species)
+# require a full restart because it gates pipeline wiring at startup.
+world_model:
+  tracked_species: [cat, dog]
+  visiting_animal_retention_minutes: 60
+  # Nightly behavioral profile rebuild (§22.6). Once per interval_hours.
+  nightly:
+    interval_hours: 24
+    startup_grace_seconds: 60
+    profile_days_back: 30
+
+residents:
+  - id: cole
+    display_name: Cole
+    primary_room: office
+  - id: anna
+    display_name: Anna
+    primary_room: bedroom
+  - id: jeff
+    display_name: Jeff
+    primary_room: jeff_room          # declared but UNMONITORED
+
+pets:
+  cats:
+    - name: Socks
+      household_owner: cole
+      color_class: tuxedo
+      expected_size: medium
+      home_room: office
+      personality: skittish_weird
+      affinities:
+        - person: anna
+          strength: high
+          contexts: [proximity_general]
+
+    - name: Sneaky
+      household_owner: cole
+      color_class: silver-tabby
+      coat_length: long
+      expected_size: medium-large
+      home_room: cyclic
+      cyclic_home_rooms: [living_room, kitchen, any_closet]
+      personality: patient_hunter_survivalist
+      hyper_alert_to: [Summer]
+      sees_ghosts: true
+      distinctive_features: [blue_eyes, pink_nose, long_coat]
+
+    - name: Spooky
+      household_owner: cole
+      color_class: black
+      coat_texture: fluffy_curly
+      expected_size: medium
+      home_room: bedroom
+      personality: calm
+      affinities:
+        - person: cole
+          strength: high
+          contexts: [sleeping]
+
+    - name: Velcro
+      household_owner: jeff
+      unmonitored_home: jeff_room
+      color_class: black
+      coat_texture: straight_sleek
+      expected_size: medium-large
+      home_room: jeff_room
+      personality: spirited
+      preferred_perches: [kitchen_fridge_top]
+      conflicts_with: [Summer]
+      affinities:
+        - person: jeff
+          strength: high
+          contexts: [proximity_general, sleeping]
+        - person: anna
+          strength: medium
+          contexts: [physical_contact, rubbing]
+
+    - name: Sparta
+      household_owner: cole
+      color_class: tabby-and-white
+      expected_size: xl
+      size_basis: dynamic
+      home_room: bedroom
+      personality: lazy_opportunist
+      preferred_landmarks: [food_dish]
+      affinities:
+        - person: anna
+          strength: medium
+          contexts: [proximity_general]
+      notes: "Affinity is soft — Sparta gravitates to whoever is most convenient."
+
+    - name: Serval
+      household_owner: cole
+      color_class: tabby-and-white
+      expected_size: large
+      size_basis: dynamic
+      home_room: office
+      personality: senior
+      age_state: senior_thinning
+
+  dogs:
+    - name: Summer
+      household_owner: cole
+      breed_class: medium-longhair
+      color_class: cream
+      expected_size: medium
+      home_rooms: [bedroom, living_room, outdoor]
+      feeding_room: living_room
+      personality: smart_demanding_excitable
+      anxiety_triggers: [strangers_in_house]
+      affinities:
+        - person: anna
+          strength: high
+          contexts: [proximity_general]
+        - person: cole
+          strength: medium
+          contexts: [authority]
+
+    - name: Dalila
+      household_owner: cole
+      breed_class: medium-shorthair
+      color_class: brindle
+      expected_size: medium
+      home_rooms: [bedroom, living_room, outdoor]
+      feeding_room: living_room
+      personality: low_energy_chill
+      nicknames: [Eeyore, brown_dog, dog_2]
+
+# Out-of-scope for the world model — see §22.10. Lives outdoors, handled by
+# the OutdoorObserver subsystem (not yet wired). Listing here so future
+# additions land in one place.
+outdoor_pets:
+  - name: Scooter
+    species: tortoise
+    breed: sulcata
+    typical_zones: [backyard]
+    household_owner: cole

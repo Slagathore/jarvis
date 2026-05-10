@@ -121,7 +121,13 @@ from modules.vision.object_detector import ObjectDetector
 from modules.vision.posture_analyzer import PostureAnalyzer
 from modules.vision.observation_builder import ObservationBuilder
 from modules.layout import DoorMap
-from modules.world_model import WorldModel, WorldQueryTools, WorldStore
+from modules.world_model import (
+    BehavioralProfileBuilder,
+    WorldModel,
+    WorldQueryTools,
+    WorldStore,
+    bootstrap_pets_from_config,
+)
 from modules.vision.scene_analyzer import SceneAnalyzer
 from modules.vision.wyze_cam_control import WyzeCamControl
 from core.room_settings import RoomSettings
@@ -3429,6 +3435,70 @@ class Orchestrator:
 
             await asyncio.sleep(interval_seconds)
 
+    async def _world_model_nightly_loop(self) -> None:
+        """
+        §22.6 BehavioralProfileBuilder. Once per `interval_hours` (24 by
+        default), iterate over every resident pet entity and rebuild its
+        behavioral profile from the last 30 days of events. The first
+        run waits `startup_grace_seconds` to avoid stampeding boot.
+        """
+        cfg = (self.config.get("world_model") or {}).get("nightly", {})
+        interval_hours = float(cfg.get("interval_hours", 24))
+        grace_s = float(cfg.get("startup_grace_seconds", 60))
+        days_back = int(cfg.get("profile_days_back", 30))
+
+        logger.info(
+            f"[WorldModel] nightly profile builder loop starting "
+            f"(every {interval_hours}h, {days_back}d window)"
+        )
+        try:
+            await asyncio.sleep(grace_s)
+        except asyncio.CancelledError:
+            return
+
+        builder = BehavioralProfileBuilder()
+        while True:
+            try:
+                world = self.world_model
+                if world is None:
+                    await asyncio.sleep(interval_hours * 3600)
+                    continue
+                # Snapshot the entity list under the lock so we don't
+                # rebuild the same dict twice if entities mutate mid-pass.
+                async with world._lock:
+                    targets = [
+                        e for e in world.entities.values()
+                        if e.entity_type in ("cat", "dog")
+                        and e.is_resident
+                        and e.archived_at is None
+                    ]
+                rebuilt = 0
+                for ent in targets:
+                    try:
+                        await builder.rebuild_for(
+                            world, ent, days_back=days_back
+                        )
+                        rebuilt += 1
+                    except Exception as e:
+                        logger.warning(
+                            f"[WorldModel] profile rebuild failed for "
+                            f"'{ent.display_name}': {e}"
+                        )
+                logger.info(
+                    f"[WorldModel] nightly: rebuilt {rebuilt}/"
+                    f"{len(targets)} pet profiles"
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception(
+                    "[WorldModel] nightly loop iteration crashed"
+                )
+            try:
+                await asyncio.sleep(interval_hours * 3600)
+            except asyncio.CancelledError:
+                break
+
     # ── Event Handlers ─────────────────────────────────────────────────────
 
     async def _on_appliance_changed(self, event: dict) -> None:
@@ -4616,6 +4686,21 @@ class Orchestrator:
                 # Query layer over the live model — registered into the
                 # LLM tool registry by _build_tool_registry below.
                 self.world_query_tools = WorldQueryTools(self.world_model)
+                # Phase 4 (§22): bootstrap declared cats/dogs into entity
+                # rows + sync affinities. Idempotent — safe to call every
+                # boot. Failures here don't take the world model down.
+                try:
+                    pets = await bootstrap_pets_from_config(
+                        self.world_store, self.config
+                    )
+                    # Re-hydrate the live entity registry so newly
+                    # bootstrapped pets are immediately matchable.
+                    if pets:
+                        async with self.world_model._lock:
+                            for ent in pets:
+                                self.world_model.entities[ent.id] = ent
+                except Exception as e:
+                    logger.warning(f"[Init] pets bootstrap failed: {e}")
                 logger.info("[Init] World Model + ObservationBuilder started")
             except Exception as e:
                 logger.warning(
@@ -4752,6 +4837,12 @@ class Orchestrator:
         # Reminder scheduler
         if self.reminder_scheduler:
             tasks.append(self.reminder_scheduler.run())
+
+        # World Model nightly: §22.6 BehavioralProfileBuilder. One pass
+        # per resident pet entity, rolling 30-day window. Skipped if
+        # the world model didn't come up.
+        if self.world_model is not None:
+            tasks.append(self._world_model_nightly_loop())
 
         # Dashboard
         if self.dashboard:

@@ -1,6 +1,6 @@
 # World Model integration — resume notes
 
-Last updated: **2026-05-10**
+Last updated: **2026-05-10** (post-§22 chunk: pets-by-name code-complete)
 
 This file is the bridge between sessions. The bible is
 `scripts/massive_new_integration/new 2.md`; the **TOC comments at the
@@ -28,6 +28,7 @@ top of that doc** mark every section that's been completed (search for
 | Phase 3.4 (polygon viewer) | `dashboard/static/polygon_viewer.html` + `/api/world_model/rooms{,/.../polygons}` + `/polygons` page | Endpoints + page serve via TestClient ✅ |
 | §31 (notifications) | `modules/notifications/{dispatcher,channels}.py` | Routing + parallel dispatch + delivery-log roundtrip ✅ |
 | §29 (alarm framework + cat-escape) | `modules/safety/alarms/{state,alarm,audio,dispatcher,cat_escape}.py` | 7-scenario synthetic test ✅ |
+| §22 (Phase 4 — pets by name) | `modules/world_model/pets.py`, `modules/world_model/cluster_builder.py`; `_animal_pair_cost` + `_build_cat_obs`/`_build_dog_obs` rewrite; `pet_affinities` schema; orchestrator nightly profile loop | 7-scenario synthetic test (`scripts/test_pets_synthetic.py`) ✅ |
 
 **Hands-on verify gates still pending** (need Cole + running Jarvis):
 - Phase 1.2 — re-enroll Cole + Anna with 5 ArcFace photos each, confirm `identify ≥0.6` + margin-gate refusal.
@@ -122,25 +123,46 @@ logs for which dep failed.
 
 ## What's next per the doc's build order
 
-The strict next code-only chunk is **§22 (Phase 4 — pets by name)**. Per
-§26, Phase 4 is "optional for the boss demo" but high-value for the
-long-running system. Implementation lives in §22.3-§22.7:
+**§22 (Phase 4 — pets by name) is now CODE-COMPLETE** as of 2026-05-10.
+The build artifacts are:
 
-- `modules/world_model/pets.py` — bootstrap from `config.pets`
-- `modules/vision/observation_builder.py::_build_cat_obs` — replace stub
-  with full color/pattern/coat-texture enricher (§22.3)
-- `modules/world_model/world_model.py::_cat_pair_cost` — replace stub with
-  the full §22.7 cost function
-- `modules/world_model/cluster_builder.py` — cold-start cluster protocol
-  (§22.5)
-- `modules/world_model/behavioral_profile_builder.py` — nightly profile
-  rebuild (§22.6)
-- Schema additions per §22.0a (household_owner_id, unmonitored_home_room,
-  pet_affinities table)
+- `modules/world_model/pets.py` — `bootstrap_pets_from_config` +
+  `BehavioralProfileBuilder` (cats AND dogs).
+- `modules/world_model/cluster_builder.py` — `AnimalClusterBuilder` +
+  `apply_cluster_labels` (cold-start protocol).
+- `modules/vision/observation_builder.py` — full `_build_cat_obs` +
+  new `_build_dog_obs` + `_build_animal_obs` dispatcher; descriptor
+  helpers (`_classify_cat_color`, `_classify_dog_color`,
+  `_color_histogram`, `_coat_texture_descriptor`,
+  `_coarse_breed_class`).
+- `modules/world_model/world_model.py` — `_animal_pair_cost(species)`
+  with cat/dog weight tables; archived-pet hard reject; cat/dog event
+  metadata blends in observation descriptors so the cluster builder
+  has signal to work with.
+- `modules/world_model/store.py` — schema + ALTER-based forward
+  migration for `household_owner_id`, `unmonitored_home_room`,
+  `archived_at`; new `pet_affinities` table; `replace_affinities`.
+- `modules/world_model/types.py` — `WorldEntity` exposes the three
+  new fields.
+- `core/orchestrator.py` — bootstrap_pets_from_config call after
+  `world_model.start()`; `_world_model_nightly_loop` periodic task
+  for §22.6 BehavioralProfileBuilder.
+- `config.yaml` — full `world_model:`, `residents:`, `pets:`, and
+  `outdoor_pets:` blocks declaring the 6 cats + 2 dogs + Scooter.
 
-The verify gate for §22 is "5 photos × 5 cats enrolled, ≥70% top-1 match
-on held-out crops". That's hands-on (photos) but the code is fully
-writable in advance.
+**Hands-on verify gates for §22:**
+- Boot Jarvis; tail logs for `[pets] bootstrap complete: N cat(s), M dog(s)`.
+- Run `python scripts/test_pets_synthetic.py` → 7 scenarios pass.
+- Day-1 → day-30 disambiguation walk (§22.8) — needs real cat
+  observations accumulating; the cluster-builder dashboard page is
+  not yet built (Phase 3.4 polygon viewer pattern is the model).
+
+**Remaining doc chunks** (no order dependency):
+- §22.10 OutdoorObserver (Scooter) — Phase 6, deferred.
+- §23 objects (CLIP encoder + open-vocab detector + cost function).
+- §29.3 / §29.4 (door-open + fire alarms — pending detector signals).
+- §30 wake words / multi-persona scaffold.
+- Cluster-builder dashboard page (§22.5) for human-in-the-loop labeling.
 
 **Other sections that could go in parallel** (no order dependency on §22):
 - §32 schema migrations — finish the `alarm_state` / `alarm_fires` /
