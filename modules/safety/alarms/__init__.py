@@ -8,6 +8,10 @@ from modules.safety.alarms.alarm import Alarm
 from modules.safety.alarms.audio import AlarmAudio, NullAlarmAudio
 from modules.safety.alarms.dispatcher import AlarmDispatcher
 from modules.safety.alarms.cat_escape import CatEscapeAlarm
+from modules.safety.alarms.door_open import DoorOpenAlarm
+from modules.safety.alarms.fire import FireAlarm
+from modules.safety.alarms.klaxon import KlaxonLibrary
+from modules.safety.alarms.store import AlarmStore, NullAlarmStore
 
 __all__ = [
     "AlarmState",
@@ -17,4 +21,9 @@ __all__ = [
     "NullAlarmAudio",
     "AlarmDispatcher",
     "CatEscapeAlarm",
+    "DoorOpenAlarm",
+    "FireAlarm",
+    "KlaxonLibrary",
+    "AlarmStore",
+    "NullAlarmStore",
 ]

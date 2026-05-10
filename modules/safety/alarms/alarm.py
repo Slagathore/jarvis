@@ -56,12 +56,17 @@ class Alarm:
         self,
         bus: Any,
         notifier: Optional[Any] = None,
+        store: Optional[Any] = None,
         mute_seconds: float = 300.0,        # 5 min default
     ) -> None:
         self.bus = bus
         # NotificationDispatcher (§31). Optional — alarms still fire
         # locally without it, just no phone alerts.
         self.notifier = notifier
+        # AlarmStore (§32 alarm_fires + alarm_state persistence).
+        # Optional — None falls back to NullAlarmStore semantics.
+        from modules.safety.alarms.store import NullAlarmStore
+        self.store = store if store is not None else NullAlarmStore()
         self._mute_seconds = float(mute_seconds)
         # Public, dispatcher reads this to compute audio_owner.
         self.state: AlarmState = AlarmState.INACTIVE
@@ -118,10 +123,23 @@ class Alarm:
                 f"context={context or {}})"
             )
 
-        # Notify outside the lock so notifier failure doesn't block
-        # state transitions.
+        # Notify outside the lock so notifier / store failure doesn't
+        # block state transitions.
         if old in (AlarmState.INACTIVE, AlarmState.RESOLVED):
             await self._send_phone_alert(context)
+            # New fire → audit row. Rearms (MUTED → FIRING_AUDIO) reuse
+            # the same fire_id so record_fire's dedup keeps audit clean.
+            if self.fire_id is not None and self.fired_at is not None:
+                await self.store.record_fire(
+                    fire_id=self.fire_id,
+                    alarm_type=self.ALARM_TYPE,
+                    fired_at=self.fired_at,
+                    metadata=context or {},
+                )
+        await self.store.record_state(
+            self.ALARM_TYPE, AlarmState.FIRING_AUDIO.value,
+            metadata={"fire_id": self.fire_id},
+        )
         await self._notify_dispatcher(old, AlarmState.FIRING_AUDIO)
 
     async def condition_cleared(
@@ -134,11 +152,29 @@ class Alarm:
                 return
             old = self.state
             self.state = AlarmState.RESOLVED
+            resolved_fire_id = self.fire_id
             await self._cancel_mute_timer()
             logger.info(
                 f"[Alarm:{self.ALARM_TYPE}] RESOLVED — condition cleared "
                 f"(fire_id={self.fire_id})"
             )
+        # Stamp the resolution on the alarm_fires row + flip alarm_state.
+        # Both record_* paths swallow failures; persistence shouldn't
+        # block dispatcher notification.
+        if resolved_fire_id is not None:
+            resolution_kind = (
+                (context or {}).get("reason") or "condition_clear"
+            )
+            await self.store.record_resolution(
+                fire_id=resolved_fire_id,
+                alarm_type=self.ALARM_TYPE,
+                resolution=resolution_kind,
+                metadata=context or {},
+            )
+        await self.store.record_state(
+            self.ALARM_TYPE, AlarmState.RESOLVED.value,
+            metadata={"fire_id": resolved_fire_id},
+        )
         await self._notify_dispatcher(old, AlarmState.RESOLVED)
 
     async def voice_silence(self) -> None:
@@ -157,6 +193,13 @@ class Alarm:
                 f"[Alarm:{self.ALARM_TYPE}] MUTED for "
                 f"{self._mute_seconds:.0f}s (fire_id={self.fire_id})"
             )
+        await self.store.record_state(
+            self.ALARM_TYPE, AlarmState.MUTED.value,
+            metadata={
+                "fire_id": self.fire_id,
+                "mute_seconds": self._mute_seconds,
+            },
+        )
         await self._notify_dispatcher(old, AlarmState.MUTED)
 
     async def suppress(self) -> None:
