@@ -30,7 +30,7 @@ Spec:    new 2.md §8 (Storage Layer) and §16 (Full Code: WorldStore).
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import numpy as np
@@ -236,7 +236,7 @@ class WorldStore:
                 entity_id,
                 embedding.astype(np.float32).tobytes(),
                 int(embedding.shape[0]),
-                datetime.utcnow().isoformat(),
+                _utcnow().isoformat(),
             ),
         )
 
@@ -280,7 +280,7 @@ class WorldStore:
                     if row["last_seen_bbox"] else None,
                 last_seen_landmark=row["last_seen_landmark"],
                 last_state_change_ts=_parse_iso(row["last_state_change_ts"])
-                    or datetime.utcnow(),
+                    or _utcnow(),
                 confidence=row["confidence"] or 0.0,
                 last_attribution_confidence=row["last_attribution_confidence"] or 0.0,
                 is_resident=bool(row["is_resident"]),
@@ -377,10 +377,10 @@ class WorldStore:
             params.extend(event_types)
         if since:
             q += " AND ts >= ?"
-            params.append(since.isoformat())
+            params.append(_iso(since))
         if until:
             q += " AND ts <= ?"
-            params.append(until.isoformat())
+            params.append(_iso(until))
         q += " ORDER BY ts DESC LIMIT ?"
         params.append(limit)
         rows = await self.db.fetchall(q, tuple(params))
@@ -390,12 +390,25 @@ class WorldStore:
 # ── helpers ─────────────────────────────────────────────────────────────────
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _iso(ts: Optional[datetime]) -> Optional[str]:
-    return ts.isoformat() if ts else None
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).isoformat()
 
 
 def _parse_iso(s: Optional[str]) -> Optional[datetime]:
-    return datetime.fromisoformat(s) if s else None
+    if not s:
+        return None
+    ts = datetime.fromisoformat(s)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 
 def _clean_metadata(metadata: dict) -> dict:

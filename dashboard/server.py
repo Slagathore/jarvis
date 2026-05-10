@@ -1377,8 +1377,27 @@ class DashboardServer:
                     name = p.get("name")
                     if not name:
                         continue
-                    where = await wq.where_is_pet(name)
-                    care = await wq.pet_care_summary(name, hours_ago=24)
+                    try:
+                        where = await wq.where_is_pet(name)
+                    except Exception as e:
+                        logger.warning(
+                            f"[/api/world_model/pets] where_is_pet({name!r}) failed: {e}"
+                        )
+                        where = {
+                            "state": p.get("state"),
+                            "last_seen_room": p.get("last_seen_room"),
+                            "likely_room": p.get("last_seen_room"),
+                            "likely_room_inferred": False,
+                            "unmonitored_home": p.get("unmonitored_home"),
+                            "duration_in_state_seconds": None,
+                        }
+                    try:
+                        care = await wq.pet_care_summary(name, hours_ago=24)
+                    except Exception as e:
+                        logger.warning(
+                            f"[/api/world_model/pets] pet_care_summary({name!r}) failed: {e}"
+                        )
+                        care = {"by_kind": {}}
                     pets_out.append({
                         "name": name,
                         "species": p.get("species"),
@@ -1582,7 +1601,8 @@ class DashboardServer:
                 limit = max(1, min(int(limit), 200))
                 hours_ago = max(1, min(int(hours_ago), 168))
                 rows = await wq.search_recent_events(
-                    hours_ago=hours_ago, limit=limit,
+                    hours_ago=hours_ago,
+                    limit=min(limit * 5, 500),
                 )
                 # search_events serializes metadata as a JSON string;
                 # decode here so the browser doesn't double-parse.
@@ -1598,7 +1618,21 @@ class DashboardServer:
                             d["metadata"] = {}
                     elif raw is None:
                         d["metadata"] = {}
+                    meta = d.get("metadata") or {}
+                    name = str(d.get("entity_name") or "")
+                    generic_object_churn = (
+                        d.get("entity_type") == "object"
+                        and d.get("event_type") in {
+                            "lost_visibility", "reappeared",
+                        }
+                        and name.startswith("unknown_")
+                        and meta.get("source", "yolo") == "yolo"
+                    )
+                    if generic_object_churn:
+                        continue
                     clean.append(d)
+                    if len(clean) >= limit:
+                        break
                 return JSONResponse({
                     "events": clean, "available": True,
                 })

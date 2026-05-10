@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import numpy as np
@@ -42,6 +42,16 @@ from modules.world_model.types import (
     Observation,
     WorldEntity,
 )
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 
 class WorldModel:
@@ -156,8 +166,14 @@ class WorldModel:
         UNKNOWN_AT_BOOT for the first 30s — observations resolve, the
         timer demotes survivors to IN_HOUSE_UNMONITORED."""
         for ent in await self.store.load_entities():
+            if ent.last_seen_ts is not None:
+                ent.last_seen_ts = _as_utc(ent.last_seen_ts)
+            if ent.last_state_change_ts is not None:
+                ent.last_state_change_ts = _as_utc(ent.last_state_change_ts)
+            if ent.archived_at is not None:
+                ent.archived_at = _as_utc(ent.archived_at)
             self.entities[ent.id] = ent
-        boot_ts = datetime.utcnow()
+        boot_ts = _utcnow()
         for ent in self.entities.values():
             if ent.state == EntityState.PRESENT:
                 ent.state = EntityState.UNKNOWN_AT_BOOT
@@ -174,7 +190,10 @@ class WorldModel:
             camera = payload["camera"]
             ts = payload["ts"] if isinstance(payload["ts"], datetime) \
                  else datetime.fromisoformat(payload["ts"])
+            ts = _as_utc(ts)
             observations: list[Observation] = payload["observations"]
+            for obs in observations:
+                obs.ts = _as_utc(obs.ts)
 
             # Skip if camera is unhealthy — entities should already be
             # suspended by _on_camera_health.
@@ -261,6 +280,7 @@ class WorldModel:
         return matched, unmatched_obs, unmatched_ents
 
     def _pair_cost(self, obs: Observation, ent: WorldEntity) -> float:
+        obs.ts = _as_utc(obs.ts)
         if ent.entity_type != obs.obj_class:
             return self.cfg["cost_reject"] * 2
         # Archived pet entities never match — they're soft-deleted.
@@ -277,6 +297,7 @@ class WorldModel:
         return self.cfg["cost_reject"] * 2
 
     def _person_pair_cost(self, obs: Observation, ent: WorldEntity) -> float:
+        obs.ts = _as_utc(obs.ts)
         # Identity wins if both sides have it.
         if obs.person_id is not None and ent.person_id is not None:
             if obs.person_id == ent.person_id:
@@ -287,6 +308,7 @@ class WorldModel:
         # Fallback to spatial-temporal continuity.
         if not ent.last_seen_ts:
             return self.cfg["cost_reject"] * 2
+        ent.last_seen_ts = _as_utc(ent.last_seen_ts)
         seconds_gone = (obs.ts - ent.last_seen_ts).total_seconds()
         if seconds_gone > 60.0:
             return self.cfg["cost_reject"] * 2
@@ -670,10 +692,14 @@ class WorldModel:
             detected = obs.metadata.get("detected_class")
             if detected:
                 new_ent.metadata["detected_class"] = detected
+            source = obs.metadata.get("source")
+            if source:
+                new_ent.metadata["source"] = source
         if obs.visual_embedding is not None:
             new_ent.metadata["_visual_embedding"] = obs.visual_embedding
-            await self.store.upsert_embedding(new_ent.id, obs.visual_embedding)
         await self.store.upsert_entity(new_ent)
+        if obs.visual_embedding is not None:
+            await self.store.upsert_embedding(new_ent.id, obs.visual_embedding)
         await self._emit(EventType.FIRST_SEEN, new_ent, obs)
 
     def _find_entity_by_person_id(self, person_id: int) -> Optional[WorldEntity]:
@@ -778,9 +804,10 @@ class WorldModel:
         while not self._stopped:
             try:
                 await asyncio.sleep(tick)
-                now = datetime.utcnow()
+                now = _utcnow()
                 async with self._lock:
                     for ent in list(self.entities.values()):
+                        ent.last_state_change_ts = _as_utc(ent.last_state_change_ts)
                         elapsed = now - ent.last_state_change_ts
 
                         # UNKNOWN_AT_BOOT → resolve after boot grace.
@@ -880,7 +907,7 @@ class WorldModel:
         obs: Optional[Observation],
         metadata: Optional[dict] = None,
     ) -> None:
-        ts = obs.ts if obs else datetime.utcnow()
+        ts = _as_utc(obs.ts) if obs else _utcnow()
         # For cat/dog events, blend the observation's visual descriptors
         # into event metadata so §22.5's AnimalClusterBuilder has signal
         # to work with at cold-start. Color histogram is excluded — too
@@ -895,13 +922,26 @@ class WorldModel:
                 v = obs.metadata.get(k)
                 if v is not None and k not in merged_metadata:
                     merged_metadata[k] = v
+        if ent.entity_type == "object":
+            for k in ("detected_class", "source", "openvocab_query"):
+                v = (obs.metadata.get(k) if obs is not None else None)
+                if v is None:
+                    v = ent.metadata.get(k)
+                if v is not None and k not in merged_metadata:
+                    merged_metadata[k] = v
+        entity_name = ent.display_name
+        if not entity_name and ent.entity_type == "object":
+            detected = merged_metadata.get("detected_class")
+            if detected:
+                safe_class = str(detected).strip().lower().replace(" ", "_")
+                entity_name = f"unknown_{safe_class}_{ent.id[:6]}"
+        if not entity_name:
+            entity_name = f"unknown_{ent.entity_type}_{ent.id[:6]}"
         payload = {
             "id": str(uuid.uuid4()),
             "ts": ts.isoformat(),
             "entity_id": ent.id,
-            "entity_name": (
-                ent.display_name or f"unknown_{ent.entity_type}_{ent.id[:6]}"
-            ),
+            "entity_name": entity_name,
             "entity_type": ent.entity_type,
             "person_id": ent.person_id,
             "event_type": event_type.value,
@@ -934,11 +974,13 @@ class WorldModel:
              declared resident.
         """
         lookback = int(self.cfg.get("candidate_lookback_minutes", 2))
-        cutoff = datetime.utcnow() - timedelta(minutes=lookback)
+        cutoff = _utcnow() - timedelta(minutes=lookback)
         cam_room = self.cameras.get(camera, {}).get("room")
 
         out: dict[str, WorldEntity] = {}
         for e in self.entities.values():
+            if e.last_seen_ts is not None:
+                e.last_seen_ts = _as_utc(e.last_seen_ts)
             recent_here = bool(
                 e.last_seen_ts and e.last_seen_ts > cutoff and (
                     e.last_seen_camera == camera
@@ -1087,7 +1129,7 @@ class WorldModel:
         # even when Cole isn't currently in any in-house state).
         if max_events > 0:
             try:
-                cutoff = datetime.utcnow() - timedelta(
+                cutoff = _utcnow() - timedelta(
                     minutes=recent_event_minutes
                 )
                 rows = await self.store.search_events(
@@ -1162,6 +1204,7 @@ class WorldModel:
         plus continuity and co-occurrence bonuses. Weights differ per
         species (see `_COST_WEIGHTS`).
         """
+        obs.ts = _as_utc(obs.ts)
         w = self._COST_WEIGHTS.get(species, self._COST_WEIGHTS["cat"])
 
         # Color class hard filter — solid-black observation can't be a
@@ -1215,6 +1258,7 @@ class WorldModel:
         # ── Continuity bonus: same camera in last few seconds is a strong
         # negative-cost (i.e. likely the same animal).
         if ent.last_seen_ts:
+            ent.last_seen_ts = _as_utc(ent.last_seen_ts)
             seconds_gone = (obs.ts - ent.last_seen_ts).total_seconds()
         else:
             seconds_gone = 1e6
@@ -1255,6 +1299,8 @@ class WorldModel:
         room within `lookback_seconds`? Returns its display_name or None."""
         cutoff = ts - timedelta(seconds=lookback_seconds)
         for other in self.entities.values():
+            if other.last_seen_ts is not None:
+                other.last_seen_ts = _as_utc(other.last_seen_ts)
             if (other.entity_type == ent.entity_type
                     and other.id != ent.id
                     and other.last_seen_ts and other.last_seen_ts >= cutoff
@@ -1277,7 +1323,7 @@ class WorldModel:
 
         Called nightly off the orchestrator's daily-task loop alongside
         BehavioralProfileBuilder. Returns the count of pruned entities."""
-        now = datetime.utcnow()
+        now = _utcnow()
         cutoff = now - timedelta(days=max_age_days)
         pruned = 0
         async with self._lock:
@@ -1286,6 +1332,8 @@ class WorldModel:
                     continue
                 if ent.metadata.get("pruned"):
                     continue
+                if ent.last_seen_ts is not None:
+                    ent.last_seen_ts = _as_utc(ent.last_seen_ts)
                 if ent.last_seen_ts is not None and ent.last_seen_ts >= cutoff:
                     continue
                 # Check for any interaction history before pruning.
@@ -1330,6 +1378,7 @@ class WorldModel:
             so finding a similar object after a long gap doesn't
             silently re-attribute it.
         """
+        obs.ts = _as_utc(obs.ts)
         obs_class = obs.metadata.get("detected_class")
         ent_class = ent.metadata.get("detected_class")
         if (obs_class and ent_class and obs_class != ent_class):
@@ -1355,6 +1404,7 @@ class WorldModel:
             else:
                 room_cost = 0.5
             if ent.last_seen_ts:
+                ent.last_seen_ts = _as_utc(ent.last_seen_ts)
                 days_gone = (
                     (obs.ts - ent.last_seen_ts).total_seconds() / 86400.0
                 )
@@ -1372,6 +1422,7 @@ class WorldModel:
         # lack a visual embedding (Null encoder, embed compute failed).
         if not ent.last_seen_ts:
             return self.cfg["cost_reject"] * 2
+        ent.last_seen_ts = _as_utc(ent.last_seen_ts)
         seconds_gone = (obs.ts - ent.last_seen_ts).total_seconds()
         if seconds_gone > 15 * 60:
             return self.cfg["cost_reject"] * 2

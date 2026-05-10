@@ -9,10 +9,14 @@ Spec:    new 2.md §5 (Data Model) and §15 (Full Code: types.py).
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 import numpy as np
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class EntityState(str, Enum):
@@ -62,7 +66,7 @@ class WorldEntity:
     last_seen_camera: Optional[str] = None
     last_seen_bbox: Optional[tuple] = None
     last_seen_landmark: Optional[str] = None
-    last_state_change_ts: datetime = field(default_factory=datetime.utcnow)
+    last_state_change_ts: datetime = field(default_factory=_utcnow)
     confidence: float = 0.0              # current state confidence
     last_attribution_confidence: float = 0.0  # how sure we are this obs matched ent
     is_resident: bool = False

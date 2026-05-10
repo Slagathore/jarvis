@@ -468,7 +468,11 @@ class IdentityManager:
         return match
 
     async def identify_from_embedding_async(
-        self, embedding: np.ndarray, modality: str = "face"
+        self,
+        embedding: np.ndarray,
+        modality: str = "face",
+        image_jpeg: Optional[bytes] = None,
+        audio_pcm16: Optional[bytes] = None,
     ) -> Optional[PersonMatch]:
         """
         Match an already-extracted embedding against the centroid bank.
@@ -479,14 +483,19 @@ class IdentityManager:
         twice (once for the person crop, once inside identify_face).
 
         Behavior mirrors `identify_face`: pending-cluster write on miss,
-        voice-verification scheduling on hit. Differs in that no image is
-        attached to the pending row (caller has the crop).
+        voice-verification scheduling on hit. Callers may pass preview media
+        for dashboard review when they already own the crop/audio.
         """
         if embedding is None:
             return None
         match = self._match_against(modality, embedding)
         if match is None:
-            await self._add_to_pending_cluster(modality, embedding)
+            await self._add_to_pending_cluster(
+                modality,
+                embedding,
+                image_jpeg=image_jpeg,
+                audio_pcm16=audio_pcm16,
+            )
         else:
             other = "voice" if modality == "face" else "face"
             self._verify_pending[match.person_id] = other
@@ -966,6 +975,13 @@ class IdentityManager:
             new_centroid = (centroid * count + emb.astype(np.float32)) / new_count
             self._pending_clusters[target_cluster] = (mod, new_centroid, new_count)
             cluster_id = target_cluster
+            await self._attach_pending_preview(
+                kind=f"pending_cluster_{modality}",
+                cluster_id=cluster_id,
+                image_jpeg=image_jpeg,
+                audio_pcm16=audio_pcm16,
+            )
+            return
         else:
             cluster_id = self._next_cluster_id
             self._next_cluster_id += 1
@@ -985,6 +1001,41 @@ class IdentityManager:
             audio_pcm16=audio_pcm16,
             cluster_id=cluster_id,
         )
+
+    async def _attach_pending_preview(
+        self,
+        kind: str,
+        cluster_id: int,
+        image_jpeg: Optional[bytes],
+        audio_pcm16: Optional[bytes],
+    ) -> None:
+        """Fill a missing preview on an existing unresolved cluster row."""
+        changed = False
+        if image_jpeg is not None:
+            await self._db.execute(
+                "UPDATE identity_pending SET image_jpeg = ? "
+                "WHERE kind = ? AND cluster_id = ? AND resolved = 0 "
+                "AND image_jpeg IS NULL",
+                (image_jpeg, kind, cluster_id),
+            )
+            changed = True
+        if audio_pcm16 is not None:
+            await self._db.execute(
+                "UPDATE identity_pending SET audio_pcm16 = ? "
+                "WHERE kind = ? AND cluster_id = ? AND resolved = 0 "
+                "AND audio_pcm16 IS NULL",
+                (audio_pcm16, kind, cluster_id),
+            )
+            changed = True
+        if changed and self._broadcast is not None:
+            try:
+                await self._broadcast({
+                    "type": "identity_pending_added",
+                    "kind": kind,
+                    "cluster_id": cluster_id,
+                })
+            except Exception as e:
+                logger.debug(f"[Identity] pending preview broadcast failed: {e}")
 
     async def _write_pending(
         self,
@@ -1195,7 +1246,10 @@ class IdentityManager:
             "SELECT id, kind, person_id, cluster_id, similarity, anchored_via, "
             "captured_at, image_jpeg IS NOT NULL AS has_image, "
             "audio_pcm16 IS NOT NULL AS has_audio "
-            "FROM identity_pending WHERE resolved = 0 ORDER BY captured_at DESC"
+            "FROM identity_pending WHERE resolved = 0 "
+            "AND NOT (kind = 'pending_cluster_face' AND image_jpeg IS NULL) "
+            "AND NOT (kind = 'pending_cluster_voice' AND audio_pcm16 IS NULL) "
+            "ORDER BY captured_at DESC"
         )
         out: list[dict] = []
         for r in rows:

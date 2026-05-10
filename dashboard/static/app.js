@@ -2756,12 +2756,16 @@ function renderPetCard(pet) {
 }
 
 async function loadPets() {
+  const list = document.getElementById("pets-list");
+  if (!list) return;
   try {
     const res = await fetch("/api/world_model/pets");
-    if (!res.ok) return;
+    if (!res.ok) {
+      list.innerHTML =
+        '<div class="who-empty">Pets unavailable.</div>';
+      return;
+    }
     const body = await res.json();
-    const list = document.getElementById("pets-list");
-    if (!list) return;
     if (!body.available) {
       list.innerHTML =
         '<div class="who-empty">World model unavailable.</div>';
@@ -2783,6 +2787,8 @@ async function loadPets() {
     pets.sort(order).forEach((p) => list.appendChild(renderPetCard(p)));
   } catch (err) {
     console.warn("[loadPets] failed:", err);
+    list.innerHTML =
+      '<div class="who-empty">Pets unavailable.</div>';
   }
 }
 loadPets();

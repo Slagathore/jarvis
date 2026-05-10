@@ -29,10 +29,20 @@ Spec:    new 2.md §20 (Query Layer).
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from modules.world_model.world_model import WorldModel
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 
 class WorldQueryTools:
@@ -60,7 +70,7 @@ class WorldQueryTools:
                 "found": False,
                 "message": f"No entity named {name} in registry.",
             }
-        elapsed = datetime.utcnow() - ent.last_state_change_ts
+        elapsed = _utcnow() - _as_utc(ent.last_state_change_ts)
         return {
             "found": True,
             "name": ent.display_name,
@@ -135,7 +145,7 @@ class WorldQueryTools:
             if not ent:
                 return []
             entity_id = ent.id
-        since = datetime.utcnow() - timedelta(hours=hours_ago)
+        since = _utcnow() - timedelta(hours=hours_ago)
         return await self.world.store.search_events(
             entity_id=entity_id,
             room=room,
@@ -186,7 +196,7 @@ class WorldQueryTools:
         if not ent or ent.entity_type not in ("cat", "dog"):
             return {"found": False,
                     "message": f"No pet named {name} in registry."}
-        elapsed = datetime.utcnow() - ent.last_state_change_ts
+        elapsed = _utcnow() - _as_utc(ent.last_state_change_ts)
         unmon = ent.unmonitored_home_room
         # If we haven't seen the pet AND it has an unmonitored home,
         # surface that as the most likely location.
@@ -333,7 +343,7 @@ class WorldQueryTools:
         person_ent = self.world.find_entity_by_name(person_name)
         if not person_ent:
             return []
-        since = datetime.utcnow() - timedelta(hours=hours_ago)
+        since = _utcnow() - timedelta(hours=hours_ago)
         events = await self.world.store.search_events(
             person_id=person_ent.person_id,
             event_types=["interacted_with", "picked_up", "placed_down"],
@@ -439,7 +449,7 @@ class WorldQueryTools:
         if not ent or ent.entity_type not in ("cat", "dog"):
             return {"found": False,
                     "message": f"No pet named {name} in registry."}
-        since = datetime.utcnow() - timedelta(hours=hours_ago)
+        since = _utcnow() - timedelta(hours=hours_ago)
         events = await self.world.store.search_events(
             entity_id=ent.id,
             event_types=["interacted_with"],

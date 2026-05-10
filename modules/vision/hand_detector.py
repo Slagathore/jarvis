@@ -35,6 +35,7 @@ Spec:    new 2.md §24.1.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -70,6 +71,8 @@ class HandDetector:
             min_tracking_confidence=float(min_tracking_confidence),
         )
         self._max_hands = int(max_num_hands)
+        self._detect_lock = asyncio.Lock()
+        self._next_error_log_ts = 0.0
         logger.info(
             f"[HandDetector] MediaPipe Hands loaded "
             f"(max_num_hands={max_num_hands}, "
@@ -90,7 +93,10 @@ class HandDetector:
         try:
             results = self._hands.process(rgb)
         except Exception as e:
-            logger.debug(f"[HandDetector] mediapipe process failed: {e}")
+            now = time.monotonic()
+            if now >= self._next_error_log_ts:
+                self._next_error_log_ts = now + 5.0
+                logger.debug(f"[HandDetector] mediapipe process failed: {e}")
             return []
         if not getattr(results, "multi_hand_landmarks", None):
             return []
@@ -130,7 +136,8 @@ class HandDetector:
         MediaPipe inference."""
         if image_bgr is None or image_bgr.size == 0:
             return []
-        return await asyncio.to_thread(self.detect, image_bgr)
+        async with self._detect_lock:
+            return await asyncio.to_thread(self.detect, image_bgr)
 
     def close(self) -> None:
         """Free MediaPipe resources. The graph's GPU buffers stick

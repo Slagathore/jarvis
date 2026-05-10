@@ -142,6 +142,14 @@ class ObservationBuilder:
         self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else None
         if self.snapshot_dir is not None:
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self._snapshot_last_saved: dict[tuple[str, str, str], float] = {}
+        self._snapshot_min_interval_s: dict[str, float] = {
+            "person": 30.0,
+            "cat": 30.0,
+            "dog": 30.0,
+            "openvocab": 30.0,
+            "object": 120.0,
+        }
         # Track per-room loop tasks so we can cancel on shutdown without
         # leaking. Keyed by room id.
         self._tasks: dict[str, asyncio.Task] = {}
@@ -354,7 +362,10 @@ class ObservationBuilder:
         # Save crop for enrollment / dashboard. Optional: gated on
         # snapshot_dir being set so tests / lightweight setups skip it.
         crop_path: Optional[Path] = None
-        if self.snapshot_dir is not None and crop is not None and crop.size > 0:
+        if (self.snapshot_dir is not None
+                and crop is not None
+                and crop.size > 0
+                and self._snapshot_allowed("person", room, ts)):
             try:
                 import cv2  # noqa: E402 — lazy so test envs without cv2 don't choke
                 fname = (
@@ -395,7 +406,9 @@ class ObservationBuilder:
             identity_status = "no_match"
             try:
                 match = await self.identity.identify_from_embedding_async(
-                    face["embedding"], modality="face"
+                    face["embedding"],
+                    modality="face",
+                    image_jpeg=_jpeg_bytes(crop),
                 )
                 # Treat ambiguous matches as "unknown for now". The
                 # margin gate inside IdentityManager flagged this match
@@ -571,12 +584,31 @@ class ObservationBuilder:
             },
         )
 
+    def _snapshot_allowed(
+        self,
+        kind: str,
+        room: str,
+        ts: datetime,
+        label: Optional[str] = None,
+    ) -> bool:
+        interval = float(self._snapshot_min_interval_s.get(kind, 60.0))
+        if interval <= 0:
+            return False
+        key = (kind, room, label or "")
+        now = ts.timestamp()
+        last = self._snapshot_last_saved.get(key)
+        if last is not None and (now - last) < interval:
+            return False
+        self._snapshot_last_saved[key] = now
+        return True
+
     def _save_animal_crop(
         self,
         species: str,
         crop: Optional[np.ndarray],
         room: str,
         ts: datetime,
+        label: Optional[str] = None,
     ) -> Optional[Path]:
         """Save a cat/dog bbox crop next to the world snapshots so the
         §22.5 cluster builder dashboard can show the image grid. Same
@@ -585,6 +617,8 @@ class ObservationBuilder:
         the full Path on success, None on no-op (no snapshot dir set,
         empty crop, cv2 unavailable, encode failure)."""
         if self.snapshot_dir is None or crop is None or crop.size == 0:
+            return None
+        if not self._snapshot_allowed(species, room, ts, label=label):
             return None
         try:
             import cv2  # noqa: E402 — lazy
@@ -654,7 +688,9 @@ class ObservationBuilder:
                     f"[ObservationBuilder] CLIP encode failed in '{room}' "
                     f"for {det.class_name}: {e}"
                 )
-        crop_path = self._save_animal_crop("object", crop, room, ts)
+        crop_path = self._save_animal_crop(
+            "object", crop, room, ts, label=det.class_name
+        )
         return Observation(
             camera=room, room=room, obj_class="object",
             bbox=tuple(bbox), confidence=det.confidence, ts=ts,
@@ -740,10 +776,10 @@ class ObservationBuilder:
                                 f"[ObservationBuilder] CLIP encode "
                                 f"failed in open-vocab '{room_id}': {e}"
                             )
-                    crop_path = self._save_animal_crop(
-                        "openvocab", crop, room_id, ts,
-                    )
                     friendly = name_for_query.get(r["name"], r["name"])
+                    crop_path = self._save_animal_crop(
+                        "openvocab", crop, room_id, ts, label=friendly,
+                    )
                     observations.append(Observation(
                         camera=room_id, room=room_id, obj_class="object",
                         bbox=(x1, y1, x2, y2),
@@ -941,3 +977,17 @@ def _laplacian_var(image: Optional[np.ndarray]) -> float:
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
     except Exception:
         return 0.0
+
+
+def _jpeg_bytes(image: Optional[np.ndarray]) -> Optional[bytes]:
+    """BGR crop -> JPEG bytes for pending-review previews."""
+    if image is None or image.size == 0:
+        return None
+    try:
+        import cv2  # noqa: E402 — lazy
+        ok, buf = cv2.imencode(
+            ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+        )
+        return buf.tobytes() if ok else None
+    except Exception:
+        return None

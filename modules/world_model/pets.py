@@ -32,7 +32,7 @@ from __future__ import annotations
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import numpy as np
@@ -40,6 +40,10 @@ from loguru import logger
 
 from modules.world_model.store import WorldStore
 from modules.world_model.types import EntityState, WorldEntity
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # ── Affinity ────────────────────────────────────────────────────────────────
@@ -82,7 +86,7 @@ async def resolve_resident_ids(
         try:
             pid = await db.execute(
                 "INSERT INTO persons (name, created_at) VALUES (?, ?)",
-                (name, datetime.utcnow().isoformat()),
+                (name, _utcnow().isoformat()),
             )
             if pid is not None:
                 out[rid] = int(pid)
@@ -142,7 +146,7 @@ async def bootstrap_pets_from_config(
     # Soft-archive: any resident pet entity that's no longer declared in
     # config gets `archived_at` stamped — its history stays for queries
     # but it won't match new observations. New declarations clear it.
-    now = datetime.utcnow()
+    now = _utcnow()
     for (etype, name), ent in by_type_name.items():
         if etype not in ("cat", "dog"):
             continue
@@ -243,7 +247,7 @@ async def _materialize_pet(
         ent.unmonitored_home_room = cfg.get("unmonitored_home")
         ent.is_resident = True
         if cfg.get("archived"):
-            ent.archived_at = ent.archived_at or datetime.utcnow()
+            ent.archived_at = ent.archived_at or _utcnow()
         else:
             ent.archived_at = None
     else:
@@ -254,7 +258,7 @@ async def _materialize_pet(
             display_name=name,
             state=EntityState.IN_ROOM_UNSEEN,
             last_seen_room=home_room,
-            last_state_change_ts=datetime.utcnow(),
+            last_state_change_ts=_utcnow(),
             is_resident=True,
             household_owner_id=owner_id,
             unmonitored_home_room=cfg.get("unmonitored_home"),
@@ -264,7 +268,7 @@ async def _materialize_pet(
             },
         )
         if cfg.get("archived"):
-            ent.archived_at = datetime.utcnow()
+            ent.archived_at = _utcnow()
 
     await store.upsert_entity(ent)
 
@@ -322,7 +326,7 @@ class BehavioralProfileBuilder:
         Returns the freshly built profile dict and writes it to
         `ent.metadata['behavioral_profile']` + persists via upsert.
         """
-        since = datetime.utcnow() - timedelta(days=days_back)
+        since = _utcnow() - timedelta(days=days_back)
         events = await world.store.search_events(
             entity_id=ent.id, since=since, limit=50000,
         )
@@ -338,7 +342,7 @@ class BehavioralProfileBuilder:
             "co_occurrence_partners": await self._co_occurrence(world, ent, since),
             "n_observations": len(events),
             "window_start": since.isoformat(),
-            "window_end": datetime.utcnow().isoformat(),
+            "window_end": _utcnow().isoformat(),
         }
         ent.metadata["behavioral_profile"] = profile
         await world.store.upsert_entity(ent)
@@ -495,10 +499,14 @@ def _decode_metadata(raw: Any) -> dict:
 def _parse_event_ts(event: dict) -> Optional[datetime]:
     raw = event.get("ts")
     if isinstance(raw, datetime):
-        return raw
-    if isinstance(raw, str):
+        ts = raw
+    elif isinstance(raw, str):
         try:
-            return datetime.fromisoformat(raw)
+            ts = datetime.fromisoformat(raw)
         except ValueError:
             return None
-    return None
+    else:
+        return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)

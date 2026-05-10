@@ -32,13 +32,17 @@ Note: For the K-means input vector, we read color_class + room from
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import numpy as np
 from loguru import logger
 
 from modules.world_model.store import WorldStore
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # Default rooms used for the room one-hot. Override via config in
@@ -82,7 +86,7 @@ class AnimalClusterBuilder:
         entities of this species (so K=4 for 4 declared cats); the
         dashboard can pass an override if it wants a different K.
         """
-        cutoff = datetime.utcnow() - timedelta(days=days_back)
+        cutoff = _utcnow() - timedelta(days=days_back)
         events = await self.store.search_events(
             event_types=["first_seen", "moved_within_room", "reappeared",
                          "moved_to"],
