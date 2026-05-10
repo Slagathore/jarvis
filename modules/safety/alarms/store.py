@@ -79,8 +79,11 @@ class AlarmStore:
         """Stamp the resolved_at + resolution on the alarm_fires row
         for this fire_id. resolution ∈ {condition_clear, voice_silence,
         visual_confirm, manual, mute_expired_clear}."""
+        # Compute ts once outside the try so the except-branch fallback
+        # path has a definite value (Pylance flagged the original as
+        # possibly-unbound).
+        ts = (resolved_at or datetime.now(timezone.utc)).isoformat()
         try:
-            ts = (resolved_at or datetime.now(timezone.utc)).isoformat()
             await self._db.execute(
                 "UPDATE alarm_fires SET resolved_at = ?, resolution = ?, "
                 "metadata = json_patch(COALESCE(metadata, '{}'), ?) "

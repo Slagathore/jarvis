@@ -49,6 +49,7 @@ class AlarmDispatcher:
             AlarmType.FIRE,
             AlarmType.CAT_ESCAPE,
             AlarmType.DOOR_OPEN,
+            AlarmType.CLOWN,    # v4.1 — lowest; audio-suppressed by any other
         ]
 
     # ── Registration / lifecycle ────────────────────────────────────────────

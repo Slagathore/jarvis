@@ -55,10 +55,14 @@ class CatEscapeAlarm(Alarm):
         bus: Any,
         rooms_config: list[dict],
         notifier: Optional[Any] = None,
+        store: Optional[Any] = None,
         armed: bool = True,
         mute_seconds: float = 300.0,           # 5 min default
     ) -> None:
-        super().__init__(bus=bus, notifier=notifier, mute_seconds=mute_seconds)
+        super().__init__(
+            bus=bus, notifier=notifier, store=store,
+            mute_seconds=mute_seconds,
+        )
         # Per-room exterior_exit polygons. Indexed by room id; each
         # entry is a list of {name, polygon} dicts.
         self._exits_by_room = self._index_exits(rooms_config)

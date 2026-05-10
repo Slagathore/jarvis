@@ -1,7 +1,69 @@
 <!-- markdownlint-disable -->
 # World Model integration — resume notes
 
-Last updated: **2026-05-10** (post-§22 chunk: pets-by-name code-complete)
+Last updated: **2026-05-10** (mid-session: §24 fully closed; mid-implementing v4.1 clown alarm; §23 next)
+
+## Resume protocol if you're picking up after auto-compaction
+
+1. Read this file end-to-end first.
+2. Run `git log --oneline -15` to see exactly what's landed.
+3. Run all four synthetic suites — should all be green:
+   - `python scripts/test_world_model_synthetic.py` (4 scenarios)
+   - `python scripts/test_pets_synthetic.py` (13 scenarios)
+   - `python scripts/test_review_fixes_synthetic.py` (6 scenarios)
+   - `python scripts/test_interactions_synthetic.py` (7 scenarios)
+4. Check the "What I'm currently in the middle of" section below.
+5. Resume from there.
+
+## What I'm currently in the middle of (2026-05-10 12:50)
+
+**Implementing v4.1 Clown Alarm.** Spec docs:
+- `v4_1_clown_alarm_micropatch.md` (Cole pasted as conversation message — not a file in the repo)
+- `clown_alarm_patch_patch.md` (correction to the micropatch's `generate_improv` function — Cole pasted too)
+
+**Apply patch-patch into micropatch first**, then implement. The patch-patch fixes:
+- Removes the broken `count_curated_in_style(style_seed)` reference (it was undefined; just use `len(in_style)`)
+- Adds 3-layer fallback for sparse pools:
+  - Layer 1: ≥3 in-style examples → standard generation
+  - Layer 2: 1-2 in-style → supplement with cross-style examples + marked prompt
+  - Layer 3: 0 in-style → log warning + fall back to curated entry (no LLM call)
+- Adds explicit try/except around the LLM call (timeout/error → curated fallback)
+- Adds `record_improv_event()` at every branch for dashboard observability
+- Adds `_select_curated_fallback()` helper with hardcoded last-resort response
+
+**Files to create:**
+- `modules/safety/alarms/clown.py` — ClownAlarm class (subclasses Alarm, PRIORITY=40)
+- `assets/clown_responses.yaml` — curated response pool from §29.8.3 verbatim
+- `prompts/clown_improv.md` — standard generation template
+- `prompts/clown_improv_supplement.md` — variant for thin-pool case
+- `scripts/test_clown_alarm_synthetic.py` — tests for the state machine + selection + fallback
+
+**Files to modify:**
+- `modules/safety/alarms/__init__.py` — export ClownAlarm
+- `modules/safety/alarms/state.py` — add `AlarmType.CLOWN = "clown"` (priority 40)
+- `modules/safety/alarms/dispatcher.py` — extend priority_order with `AlarmType.CLOWN` at the end
+- `modules/safety/alarms/audio.py` — extend repeat-cadence + add 3-stage clown sequence (horns ×3 → TTS → calliope) — needs a custom path because clown is "play once, end naturally" not the standard "loop forever"
+- `modules/safety/alarms/klaxon.py` — add `(calliope, "calliope")` to `_NAME_TOKENS` so `Circus Calliope.mp3` gets classified
+- `core/orchestrator.py` — wire ClownAlarm at boot, register with dispatcher
+- `dashboard/server.py` — `POST /api/world_model/clown_test` for test fire button
+- `dashboard/static/index.html` + `app.js` + `style.css` — clown alarm card with status + test fire button + recent fires + response pool browser
+
+**After clown alarm → §23 Objects.** Cole picked it (highest daily-use UX value) — CLIP encoder + open-vocab detector (OWLv2 or GroundingDINO) + object cost function + dedup + `find_object` query. Heavy ML deps (~600MB-1GB of new weights). Closed-vocab cost function already done (committed earlier).
+
+## Recent commit chain (2026-05-10 session)
+
+```
+e0d43b3 feat(world_model+dashboard): §24 close-outs — HANDED_OFF + interactions timeline
+65af7c4 feat(world_model+vision): §24 Phase 5 — interactions (MediaPipe Hands + pickup/placement)
+bcba1f8 feat(dashboard+vision): §22.5 cluster-builder UI + cat/dog crop persistence
+76dc89e feat(safety): §29 alarms — DoorOpen, Fire, klaxon audio, alarm_fires
+c7887dd feat(world_model+identity+config): §10 auto-enroll, §32 schema, Pydantic validation
+161cb2a fix(world_model+identity): six review-flagged correctness bugs
+9ccffd1 fix(camera) + feat(dashboard): living_room visibility + pets / world-events panels
+2dbe09a feat(world_model): §22.9 landmark events + §23 closed-vocab object cost + pet query tools
+1217184 feat(world_model): §22 wire-up — orchestrator bootstrap + nightly loop + config
+03043fc feat(world_model): §22.5 cold-start cluster protocol + animal event metadata
+```
 
 This file is the bridge between sessions. The bible is
 `scripts/massive_new_integration/new 2.md`; the **TOC comments at the

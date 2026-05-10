@@ -1404,6 +1404,119 @@ class DashboardServer:
                 logger.warning(f"[/api/world_model/pets] {e}")
                 raise HTTPException(status_code=500, detail=str(e)) from e
 
+        # ── §29.8 Clown alarm (v4.1) ──────────────────────────────────────
+
+        def _clown_alarm():
+            """Resolve the active ClownAlarm instance via the alarm
+            dispatcher, or None when not wired."""
+            orch = self._orchestrator
+            disp = getattr(orch, "alarm_dispatcher", None) if orch else None
+            if disp is None:
+                return None
+            return disp.alarms.get("clown")
+
+        @app.get("/api/clown/status")
+        async def clown_status():
+            """State + cooldown + recent generation events for the
+            dashboard clown card."""
+            ca = _clown_alarm()
+            if ca is None:
+                return JSONResponse({"available": False})
+            return JSONResponse({
+                "available": True,
+                "state": ca.state.value,
+                "cooldown_remaining_seconds": ca._cooldown_remaining(),
+                "cooldown_reason": ca._cooldown_reason,
+                "recent_improv_events": ca.recent_improv_events()[-10:],
+                "pool_size": len(ca._pool),
+                "pool_improv_slots": sum(
+                    1 for r in ca._pool if r.generate
+                ),
+            })
+
+        @app.post("/api/clown/test_fire")
+        async def clown_test_fire(payload: Optional[dict] = None):
+            """§29.8.5 — synthesize a clown.detected event so Cole can
+            confirm the audio sequence end-to-end after editing the
+            YAML or replacing audio files."""
+            orch = self._orchestrator
+            if orch is None:
+                raise HTTPException(status_code=503, detail="No orchestrator")
+            from datetime import timezone as _tz
+            await orch.bus.publish("clown.detected", {
+                "trigger": "dashboard_test",
+                "evidence": "dashboard test fire button",
+                "confidence": 1.0,
+                "ts": datetime.now(_tz.utc).isoformat(),
+                **(payload or {}),
+            })
+            return JSONResponse({"fired": True})
+
+        @app.post("/api/clown/reload_pool")
+        async def clown_reload_pool():
+            """Hot-reload the response YAML after Cole edits it."""
+            ca = _clown_alarm()
+            if ca is None:
+                raise HTTPException(status_code=503, detail="Clown alarm unavailable")
+            count = ca.reload_pool()
+            return JSONResponse({"loaded": count})
+
+        @app.get("/api/clown/pool")
+        async def clown_pool():
+            """Browse the response pool (id / tone / text / generate flag)."""
+            ca = _clown_alarm()
+            if ca is None:
+                return JSONResponse({"available": False, "responses": []})
+            return JSONResponse({
+                "available": True,
+                "responses": ca.pool_summary(),
+            })
+
+        @app.post("/api/clown/cooldown")
+        async def clown_cooldown(payload: dict):
+            """Voice-equivalent cooldown set from the dashboard. Body:
+              {phrase: 'for an hour'} → suppress_for_seconds via
+              parse_cooldown_phrase, OR
+              {seconds: 1800, reason: '...'} → direct seconds."""
+            ca = _clown_alarm()
+            if ca is None:
+                raise HTTPException(status_code=503, detail="Clown alarm unavailable")
+            phrase = (payload or {}).get("phrase")
+            if phrase:
+                from modules.safety.alarms import parse_cooldown_phrase
+                seconds, reason = parse_cooldown_phrase(str(phrase))
+                if seconds < 0:
+                    ca.suppress_indefinitely(reason=reason)
+                    return JSONResponse({"suppressed": True, "indefinite": True})
+                if seconds == 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Could not parse phrase: {phrase!r}",
+                    )
+                ca.suppress_for_seconds(seconds, reason=reason)
+                return JSONResponse({
+                    "suppressed": True, "seconds": seconds,
+                    "reason": reason,
+                })
+            seconds = float((payload or {}).get("seconds", 0))
+            reason = (payload or {}).get("reason")
+            if seconds <= 0:
+                raise HTTPException(
+                    status_code=400, detail="seconds must be > 0",
+                )
+            ca.suppress_for_seconds(seconds, reason=reason)
+            return JSONResponse({
+                "suppressed": True, "seconds": seconds, "reason": reason,
+            })
+
+        @app.post("/api/clown/reenable")
+        async def clown_reenable():
+            ca = _clown_alarm()
+            if ca is None:
+                raise HTTPException(status_code=503, detail="Clown alarm unavailable")
+            ca.reenable()
+            return JSONResponse({"reenabled": True})
+
         @app.get("/api/world_model/interactions")
         async def world_model_interactions(
             limit: int = 30, hours_ago: int = 24,

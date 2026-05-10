@@ -376,6 +376,26 @@
           </div>
         </div>
 
+        <!-- §29.8 v4.1 Clown alarm — for morale. Test fire button +
+             cooldown control + recent improv generation log so Cole can
+             see the LLM's recent jokes and pool-health signal. -->
+        <div class="card" id="clown-card">
+          <div class="card-label">CLOWN ALARM</div>
+          <div class="clown-status" id="clown-status">Loading…</div>
+          <div class="clown-controls">
+            <button class="dev-btn" id="clown-test">TEST FIRE</button>
+            <input type="text" id="clown-cooldown-phrase"
+                   class="reminder-input"
+                   placeholder="e.g. for 30 minutes" autocomplete="off" />
+            <button class="dev-btn" id="clown-cooldown">COOLDOWN</button>
+            <button class="dev-btn" id="clown-reenable">RE-ENABLE</button>
+            <button class="dev-btn" id="clown-reload">RELOAD POOL</button>
+          </div>
+          <div class="clown-improv-list" id="clown-improv-list">
+            <div class="who-empty">No recent generations.</div>
+          </div>
+        </div>
+
         <!-- Memory v2 (semantic long-term memory) -->
         <div class="card" id="memory-card">
           <div class="card-label">MEMORY</div>

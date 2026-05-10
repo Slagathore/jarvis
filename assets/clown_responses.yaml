@@ -1,0 +1,86 @@
+# v4.1 §29.8.3 — Clown alarm response pool.
+# Each entry is a response the alarm picks at fire time. Entries with
+# `generate: true` are LLM improv slots — the entry itself is a
+# placeholder; `style_seed` tells the generator which curated entries
+# to use as in-context examples.
+#
+# Selection algorithm: random with deduplication against a recent-used
+# queue (depth in §28.5g, default 10). No tone weighting — bias the
+# distribution by adjusting entry counts per tone.
+#
+# Cole edits this freely. Hot-reload via the dashboard "reload pool"
+# button under the clown alarm card.
+
+responses:
+  # ── Military-industrial overkill ────────────────────────────────────────
+  - id: military_orbital_strike
+    tone: military
+    text: "Orbital targeting satellite receiving coordinates for Hand of God projectile. Civilian personnel, please clear a 50-meter radius. Impact in T-minus 30 seconds."
+
+  - id: military_norad_icbm
+    tone: military
+    text: "NORAD Cheyenne Mountain reports inbound ICBM. Target acquired: clown. Yield: tactical. ETA: 90 seconds. Have a nice day."
+
+  # ── Sci-fi / video game ─────────────────────────────────────────────────
+  - id: scifi_gravity_gun
+    tone: scifi
+    text: "Initializing Gravity Gun. Charge level: maximum. Recommend stepping back."
+
+  - id: scifi_bfg
+    tone: scifi
+    text: "BFG-9000 deployed. Ammunition: 1. Target acquired."
+
+  # ── Mythological / absurdist ────────────────────────────────────────────
+  - id: myth_cthulhu
+    tone: mythological
+    text: "Summoning ritual complete. Cthulhu rising from R'lyeh. ETA: indeterminate, but the clown's days are numbered."
+
+  - id: bureaucratic_hoa
+    tone: bureaucratic
+    text: "HOA violation logged: unauthorized clown on premises. Fine: 250 dollars per honk. Cumulative."
+
+  # ── Domestic chaos (uses household context) ─────────────────────────────
+  - id: domestic_summer_deploy
+    tone: domestic
+    text: "Deploying Summer. Threat assessment: clown will be aggressively loved to death within 90 seconds."
+
+  - id: domestic_sneaky_high_ground
+    tone: domestic
+    text: "Sneaky has been informed. She has acquired the high ground. The clown is unaware."
+
+  - id: domestic_sparta_food_dish
+    tone: domestic
+    text: "Sparta has been alerted, but has elected to remain at the food dish. Backup forces redirecting."
+
+  # ── Self-aware / meta ───────────────────────────────────────────────────
+  - id: meta_geneva_conventions
+    tone: meta
+    text: "Clown detected. Engaging protocol that I am 80 percent sure violates the Geneva Conventions but Cole specifically asked for this."
+
+  - id: meta_glados_overruled
+    tone: meta
+    text: "I want it on the record that I, Glados, suggested de-escalation. Cole overruled me. Initiating launch sequence."
+
+  # ── LLM improv slots — generated at fire time, seeded by tone ───────────
+  # These IDs are stable so the recent-used dedup queue can carry them.
+  # When a generate-true slot is picked, its style_seed selects which
+  # curated entries to feed into the LLM as few-shot examples.
+  - id: improv_military_1
+    tone: improv
+    generate: true
+    style_seed: military
+
+  - id: improv_scifi_1
+    tone: improv
+    generate: true
+    style_seed: scifi
+
+  - id: improv_domestic_1
+    tone: improv
+    generate: true
+    style_seed: domestic
+
+  - id: improv_meta_1
+    tone: improv
+    generate: true
+    style_seed: meta

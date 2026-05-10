@@ -2944,6 +2944,169 @@ loadInteractions();
 // dwell does; cheaper than the 5s WORLD EVENTS poll.
 setInterval(loadInteractions, 10000);
 
+// ── Clown alarm (§29.8 v4.1) ──────────────────────────────────────────────
+
+function _clownToast(msg, isError = false) {
+  // Reuse pet panel's toast if present, else fall back to console.
+  const t = document.getElementById("toast");
+  if (t) {
+    t.textContent = msg;
+    t.classList.toggle("error", isError);
+    t.classList.add("show");
+    setTimeout(() => t.classList.remove("show"), 2400);
+  } else {
+    (isError ? console.warn : console.log)("[clown]", msg);
+  }
+}
+
+async function loadClownStatus() {
+  try {
+    const res = await fetch("/api/clown/status");
+    if (!res.ok) return;
+    const body = await res.json();
+    const statusEl = document.getElementById("clown-status");
+    if (!statusEl) return;
+    if (!body.available) {
+      statusEl.innerHTML =
+        '<div class="who-empty">Clown alarm not wired.</div>';
+      return;
+    }
+    const cooldown = body.cooldown_remaining_seconds || 0;
+    const cooldownLabel =
+      cooldown > 60 * 60 * 24 * 365 ? "INDEFINITE"
+      : cooldown > 60 ? `${Math.round(cooldown / 60)}m`
+      : cooldown > 0 ? `${Math.round(cooldown)}s`
+      : "—";
+    statusEl.innerHTML = `
+      <div class="clown-state-line">
+        <span class="clown-state-label">STATE</span>
+        <span class="clown-state-value">${escapeHtml(body.state)}</span>
+        <span class="clown-state-label">COOLDOWN</span>
+        <span class="clown-state-value">${escapeHtml(cooldownLabel)}</span>
+      </div>
+      <div class="clown-pool-line">
+        Pool: ${body.pool_size} entries (${body.pool_improv_slots} improv)
+        ${body.cooldown_reason ? `· ${escapeHtml(body.cooldown_reason)}` : ""}
+      </div>
+    `;
+    const list = document.getElementById("clown-improv-list");
+    if (!list) return;
+    const events = body.recent_improv_events || [];
+    if (events.length === 0) {
+      list.innerHTML =
+        '<div class="who-empty">No recent generations.</div>';
+      return;
+    }
+    list.innerHTML = "";
+    events.slice().reverse().forEach((ev) => {
+      const row = document.createElement("div");
+      row.className = `clown-improv-row outcome-${ev.outcome}`;
+      const supplementBadge =
+        ev.cross_style_supplement_count > 0
+          ? `<span class="clown-improv-badge">+${ev.cross_style_supplement_count} cross</span>`
+          : "";
+      row.innerHTML = `
+        <div class="clown-improv-head">
+          <span class="clown-improv-style">${escapeHtml(ev.style_seed || "?")}</span>
+          <span class="clown-improv-outcome">${escapeHtml(ev.outcome || "?")}</span>
+          <span class="clown-improv-examples">${ev.examples_used_count} ex ${supplementBadge}</span>
+          <span class="clown-improv-ago">${formatRelativeTs(ev.ts)}</span>
+        </div>
+        ${ev.final_text
+          ? `<div class="clown-improv-text">${escapeHtml(ev.final_text)}</div>`
+          : ""}
+        ${ev.error
+          ? `<div class="clown-improv-error">${escapeHtml(ev.error)}</div>`
+          : ""}
+      `;
+      list.appendChild(row);
+    });
+  } catch (err) {
+    console.warn("[loadClownStatus] failed:", err);
+  }
+}
+loadClownStatus();
+setInterval(loadClownStatus, 8000);
+
+(function wireClownControls() {
+  const testBtn = document.getElementById("clown-test");
+  if (testBtn) {
+    testBtn.addEventListener("click", async () => {
+      testBtn.disabled = true;
+      try {
+        const res = await fetch("/api/clown/test_fire", { method: "POST" });
+        if (!res.ok) throw new Error(await res.text());
+        _clownToast("Test fire dispatched.");
+        setTimeout(loadClownStatus, 500);
+      } catch (err) {
+        _clownToast(`Test fire failed: ${err.message || err}`, true);
+      } finally {
+        testBtn.disabled = false;
+      }
+    });
+  }
+  const cooldownBtn = document.getElementById("clown-cooldown");
+  if (cooldownBtn) {
+    cooldownBtn.addEventListener("click", async () => {
+      const phraseEl = document.getElementById("clown-cooldown-phrase");
+      const phrase = (phraseEl && phraseEl.value.trim()) || "for an hour";
+      cooldownBtn.disabled = true;
+      try {
+        const res = await fetch("/api/clown/cooldown", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phrase }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const body = await res.json();
+        _clownToast(
+          body.indefinite
+            ? "Suppressed indefinitely."
+            : `Cooldown set: ${body.reason || `${body.seconds}s`}.`
+        );
+        loadClownStatus();
+      } catch (err) {
+        _clownToast(`Cooldown failed: ${err.message || err}`, true);
+      } finally {
+        cooldownBtn.disabled = false;
+      }
+    });
+  }
+  const reenableBtn = document.getElementById("clown-reenable");
+  if (reenableBtn) {
+    reenableBtn.addEventListener("click", async () => {
+      reenableBtn.disabled = true;
+      try {
+        const res = await fetch("/api/clown/reenable", { method: "POST" });
+        if (!res.ok) throw new Error(await res.text());
+        _clownToast("Re-enabled.");
+        loadClownStatus();
+      } catch (err) {
+        _clownToast(`Re-enable failed: ${err.message || err}`, true);
+      } finally {
+        reenableBtn.disabled = false;
+      }
+    });
+  }
+  const reloadBtn = document.getElementById("clown-reload");
+  if (reloadBtn) {
+    reloadBtn.addEventListener("click", async () => {
+      reloadBtn.disabled = true;
+      try {
+        const res = await fetch("/api/clown/reload_pool", { method: "POST" });
+        if (!res.ok) throw new Error(await res.text());
+        const body = await res.json();
+        _clownToast(`Reloaded ${body.loaded} pool entries.`);
+        loadClownStatus();
+      } catch (err) {
+        _clownToast(`Reload failed: ${err.message || err}`, true);
+      } finally {
+        reloadBtn.disabled = false;
+      }
+    });
+  }
+})();
+
 // ── Init ──────────────────────────────────────────────────────────────────
 
 connect();

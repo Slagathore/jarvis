@@ -91,6 +91,27 @@ class AlarmAudio:
                 name=f"alarm_audio:{alarm_type}",
             )
 
+    async def play_clown_sequence(
+        self,
+        announcement: str,
+        on_complete: Optional[Any] = None,
+        horn_loop_count: int = 3,
+    ) -> None:
+        """v4.1 §29.8 — fire-once-then-resolve clown audio.
+        Sequence: clown horns × N → TTS announcement → calliope full
+        song → invoke `on_complete` callback so the alarm can
+        transition itself to RESOLVED. Distinct from `play_for` which
+        loops forever; the clown alarm's natural-end semantics are
+        bounded by the calliope file's duration (the joke ends when
+        the music does).
+        """
+        async with self._lock:
+            await self._cancel_current()
+            self._current_task = asyncio.create_task(
+                self._clown_fanout(announcement, on_complete, horn_loop_count),
+                name="alarm_audio:clown",
+            )
+
     async def stop(self) -> None:
         """Halt any in-flight announcement loop."""
         async with self._lock:
@@ -170,6 +191,93 @@ class AlarmAudio:
                     f"[AlarmAudio:{alarm_type}] '{r}' {kind} play "
                     f"failed: {res}"
                 )
+
+    async def _clown_fanout(
+        self,
+        announcement: str,
+        on_complete: Optional[Any],
+        horn_loop_count: int,
+    ) -> None:
+        """v4.1 §29.8.2 single-pass clown sequence:
+            1. clown horns × horn_loop_count
+            2. TTS announcement (rendered via the existing TTS path)
+            3. calliope full track
+            4. invoke `on_complete()` so the alarm self-resolves
+
+        No looping — when the calliope finishes the alarm is done. The
+        horn × N gives the LLM-generated improv response time to
+        complete in parallel (per §29.8.3, generation is kicked off
+        when `clown.detected` fires; this method is invoked only after
+        generation has resolved or fallen back).
+
+        A higher-priority alarm preempting the audio cancels this task
+        cleanly via _cancel_current — the on_complete callback is NOT
+        invoked in that case (the dispatcher's normal state-change
+        flow takes over)."""
+        try:
+            horns = self._klaxon_for("clown")
+            calliope = self._klaxon_for("calliope")
+
+            rooms = self._target_rooms()
+            if not rooms:
+                logger.warning(
+                    "[AlarmAudio:clown] no speakers — "
+                    f"announcement dropped: {announcement!r}"
+                )
+            else:
+                # 1. Clown horns × N. Each loop fans out in parallel.
+                if horns is not None:
+                    hpcm, hrate = horns
+                    for i in range(max(1, int(horn_loop_count))):
+                        await self._fanout_play(
+                            "clown", f"horns[{i+1}/{horn_loop_count}]",
+                            rooms, hpcm, hrate,
+                        )
+                        # 100ms gap so successive loops don't slur into
+                        # one long honk.
+                        await asyncio.sleep(0.1)
+
+                # 2. TTS announcement.
+                tpcm, trate = await self._render_tts(announcement)
+                if tpcm:
+                    await asyncio.sleep(0.15)
+                    await self._fanout_play(
+                        "clown", "tts", rooms, tpcm, trate,
+                    )
+
+                # 3. Calliope full song. Skipping if the file isn't
+                # loaded means the clown alarm simply ends after TTS,
+                # which is a degraded but coherent experience.
+                if calliope is not None:
+                    cpcm, crate = calliope
+                    await asyncio.sleep(0.3)
+                    await self._fanout_play(
+                        "clown", "calliope", rooms, cpcm, crate,
+                    )
+
+            # 4. Self-resolve via callback so ClownAlarm's state
+            # transitions correctly (RESOLVED, dispatcher releases
+            # audio, state row + alarm_fires resolution stamped).
+            if on_complete is not None:
+                try:
+                    result = on_complete()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as e:
+                    logger.debug(
+                        f"[AlarmAudio:clown] on_complete callback "
+                        f"raised: {e}"
+                    )
+        except asyncio.CancelledError:
+            # Cancellation is the preempt path — DO NOT call
+            # on_complete; the alarm stays in FIRING_AUDIO and the
+            # dispatcher's normal state machine routes audio to the
+            # higher-priority alarm. ClownAlarm's resume path picks
+            # up from the start of the current segment when audio
+            # comes back.
+            return
+        except Exception as e:
+            logger.exception(f"[AlarmAudio:clown] sequence crashed: {e}")
 
     def _klaxon_for(
         self, alarm_type: str,

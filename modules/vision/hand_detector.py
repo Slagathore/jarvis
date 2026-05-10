@@ -59,7 +59,11 @@ class HandDetector:
         import mediapipe as mp_module
         self._cv2 = _cv2
         self._mp = mp_module
-        self._hands = mp_module.solutions.hands.Hands(
+        # mediapipe.solutions.hands is dynamically registered at import
+        # time; static type-checkers (Pylance) can't see it. The runtime
+        # access works fine — narrow the lookup so the ignore is local.
+        _hands_module = getattr(mp_module.solutions, "hands")
+        self._hands = _hands_module.Hands(
             static_image_mode=False,
             max_num_hands=int(max_num_hands),
             min_detection_confidence=float(min_detection_confidence),

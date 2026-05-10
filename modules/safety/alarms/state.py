@@ -30,10 +30,16 @@ class AlarmState(str, Enum):
 
 
 class AlarmType:
-    """String constants for the three v4 alarm types. Used as keys in
-    config blocks and as the priority key in AlarmDispatcher's
-    priority_order list. Centralizing prevents typo drift.
+    """String constants for the v4 alarm types + the v4.1 clown alarm.
+    Used as keys in config blocks and as the priority key in
+    AlarmDispatcher's priority_order list. Centralizing prevents typo
+    drift.
+
+    Priority (highest first): FIRE > CAT_ESCAPE > DOOR_OPEN > CLOWN.
+    Clown is audio-suppressed by any other alarm — the joke alarm
+    should never block a real one.
     """
     FIRE = "fire"
     CAT_ESCAPE = "cat_escape"
     DOOR_OPEN = "door_open"
+    CLOWN = "clown"

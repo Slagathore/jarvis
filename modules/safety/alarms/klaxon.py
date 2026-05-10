@@ -48,8 +48,12 @@ _NAME_TOKENS: list[tuple[str, str]] = [
     ("cat_escape", "cat_escape"),
     ("door",      "door_open"),
     ("fire",      "fire"),
-    # Decorative / non-standard. Available for explicit lookup but never
-    # auto-selected by an alarm type.
+    # v4.1 clown alarm uses two assets: clown* for the horns loop and
+    # calliope (or "circus calliope") for the closing music. Both
+    # discovered by the same library so the ClownAlarm can pull each
+    # by alarm-type key without knowing about specific filenames.
+    ("calliope",  "calliope"),
+    ("circus",    "calliope"),
     ("clown",     "clown"),
 ]
 

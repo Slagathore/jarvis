@@ -190,9 +190,12 @@ class FireAlarm(Alarm):
             return
         if payload.get("entity_type") != "person":
             return
-        room = payload.get("room")
-        if room != self._active_room:
+        room_raw = payload.get("room")
+        if not isinstance(room_raw, str) or room_raw != self._active_room:
             return
+        # Type-narrow `room` to str so the subsequent dict APIs see
+        # a concrete key type instead of `Any | None`.
+        room: str = room_raw
         # Track entries; first time a human shows up in the active fire
         # room, stamp the dwell start. Once the dwell exceeds threshold
         # AND signal is non-increasing, mute via visual confirmation.

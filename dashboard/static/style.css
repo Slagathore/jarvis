@@ -2189,3 +2189,116 @@ main {
 .interaction-ago {
   margin-left: auto;
 }
+
+/* ── Clown alarm card (§29.8 v4.1) ────────────────────────────────────── */
+
+#clown-card {
+  /* Subtle distinction: this is the joke alarm, not a safety alarm. */
+  border-color: var(--orange, #e8a445);
+}
+.clown-status {
+  font-size: 12px;
+  margin-bottom: 8px;
+  color: var(--text-dim);
+}
+.clown-state-line {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.clown-state-label {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+.clown-state-value {
+  color: var(--orange, #e8a445);
+  font-family: var(--mono, "Space Mono", monospace);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.clown-pool-line {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: var(--mono, "Space Mono", monospace);
+}
+.clown-controls {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.clown-controls .reminder-input {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+.clown-improv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 280px;
+  overflow-y: auto;
+  font-size: 11px;
+}
+.clown-improv-row {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.clown-improv-row.outcome-fallback_zero_examples,
+.clown-improv-row.outcome-fallback_generation_failed {
+  border-color: var(--red, #e57373);
+}
+.clown-improv-row.outcome-generated_with_supplement {
+  border-color: var(--blue-dim);
+}
+.clown-improv-head {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-family: var(--mono, "Space Mono", monospace);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.clown-improv-style {
+  color: var(--orange, #e8a445);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+}
+.clown-improv-outcome {
+  letter-spacing: 0.08em;
+}
+.clown-improv-examples {
+  opacity: 0.7;
+}
+.clown-improv-badge {
+  background: var(--blue-dim);
+  color: var(--blue);
+  padding: 0 4px;
+  border-radius: 2px;
+  margin-left: 2px;
+  font-size: 9px;
+}
+.clown-improv-ago {
+  margin-left: auto;
+  opacity: 0.6;
+}
+.clown-improv-text {
+  margin-top: 3px;
+  color: var(--text);
+  font-style: italic;
+  line-height: 1.4;
+}
+.clown-improv-error {
+  margin-top: 3px;
+  color: var(--red, #e57373);
+  font-size: 10px;
+}

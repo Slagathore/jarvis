@@ -262,6 +262,7 @@ class Orchestrator:
         self.world_model: Optional[WorldModel] = None
         self.observation_builder: Optional[ObservationBuilder] = None
         self.interaction_monitor: Optional[InteractionMonitor] = None
+        self.alarm_dispatcher: Optional[Any] = None
         # LLM-facing query layer — built alongside WorldModel. The four
         # tools (get_entity_status, list_entities_in_room, who_is_home,
         # search_recent_events) ride into _build_tool_registry when this
@@ -4734,6 +4735,11 @@ class Orchestrator:
         # World-model side: stop the observation polling loops, the
         # interaction monitor, and the WorldModel timers. Errors are
         # non-fatal — we're going down anyway.
+        if self.alarm_dispatcher is not None:
+            try:
+                await self.alarm_dispatcher.stop()
+            except Exception as e:
+                logger.debug(f"[Shutdown] alarm_dispatcher stop failed: {e}")
         if self.interaction_monitor is not None:
             try:
                 await self.interaction_monitor.stop()
@@ -4914,6 +4920,68 @@ class Orchestrator:
                     ).get("interactions", {}),
                 )
                 await self.interaction_monitor.start()
+                # §29 alarm subsystem — KlaxonLibrary loads per-alarm
+                # audio assets, AlarmAudio fans out via the existing
+                # speaker manager, AlarmStore persists fires/state.
+                # All four alarms register with the dispatcher; only
+                # those whose detectors are wired actually fire.
+                try:
+                    from modules.safety.alarms import (
+                        AlarmAudio, AlarmDispatcher, AlarmStore,
+                        CatEscapeAlarm, ClownAlarm, DoorOpenAlarm,
+                        FireAlarm, KlaxonLibrary, NullAlarmAudio,
+                    )
+                    klaxons = KlaxonLibrary()
+                    klaxons.load_all()
+                    if (getattr(self, "speaker_manager", None) is not None
+                            and getattr(self, "tts", None) is not None):
+                        alarm_audio = AlarmAudio(
+                            speaker_manager=self.speaker_manager,
+                            tts=self.tts,
+                            klaxons=klaxons,
+                        )
+                    else:
+                        alarm_audio = NullAlarmAudio()
+                    alarm_store = AlarmStore(self.db)
+                    self.alarm_dispatcher = AlarmDispatcher(
+                        audio=alarm_audio,
+                    )
+                    notifier = getattr(self, "notification_dispatcher", None)
+                    self.alarm_dispatcher.register(CatEscapeAlarm(
+                        bus=self.bus,
+                        rooms_config=self.config.get("rooms", []),
+                        notifier=notifier,
+                        store=alarm_store,
+                    ))
+                    self.alarm_dispatcher.register(DoorOpenAlarm(
+                        bus=self.bus,
+                        rooms_config=self.config.get("rooms", []),
+                        notifier=notifier,
+                        store=alarm_store,
+                    ))
+                    self.alarm_dispatcher.register(FireAlarm(
+                        bus=self.bus,
+                        notifier=notifier,
+                        store=alarm_store,
+                    ))
+                    # ClownAlarm gets the LLM client for improv
+                    # generation. None is acceptable — improv falls
+                    # back to curated entries.
+                    self.alarm_dispatcher.register(ClownAlarm(
+                        bus=self.bus,
+                        audio=alarm_audio,
+                        notifier=notifier,
+                        store=alarm_store,
+                        llm=getattr(self, "llm", None),
+                    ))
+                    await self.alarm_dispatcher.start()
+                    logger.info("[Init] Alarm subsystem started")
+                except Exception as e:
+                    logger.warning(
+                        f"[Init] alarm subsystem init failed (continuing "
+                        f"without): {e}"
+                    )
+                    self.alarm_dispatcher = None
                 # Query layer over the live model — registered into the
                 # LLM tool registry by _build_tool_registry below.
                 self.world_query_tools = WorldQueryTools(self.world_model)
