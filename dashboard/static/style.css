@@ -2091,6 +2091,16 @@ main {
   border-color: var(--border);
   color: var(--accent, #6cf);
 }
+.tab-btn-link {
+  text-decoration: none;
+  display: inline-flex; align-items: center;
+}
+.tab-btn-link::after {
+  content: "↗";
+  margin-left: 4px;
+  font-size: 0.75em;
+  opacity: 0.6;
+}
 .tab-pane { padding: 0 24px 24px 24px; }
 
 /* Settings tab */

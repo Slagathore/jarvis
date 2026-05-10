@@ -698,16 +698,62 @@ class WorldModel:
         self, obs: Observation, ts: datetime
     ) -> None:
         # Identity wins over spatial continuity for people: if obs has
-        # a person_id that matches an existing entity, route directly.
+        # a person_id that matches an existing entity, route directly —
+        # BUT with a confidence guard for cross-camera moves. Without
+        # this, a low-confidence face misidentification in room B can
+        # steal Cole's entity away from room A where he actually is,
+        # causing the "Cole is in two rooms at once" flickering.
         if obs.obj_class == "person" and obs.person_id is not None:
             existing = self._find_entity_by_person_id(obs.person_id)
             if existing:
-                attribution_conf = obs.person_match_confidence
-                if (existing.last_seen_camera
-                        and existing.last_seen_camera != obs.camera):
-                    existing.metadata["identity_overrode_continuity"] = True
-                await self._update_matched(existing, obs, ts, attribution_conf)
-                return
+                attribution_conf = obs.person_match_confidence or 0.0
+                cross_camera = (
+                    existing.last_seen_camera
+                    and existing.last_seen_camera != obs.camera
+                )
+                if cross_camera:
+                    # Time since the entity was last confirmed in its
+                    # current room — fresh sightings carry weight.
+                    last_seen = (
+                        _as_utc(existing.last_seen_ts)
+                        if existing.last_seen_ts else None
+                    )
+                    age_s = (
+                        (ts - last_seen).total_seconds()
+                        if last_seen else 999.0
+                    )
+                    freshness_s = float(self.cfg.get(
+                        "identity_cross_camera_freshness_seconds", 5.0
+                    ))
+                    existing_conf = float(
+                        existing.last_attribution_confidence or 0.0
+                    )
+                    margin = float(self.cfg.get(
+                        "identity_cross_camera_margin", 0.15
+                    ))
+                    # Hold the entity in place when:
+                    #   - it was just seen there with a real attribution
+                    #   - AND the new claim is not decisively better
+                    if (age_s < freshness_s
+                            and existing_conf > 0.0
+                            and attribution_conf < existing_conf + margin):
+                        # Treat this as a misattribution — drop the
+                        # person_id and let the spatial-continuity path
+                        # below handle the obs as an unidentified person.
+                        obs.person_id = None
+                        obs.person_name = None
+                        obs.person_match_confidence = None
+                    else:
+                        existing.metadata["identity_overrode_continuity"] = True
+                        await self._update_matched(
+                            existing, obs, ts, attribution_conf
+                        )
+                        return
+                else:
+                    await self._update_matched(
+                        existing, obs, ts, attribution_conf
+                    )
+                    return
 
         # Face attribution dropped out (no person_id) but a known named
         # person was just here. Prefer routing to them over spawning a

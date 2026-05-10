@@ -915,13 +915,37 @@ class Orchestrator:
 
         # Vision/person-presence disambiguation: a recent room-local presence
         # signal is a stronger localizer than raw OWW confidence when mic
-        # quality varies wildly between rooms.
+        # quality varies wildly between rooms. The office PC mic is much
+        # louder/cleaner than Wyze room mics; without an override it keeps
+        # winning arbitration even when Cole is clearly elsewhere on camera.
         wake_cfg = self.config.get("voice", {}).get("wake_word", {}) or {}
         prior = self._wake_room_prior()
         prior_room = prior[0] if prior is not None else None
         prior_source = prior[1] if prior is not None else None
         prior_age_s = prior[2] if prior is not None else None
         vision_prior_bonus = float(wake_cfg.get("vision_prior_bonus", 0.5))
+        # When True, a fresh vision prior forces a hard override: if the
+        # prior_room has ANY wake event in the coalesce window, it wins
+        # regardless of OWW confidence. Other rooms drop to 0 effectively.
+        # Configurable so users can revert to soft (additive) behavior.
+        vision_prior_hard_override = bool(
+            wake_cfg.get("vision_prior_hard_override", True)
+        )
+        # Minimum OWW confidence the prior_room must show before the hard
+        # override kicks in. Set low so even a faint Wyze mic pickup wins,
+        # but not so low that we route to a room that didn't actually
+        # hear anything.
+        hard_override_min_conf = float(
+            wake_cfg.get("vision_prior_hard_min_confidence", 0.10)
+        )
+
+        prior_event = None
+        if prior_room is not None and vision_prior_hard_override:
+            for e in pending:
+                if e.get("room") == prior_room:
+                    if float(e.get("confidence", 0.0)) >= hard_override_min_conf:
+                        prior_event = e
+                        break
 
         def _score(e: dict) -> float:
             base = float(e.get("confidence", 0.0))
@@ -929,7 +953,34 @@ class Orchestrator:
                 return base + vision_prior_bonus
             return base
 
-        winner = max(pending, key=_score)
+        if prior_event is not None:
+            # Hard override path — prior_room has a real wake; everything
+            # else gets squashed.
+            winner = prior_event
+        else:
+            # Vision says Cole is NOT in office, but only office heard the
+            # wake. This is almost always a false trigger from PC speakers,
+            # TV audio, or someone in living_room being picked up by the
+            # studio mic. Drop it rather than fire in the wrong room.
+            suppress_office_false_positive = bool(
+                wake_cfg.get("suppress_office_false_positive", True)
+            )
+            if (suppress_office_false_positive
+                    and prior_room is not None
+                    and prior_room != "office"):
+                non_office = [e for e in pending if e.get("room") != "office"]
+                if not non_office:
+                    logger.info(
+                        f"[Wake] Suppressed office-only wake — vision puts "
+                        f"Cole in '{prior_room}' (age={prior_age_s:.1f}s). "
+                        f"office@{pending[0].get('confidence', 0):.3f} dropped "
+                        f"as likely false trigger."
+                    )
+                    return
+                # Vision elsewhere AND some non-office room also heard it
+                # — let those compete on score, but exclude office.
+                pending = non_office
+            winner = max(pending, key=_score)
         if len(pending) > 1:
             # Per-room rundown so the log makes the choice obvious. Show
             # base confidence + (bonus) when the prior applied, so it's
@@ -948,9 +999,10 @@ class Orchestrator:
                 f", prior={prior_room}/{prior_source}@{prior_age_s:.1f}s"
                 if prior_room and prior_age_s is not None else ""
             )
+            override_tag = " [HARD-OVERRIDE]" if prior_event is not None else ""
             logger.info(
                 f"[Wake] Coalesced {len(pending)} simultaneous wakes "
-                f"[{rundown}{prior_age}] → winner '{winner.get('room')}'"
+                f"[{rundown}{prior_age}] → winner '{winner.get('room')}'{override_tag}"
             )
         await self._on_wake_detected(winner)
 
