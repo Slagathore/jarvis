@@ -3679,6 +3679,7 @@ setInterval(loadClownStatus, 8000);
   const buttons = bar.querySelectorAll(".tab-btn");
   const panes = {
     home: document.getElementById("tab-pane-home"),
+    reviews: document.getElementById("tab-pane-reviews"),
     settings: document.getElementById("tab-pane-settings"),
     logs: document.getElementById("tab-pane-logs"),
   };
@@ -3691,10 +3692,253 @@ setInterval(loadClownStatus, 8000);
         el.hidden = k !== target;
       });
       if (target === "settings") loadSettings();
+      if (target === "reviews") loadReviewsTab();
       if (target === "logs") connectLogStream();
       if (target !== "logs") disconnectLogStream();
     });
   });
+  // Keep the tab badge in sync independent of which tab is open.
+  refreshReviewsBadge();
+  setInterval(refreshReviewsBadge, 15000);
+})();
+
+// ── Pending Reviews tab ───────────────────────────────────────────────────
+
+let _reviewsItems = [];
+let _reviewsSelected = new Set();
+
+async function refreshReviewsBadge() {
+  try {
+    const res = await fetch("/api/identity/pending");
+    if (!res.ok) return;
+    const body = await res.json();
+    const n = (body.pending || []).length;
+    const badge = document.getElementById("reviews-tab-badge");
+    if (badge) {
+      badge.textContent = String(n);
+      badge.hidden = n === 0;
+    }
+  } catch {}
+}
+
+async function _loadBankStats() {
+  try {
+    const res = await fetch("/api/identity/bank_stats");
+    if (!res.ok) return [];
+    const body = await res.json();
+    return Array.isArray(body.persons) ? body.persons : [];
+  } catch {
+    return [];
+  }
+}
+
+async function loadReviewsTab() {
+  const grid = document.getElementById("reviews-grid");
+  const statsEl = document.getElementById("reviews-stats");
+  const targetSel = document.getElementById("reviews-bulk-target");
+  if (!grid || !targetSel) return;
+
+  grid.innerHTML = '<div class="who-empty">Loading…</div>';
+
+  const [items, persons] = await Promise.all([
+    fetch("/api/identity/pending").then((r) => r.json()).then((b) => b.pending || []).catch(() => []),
+    _loadBankStats(),
+  ]);
+  _reviewsItems = items;
+  _reviewsSelected.clear();
+
+  // Populate bulk-target dropdown with enrolled persons.
+  targetSel.innerHTML = persons
+    .map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)} (${p.face_samples} face samples)</option>`)
+    .join("");
+
+  // Per-person bank stats summary.
+  if (statsEl) {
+    statsEl.innerHTML = persons.length
+      ? "Bank: " + persons
+          .map((p) => `${escapeHtml(p.name)}=${p.face_samples}`)
+          .join(", ")
+      : "";
+  }
+
+  if (items.length === 0) {
+    grid.innerHTML = '<div class="who-empty">No pending reviews.</div>';
+    _updateReviewsCount();
+    return;
+  }
+  grid.innerHTML = "";
+  items.forEach((p) => grid.appendChild(_renderReviewCard(p)));
+  _updateReviewsCount();
+}
+
+function _renderReviewCard(p) {
+  const div = document.createElement("div");
+  div.className = "review-card";
+  div.dataset.id = p.id;
+  const isCluster = p.kind && p.kind.startsWith("pending_cluster_");
+  const modality = p.kind && p.kind.includes("voice") ? "voice" : "face";
+  const sim = (p.similarity || 0).toFixed(2);
+  const suggested = p.suggested_person_name
+    ? `<span class="review-suggested">looks like <b>${escapeHtml(p.suggested_person_name)}</b> (${(p.suggested_similarity || 0).toFixed(2)})</span>`
+    : "";
+  const bboxJson = p.face_bbox ? JSON.stringify(p.face_bbox) : "";
+  const hasImg = p.has_image;
+  div.innerHTML = `
+    <div class="review-head">
+      <label class="review-check">
+        <input type="checkbox" class="review-cb" />
+      </label>
+      <span class="review-id">#${p.id}</span>
+      ${suggested}
+      <span class="review-sim">sim ${sim}</span>
+    </div>
+    <div class="review-thumb-wrap" data-bbox='${escapeHtml(bboxJson)}'>
+      ${hasImg
+        ? `<img class="review-thumb" src="/api/identity/pending/${p.id}/image.jpg" alt="capture" />`
+        : `<div class="review-thumb empty">(${modality})</div>`}
+      ${p.face_bbox
+        ? `<div class="face-bbox-overlay review-bbox"
+              data-x1="${p.face_bbox[0]}" data-y1="${p.face_bbox[1]}"
+              data-x2="${p.face_bbox[2]}" data-y2="${p.face_bbox[3]}"></div>`
+        : ""}
+    </div>
+    <div class="review-foot">
+      <button class="dev-btn review-quick" data-action="suggested">Assign suggested</button>
+      <button class="dev-btn review-quick" data-action="reject">Reject</button>
+    </div>
+  `;
+  // Checkbox tracking.
+  const cb = div.querySelector(".review-cb");
+  cb.addEventListener("change", () => {
+    if (cb.checked) _reviewsSelected.add(p.id);
+    else _reviewsSelected.delete(p.id);
+    _updateReviewsCount();
+    div.classList.toggle("review-selected", cb.checked);
+  });
+  // Bbox overlay positioning.
+  const img = div.querySelector(".review-thumb");
+  const overlay = div.querySelector(".review-bbox");
+  if (img && img.tagName === "IMG" && overlay) {
+    const pos = () => _positionFaceBbox(img, overlay);
+    if (img.complete && img.naturalWidth > 0) pos();
+    else img.addEventListener("load", pos);
+    window.addEventListener("resize", pos);
+  }
+  // Clicking the thumb opens the lightbox (with bbox).
+  if (img && img.tagName === "IMG") {
+    img.style.cursor = "zoom-in";
+    img.addEventListener("click", () => {
+      openImageLightbox(
+        `/api/identity/pending/${p.id}/image.jpg`,
+        p.suggested_person_name || (isCluster ? `Cluster #${p.cluster_id}` : `Drift on ${p.person_name}`),
+        p.captured_at,
+        p.face_bbox || null,
+      );
+    });
+  }
+  // Quick action buttons.
+  div.querySelectorAll(".review-quick").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const action = btn.dataset.action;
+      try {
+        if (action === "suggested") {
+          if (!p.suggested_person_name) {
+            alert("No suggestion available — select from bulk dropdown above.");
+            return;
+          }
+          await fetch(`/api/identity/pending/${p.id}/resolve`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              action: "assign",
+              target_name: p.suggested_person_name,
+            }),
+          });
+        } else if (action === "reject") {
+          await fetch(`/api/identity/pending/${p.id}/resolve`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "reject" }),
+          });
+        }
+        div.classList.add("review-resolving");
+        setTimeout(() => div.remove(), 200);
+      } catch (e) {
+        console.warn("[reviews] quick action failed:", e);
+      }
+    });
+  });
+  return div;
+}
+
+function _updateReviewsCount() {
+  const c = document.getElementById("reviews-count");
+  if (c) c.textContent = `${_reviewsSelected.size} selected`;
+}
+
+(function wireReviewsControls() {
+  const selectAll = document.getElementById("reviews-select-all");
+  const assignBtn = document.getElementById("reviews-bulk-assign");
+  const rejectBtn = document.getElementById("reviews-bulk-reject");
+  const targetSel = document.getElementById("reviews-bulk-target");
+  const status = document.getElementById("reviews-status");
+  if (!selectAll || !assignBtn || !rejectBtn) return;
+
+  selectAll.addEventListener("change", () => {
+    const cbs = document.querySelectorAll("#reviews-grid .review-cb");
+    cbs.forEach((cb) => {
+      cb.checked = selectAll.checked;
+      cb.dispatchEvent(new Event("change"));
+    });
+  });
+
+  const setStatus = (msg, cls = "") => {
+    if (!status) return;
+    status.textContent = msg;
+    status.className = `reviews-status ${cls}`;
+  };
+
+  const doBulk = async (action) => {
+    const ids = Array.from(_reviewsSelected);
+    if (ids.length === 0) {
+      setStatus("Nothing selected.", "err");
+      return;
+    }
+    const target = action === "assign" ? targetSel.value : null;
+    if (action === "assign" && !target) {
+      setStatus("Pick a person for the bulk target.", "err");
+      return;
+    }
+    setStatus(`Processing ${ids.length}…`);
+    assignBtn.disabled = rejectBtn.disabled = true;
+    try {
+      const res = await fetch("/api/identity/pending/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ids,
+          action,
+          target_name: target,
+        }),
+      });
+      const body = await res.json();
+      setStatus(
+        `Done: ${body.ok} ok, ${body.skipped_quality} skipped (quality), ${body.failed} failed.`,
+        body.failed ? "err" : "ok",
+      );
+      // Reload the tab so resolved rows disappear and stats refresh.
+      await loadReviewsTab();
+      refreshReviewsBadge();
+    } catch (e) {
+      setStatus(`Failed: ${e.message || e}`, "err");
+    } finally {
+      assignBtn.disabled = rejectBtn.disabled = false;
+    }
+  };
+
+  assignBtn.addEventListener("click", () => doBulk("assign"));
+  rejectBtn.addEventListener("click", () => doBulk("reject"));
 })();
 
 // ── Settings tab ──────────────────────────────────────────────────────────

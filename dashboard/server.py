@@ -867,6 +867,63 @@ class DashboardServer:
             )
             return JSONResponse({"ok": ok})
 
+        @app.post("/api/identity/pending/bulk")
+        async def identity_resolve_pending_bulk(request: Request):
+            """Bulk resolve. Body:
+              {ids: [1,2,3], action: "assign|reject", target_name: "Cole"}
+            Returns {ok, skipped_quality, failed, ids}. Used by the
+            Pending Reviews tab to drain a backlog in one click."""
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            body = await request.json()
+            ids_raw = body.get("ids") or []
+            action = str(body.get("action", "")).strip()
+            target_name = body.get("target_name")
+            if action not in ("assign", "reject"):
+                raise HTTPException(
+                    status_code=400, detail="action must be assign|reject",
+                )
+            if action == "assign" and not target_name:
+                raise HTTPException(
+                    status_code=400, detail="target_name required for assign",
+                )
+            try:
+                ids = [int(x) for x in ids_raw]
+            except (ValueError, TypeError) as e:
+                raise HTTPException(status_code=400, detail=f"bad ids: {e}") from e
+            if not ids:
+                return JSONResponse({"ok": 0, "skipped_quality": 0, "failed": 0, "ids": []})
+            result = await ident.resolve_pending_bulk(ids, action, target_name)
+            await self.broadcast({
+                "type": "identity_pending_bulk_resolved",
+                "count": result["ok"], "action": action,
+            })
+            return JSONResponse(result)
+
+        @app.get("/api/identity/bank_stats")
+        async def identity_bank_stats():
+            """Per-person sample count + dimensional health so the
+            Pending Reviews tab can show 'Cole: 235 ArcFace samples'
+            and the user knows how big the centroid bank is for each
+            resident."""
+            ident = self._identity
+            if ident is None:
+                return JSONResponse({"persons": [], "available": False})
+            persons = await ident.list_persons()
+            face_counts = {
+                pid: len(samples) for pid, samples in
+                ident._face_samples.items()
+            }
+            voice_counts = {
+                pid: len(samples) for pid, samples in
+                ident._voice_samples.items()
+            }
+            for p in persons:
+                p["face_samples"] = face_counts.get(int(p["id"]), 0)
+                p["voice_samples"] = voice_counts.get(int(p["id"]), 0)
+            return JSONResponse({"persons": persons, "available": True})
+
         # ── Notifications (bell + dropdown) ──────────────────────────────────
 
         @app.get("/api/notifications")

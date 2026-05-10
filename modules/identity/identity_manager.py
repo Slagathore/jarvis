@@ -123,6 +123,30 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Minimum face-bbox area we'll accept when adding a pending-review sample
+# to the centroid bank. Distant / profile / partially-cropped faces
+# embed poorly and drag centroids toward bad poses, which is exactly
+# why Cole's match scores stopped rising even after 300 pending reviews.
+# 80x80 = 6400 is conservative; tweak via /api/tunables if needed.
+_PENDING_MIN_FACE_AREA_PX = 6400
+
+
+def _passes_pending_area_gate(bbox: Optional[list]) -> bool:
+    """Cheap area-only quality gate for pending-review samples. The
+    full _passes_face_quality_gates needs blur/yaw/pitch which we don't
+    persist on pending rows. Area alone catches the worst offenders
+    (tiny / distant faces). Missing bbox → pass-through (legacy rows
+    don't have face_bbox stored yet)."""
+    if not bbox or len(bbox) != 4:
+        return True
+    try:
+        x1, y1, x2, y2 = (float(c) for c in bbox)
+    except (TypeError, ValueError):
+        return True
+    area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    return area >= _PENDING_MIN_FACE_AREA_PX
+
+
 # ── §10 auto-enrollment helpers ─────────────────────────────────────────────
 
 
@@ -1436,18 +1460,38 @@ class IdentityManager:
             if not target_name:
                 return False
             pid = await self.ensure_person(target_name)
-            await self._save_sample(
-                modality=modality,
-                person_id=pid,
-                emb=emb,
-                source="live_question",
-                image_jpeg=row_image,
-            )
-            # Resolve all pending rows in the same cluster as well
+            # Quality gate: don't pollute the centroid bank with samples
+            # too small to be reliable. The face bbox lets us compute a
+            # cheap area check; full pose/blur gates would require
+            # re-running InsightFace on the JPEG (skipped for cost).
+            primary_bbox = None
+            try:
+                primary_bbox = json.loads(row["face_bbox"]) if row["face_bbox"] else None
+            except Exception:
+                primary_bbox = None
+            if not _passes_pending_area_gate(primary_bbox):
+                logger.info(
+                    f"[Identity] pending {pending_id} sample skipped: "
+                    f"face area below gate"
+                )
+            else:
+                await self._save_sample(
+                    modality=modality,
+                    person_id=pid,
+                    emb=emb,
+                    source="live_question",
+                    image_jpeg=row_image,
+                )
+            # Resolve all pending rows in the same cluster as well —
+            # cluster rows that fail the quality gate still get the
+            # `resolved=1` marker so they exit the queue (they were
+            # already in this cluster; rejecting only the bad ones
+            # in-place keeps the centroid bank clean while preventing
+            # the user from seeing them again).
             cid = row["cluster_id"]
             if cid is not None:
                 cluster_rows = await self._db.fetchall(
-                    "SELECT id, embedding, image_jpeg FROM identity_pending "
+                    "SELECT id, embedding, image_jpeg, face_bbox FROM identity_pending "
                     "WHERE cluster_id = ? AND resolved = 0",
                     (cid,),
                 )
@@ -1459,6 +1503,13 @@ class IdentityManager:
                         cr_image = cr["image_jpeg"]
                     except (IndexError, KeyError):
                         cr_image = None
+                    cr_bbox = None
+                    try:
+                        cr_bbox = json.loads(cr["face_bbox"]) if cr["face_bbox"] else None
+                    except Exception:
+                        cr_bbox = None
+                    if not _passes_pending_area_gate(cr_bbox):
+                        continue  # mark resolved below, but skip save
                     await self._save_sample(
                         modality=modality,
                         person_id=pid,
@@ -1480,6 +1531,46 @@ class IdentityManager:
             return True
 
         return False
+
+    async def resolve_pending_bulk(
+        self,
+        pending_ids: list[int],
+        action: str,
+        target_name: Optional[str] = None,
+    ) -> dict:
+        """Bulk variant of resolve_pending. Returns a summary
+        {"ok": int, "skipped_quality": int, "failed": int, "ids": [...]}.
+        Used by the dashboard's Pending Reviews tab to drain large
+        backlogs efficiently. Same semantics as the singular call for
+        each row — cluster-cascade still applies on assigns."""
+        out = {"ok": 0, "skipped_quality": 0, "failed": 0, "ids": []}
+        for pid in pending_ids:
+            try:
+                before_face_samples = sum(
+                    len(v) for v in self._face_samples.values()
+                )
+                ok = await self.resolve_pending(pid, action, target_name)
+                after_face_samples = sum(
+                    len(v) for v in self._face_samples.values()
+                )
+                if not ok:
+                    out["failed"] += 1
+                    continue
+                # If we assigned but no new sample landed, it was
+                # quality-gated. Surface so the UI can show "150 done,
+                # 12 skipped (too small)".
+                if (action == "assign"
+                        and after_face_samples == before_face_samples):
+                    out["skipped_quality"] += 1
+                else:
+                    out["ok"] += 1
+                out["ids"].append(int(pid))
+            except Exception as e:
+                logger.warning(
+                    f"[Identity] bulk resolve {pid} failed: {e}"
+                )
+                out["failed"] += 1
+        return out
 
     async def delete_person(self, person_id: int) -> bool:
         """Delete a person and (via FK ON DELETE CASCADE) all their samples."""

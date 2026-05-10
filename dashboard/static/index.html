@@ -44,9 +44,36 @@
 
     <nav class="tab-bar" id="tab-bar">
       <button class="tab-btn active" data-tab="home">Home</button>
+      <button class="tab-btn" data-tab="reviews">
+        Pending Reviews
+        <span class="tab-badge" id="reviews-tab-badge" hidden>0</span>
+      </button>
       <button class="tab-btn" data-tab="settings">Settings</button>
       <button class="tab-btn" data-tab="logs">Logs</button>
     </nav>
+
+    <section class="tab-pane" id="tab-pane-reviews" hidden>
+      <div class="reviews-wrap">
+        <div class="reviews-controls">
+          <label>
+            <input type="checkbox" id="reviews-select-all" />
+            <span>Select all</span>
+          </label>
+          <span class="reviews-count" id="reviews-count">0 selected</span>
+          <label>
+            Bulk action target:
+            <select id="reviews-bulk-target"></select>
+          </label>
+          <button class="dev-btn" id="reviews-bulk-assign">Assign selected</button>
+          <button class="dev-btn" id="reviews-bulk-reject">Reject selected</button>
+          <span class="reviews-status" id="reviews-status"></span>
+          <span class="reviews-stats" id="reviews-stats"></span>
+        </div>
+        <div class="reviews-grid" id="reviews-grid">
+          <div class="who-empty">Loading…</div>
+        </div>
+      </div>
+    </section>
 
     <section class="tab-pane" id="tab-pane-settings" hidden>
       <div class="settings-wrap">
