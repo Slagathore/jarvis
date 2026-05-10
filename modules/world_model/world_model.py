@@ -54,6 +54,54 @@ def _as_utc(ts: datetime) -> datetime:
     return ts.astimezone(timezone.utc)
 
 
+# Cap on per-entity visibility history. ~40 entries covers ~8 seconds of
+# 5fps observation + plenty of headroom for the seen-fraction window. Old
+# entries roll off the back so the metadata blob stays bounded.
+_VIS_HISTORY_MAX = 40
+
+
+def _record_visibility(ent: WorldEntity, ts: datetime, seen: bool) -> None:
+    """Append a (ts_iso, seen) pair to the entity's rolling visibility
+    history. Used by the smoothing logic in _handle_unmatched_entity so
+    LOST_VISIBILITY only fires when the seen-fraction over a recent
+    window drops below threshold — i.e. real disappearance, not a
+    single bad frame."""
+    hist = ent.metadata.setdefault("vis_history", [])
+    hist.append([ts.isoformat(), bool(seen)])
+    if len(hist) > _VIS_HISTORY_MAX:
+        del hist[: len(hist) - _VIS_HISTORY_MAX]
+
+
+def _seen_fraction(
+    ent: WorldEntity, ts: datetime, window_seconds: float
+) -> tuple[float, int]:
+    """Compute (fraction seen, sample count) over the last
+    `window_seconds` of this entity's visibility history. Returns
+    (1.0, 0) when there's no usable history — the caller should treat
+    insufficient data as 'don't fire yet'."""
+    hist = ent.metadata.get("vis_history") or []
+    if not hist:
+        return 1.0, 0
+    cutoff = ts - timedelta(seconds=window_seconds)
+    seen = 0
+    total = 0
+    for entry in hist:
+        try:
+            entry_ts = datetime.fromisoformat(entry[0])
+        except (ValueError, TypeError, IndexError):
+            continue
+        if entry_ts.tzinfo is None:
+            entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+        if entry_ts < cutoff:
+            continue
+        total += 1
+        if entry[1]:
+            seen += 1
+    if total == 0:
+        return 1.0, 0
+    return seen / total, total
+
+
 class WorldModel:
     """
     Stateful tracker. Subscribes to vision.observation and camera.health.
@@ -92,8 +140,24 @@ class WorldModel:
             # transition state out of PRESENT and emit LOST_VISIBILITY.
             # Without this, YOLO false-negatives produce ~25 lost/
             # reappeared events per second per entity.
-            "visibility_grace_misses": 5,
+            # Wall-time floor + smoothing parameters for visibility
+            # transitions. See _handle_unmatched_entity.
+            #   - visibility_grace_seconds: minimum elapsed since the
+            #     last confirmed match before LOST_VISIBILITY can fire.
+            #   - visibility_window_seconds: width of the rolling
+            #     seen/missed window for the smoothing.
+            #   - visibility_min_samples: need this many observations
+            #     in the window before we trust the seen fraction.
+            #   - visibility_seen_fraction_floor: hold until the seen
+            #     fraction drops below this. 0.25 means "we have to
+            #     have been mostly missing for the window's duration."
+            # Legacy visibility_grace_misses is no longer consulted but
+            # left in cfg for backwards-compat with any read-only tooling.
             "visibility_grace_seconds": 3.0,
+            "visibility_window_seconds": 6.0,
+            "visibility_min_samples": 4,
+            "visibility_seen_fraction_floor": 0.25,
+            "visibility_grace_misses": 5,
             "landmark_dwell_frames": 3,
             # Spatial continuity for person obs that lost face
             # attribution. Within this window, an unattributed person
@@ -414,6 +478,11 @@ class WorldModel:
         # see _handle_unmatched_entity for the grace-window logic.
         if "miss_streak" in ent.metadata:
             ent.metadata.pop("miss_streak", None)
+        # Sliding-window visibility history. Each entry is a [ts_iso,
+        # seen_bool] pair; the grace logic below uses the seen fraction
+        # over a recent window to ride out single-frame flickers without
+        # firing LOST_VISIBILITY. See _handle_unmatched_entity.
+        _record_visibility(ent, ts, seen=True)
 
         # Track posture history.
         posture_val = obs.metadata.get("posture")
@@ -797,32 +866,37 @@ class WorldModel:
             return
 
         # Hysteresis: detectors flicker frame-to-frame (especially YOLO on
-        # cluttered scenes). Without a grace window we'd emit
-        # LOST_VISIBILITY + REAPPEARED dozens of times per second for a
-        # stationary entity. Hold state until BOTH:
-        #   - we've missed `visibility_grace_misses` batches in a row, AND
-        #   - `visibility_grace_seconds` of wall time have elapsed
-        #     since the last confirmed sighting.
-        # AND-semantics protect us from two failure modes:
-        #   - high-fps cameras hitting the miss count in <1s (frames-only
-        #     would fire too eagerly).
-        #   - low-fps cameras taking too long to accumulate misses
-        #     (time-only would fire on a single skipped frame at 1fps).
+        # cluttered scenes). We use a rolling seen/missed history per
+        # entity. LOST_VISIBILITY only fires when ALL of:
+        #   - last confirmed sighting was at least `visibility_grace_seconds`
+        #     ago (wall-time floor),
+        #   - we have at least `visibility_min_samples` recent observations
+        #     in the smoothing window (otherwise we don't have enough data
+        #     to trust the rate — hold),
+        #   - the seen-fraction over the smoothing window is below
+        #     `visibility_seen_fraction_floor` (truly mostly-missing,
+        #     not just a flicker).
         # Exit-polygon hits skip the grace entirely — exits are
         # deliberate, low-flicker events worth firing fast on.
         exit_match = self._classify_exit(ent.last_seen_bbox, camera)
         if exit_match is None:
-            grace_misses = int(self.cfg.get("visibility_grace_misses", 5))
+            _record_visibility(ent, ts, seen=False)
             grace_seconds = float(self.cfg.get("visibility_grace_seconds", 3.0))
-            miss_count = int(ent.metadata.get("miss_streak", 0)) + 1
-            ent.metadata["miss_streak"] = miss_count
+            window_s = float(self.cfg.get("visibility_window_seconds", 6.0))
+            min_samples = int(self.cfg.get("visibility_min_samples", 4))
+            seen_floor = float(self.cfg.get(
+                "visibility_seen_fraction_floor", 0.25
+            ))
             last_seen = _as_utc(ent.last_seen_ts) if ent.last_seen_ts else None
             elapsed = (ts - last_seen).total_seconds() if last_seen else 0.0
-            # Hold (return) while EITHER threshold is still under-budget.
-            if miss_count < grace_misses or elapsed < grace_seconds:
-                # Below threshold — hold state, no event. Do NOT upsert,
-                # in-memory miss_streak is enough; persistence happens
-                # when we actually transition.
+            frac, samples = _seen_fraction(ent, ts, window_s)
+            # Hold (return) when any condition says "not lost yet":
+            #   - wall-time grace not elapsed
+            #   - not enough samples to trust the smoothing
+            #   - smoothing says we're still seeing the entity often
+            if (elapsed < grace_seconds
+                    or samples < min_samples
+                    or frac > seen_floor):
                 return
 
         if exit_match is None:

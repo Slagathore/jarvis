@@ -2089,6 +2089,18 @@ main {
 }
 
 .interaction-thumb-clickable { cursor: zoom-in; }
+.interaction-row-clickable { cursor: pointer; }
+.interaction-row-clickable:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.pending-thumb-clickable { cursor: zoom-in; }
+.lightbox-noimg {
+  padding: 60px 40px;
+  text-align: center;
+  color: var(--text-dim, #888);
+  font-style: italic;
+  min-width: 280px;
+}
 
 .img-lightbox-overlay { padding: 16px; }
 .lightbox-card {

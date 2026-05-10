@@ -1779,14 +1779,20 @@ class DashboardServer:
                 log_blacklist = []
             return {
                 "world_model": {
-                    "visibility_grace_misses": int(wm_cfg.get(
-                        "visibility_grace_misses", 3
-                    )),
                     "visibility_grace_seconds": float(wm_cfg.get(
-                        "visibility_grace_seconds", 1.5
+                        "visibility_grace_seconds", 3.0
+                    )),
+                    "visibility_window_seconds": float(wm_cfg.get(
+                        "visibility_window_seconds", 6.0
+                    )),
+                    "visibility_min_samples": int(wm_cfg.get(
+                        "visibility_min_samples", 4
+                    )),
+                    "visibility_seen_fraction_floor": float(wm_cfg.get(
+                        "visibility_seen_fraction_floor", 0.25
                     )),
                     "movement_jitter_threshold": float(wm_cfg.get(
-                        "movement_jitter_threshold", 0.08
+                        "movement_jitter_threshold", 0.15
                     )),
                     "posture_debounce_frames": int(wm_cfg.get(
                         "posture_debounce_frames", 3
@@ -1830,7 +1836,10 @@ class DashboardServer:
                     # Allow-list the keys we expose. Avoids accidental
                     # blast-radius on unrelated cfg entries.
                     if k not in {
-                        "visibility_grace_misses", "visibility_grace_seconds",
+                        "visibility_grace_seconds",
+                        "visibility_window_seconds",
+                        "visibility_min_samples",
+                        "visibility_seen_fraction_floor",
                         "movement_jitter_threshold", "posture_debounce_frames",
                         "interaction_debounce_frames", "landmark_dwell_frames",
                         "T_handoff_seconds", "stationary_long_minutes",
@@ -1839,10 +1848,10 @@ class DashboardServer:
                         errors.append(f"unknown world_model key: {k}")
                         continue
                     try:
-                        wm.cfg[k] = (
-                            int(v) if k.endswith("_misses") or k.endswith("_frames")
-                            else float(v)
-                        )
+                        if k.endswith("_samples") or k.endswith("_frames"):
+                            wm.cfg[k] = int(v)
+                        else:
+                            wm.cfg[k] = float(v)
                         applied["world_model"][k] = wm.cfg[k]
                     except (TypeError, ValueError) as e:
                         errors.append(f"world_model.{k}: {e}")

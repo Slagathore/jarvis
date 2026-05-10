@@ -1378,7 +1378,7 @@ function renderPending(items) {
     }
     let preview = "";
     if (p.has_image) {
-      preview = `<img class="pending-thumb" src="/api/identity/pending/${p.id}/image.jpg" alt="capture" />`;
+      preview = `<img class="pending-thumb pending-thumb-clickable" src="/api/identity/pending/${p.id}/image.jpg" alt="capture" title="Click to enlarge" />`;
     } else if (p.has_audio) {
       preview = `<audio controls class="pending-audio" src="/api/identity/pending/${p.id}/audio.wav"></audio>`;
     }
@@ -1449,6 +1449,22 @@ function renderPending(items) {
       resolvePending(p.id, "assign", target);
     });
     row.querySelector(".pending-reject").addEventListener("click", () => resolvePending(p.id, "reject"));
+    // Make the capture thumbnail (if any) open the lightbox at full
+    // resolution. The select dropdown is right next to it; users
+    // squinting at a 96px thumb were the original complaint.
+    const thumb = row.querySelector(".pending-thumb-clickable");
+    if (thumb) {
+      thumb.addEventListener("click", () => {
+        const caption = isCluster
+          ? `Cluster #${p.cluster_id || "?"} (${modality})`
+          : `Drift on ${p.person_name || "?"}`;
+        openImageLightbox(
+          `/api/identity/pending/${p.id}/image.jpg`,
+          caption,
+          p.captured_at,
+        );
+      });
+    }
     el.appendChild(row);
   });
 }
@@ -3100,17 +3116,26 @@ function renderInteractionRow(ev) {
   const room = ev.room
     ? `<span class="event-room">${escapeHtml(ev.room)}</span>`
     : "";
+  // Best-effort URL: prefer the server-provided thumbnail_url; else fall
+  // back to the cluster-event endpoint which 404s gracefully if no
+  // snapshot exists. Always make the whole row clickable so the user
+  // gets a "no snapshot stored" lightbox instead of a dead row.
+  const url = ev.thumbnail_url
+    || (ev.id
+        ? `/api/world_model/cluster/event/${encodeURIComponent(ev.id)}/image.jpg`
+        : null);
   const hasThumb = !!ev.thumbnail_url;
   const thumb = hasThumb
     ? `<img class="interaction-thumb interaction-thumb-clickable"
             src="${ev.thumbnail_url}"
             alt="snapshot" loading="lazy"
             onerror="this.style.display='none';" />`
-    : '<div class="interaction-thumb empty"></div>';
+    : '<div class="interaction-thumb empty">(no thumb)</div>';
   const glyph = INTERACTION_GLYPH[ev.event_type] || "·";
   const ago = formatRelativeTs(ev.ts);
   const div = document.createElement("div");
-  div.className = `interaction-row interaction-${ev.event_type || "unknown"}`;
+  div.className = `interaction-row interaction-row-clickable interaction-${ev.event_type || "unknown"}`;
+  div.title = "Click for full-size snapshot";
   div.innerHTML = `
     ${thumb}
     <div class="interaction-body">
@@ -3121,17 +3146,13 @@ function renderInteractionRow(ev) {
       <div class="interaction-meta">${room}<span class="interaction-ago">${ago}</span></div>
     </div>
   `;
-  if (hasThumb) {
-    const img = div.querySelector("img");
-    if (img) {
-      img.title = "Click to enlarge";
-      img.addEventListener("click", () => openImageLightbox(
-        ev.thumbnail_url,
-        sentence,
-        ev.ts,
-      ));
+  div.addEventListener("click", () => {
+    if (url) {
+      openImageLightbox(url, sentence, ev.ts);
+    } else {
+      openImageLightbox(null, sentence, ev.ts);
     }
-  }
+  });
   return div;
 }
 
@@ -3157,10 +3178,17 @@ function openImageLightbox(url, caption, ts) {
     if (e.target === overlay) closeImageLightbox();
   });
   const tsStr = ts ? new Date(ts).toLocaleString() : "";
+  // The image may not exist (event predates snapshot, or no snapshot
+  // was saved for this event). Render it anyway and rely on onerror
+  // to swap in a "no image" placeholder so the lightbox still opens.
+  const imgHtml = url
+    ? `<img class="lightbox-img" src="${url}" alt="snapshot"
+            onerror="this.outerHTML='<div class=\\'lightbox-noimg\\'>No snapshot stored for this event.</div>'" />`
+    : `<div class="lightbox-noimg">No snapshot stored for this event.</div>`;
   overlay.innerHTML = `
     <div class="lightbox-card">
       <button class="modal-close lightbox-close" aria-label="Close">×</button>
-      <img class="lightbox-img" src="${url}" alt="snapshot" />
+      ${imgHtml}
       <div class="lightbox-caption">
         <span>${escapeHtml(caption || "")}</span>
         <span class="lightbox-ts">${escapeHtml(tsStr)}</span>
@@ -3394,8 +3422,10 @@ setInterval(loadClownStatus, 8000);
 // ── Settings tab ──────────────────────────────────────────────────────────
 
 const _SETTINGS_WM_LABELS = {
-  visibility_grace_misses: "Visibility grace (missed frames)",
-  visibility_grace_seconds: "Visibility grace (seconds)",
+  visibility_grace_seconds: "Visibility grace floor (seconds)",
+  visibility_window_seconds: "Visibility smoothing window (seconds)",
+  visibility_min_samples: "Visibility min samples in window",
+  visibility_seen_fraction_floor: "Visibility seen-fraction floor (0-1)",
   person_continuity_seconds: "Person continuity (seconds)",
   movement_jitter_threshold: "Movement jitter threshold (0-1)",
   posture_debounce_frames: "Posture debounce (frames)",
@@ -3431,8 +3461,12 @@ function renderSettings(state) {
     wmEl.innerHTML = Object.entries(_SETTINGS_WM_LABELS)
       .map(([k, label]) => {
         const v = wm[k];
-        const step = (k === "movement_jitter_threshold" || k.endsWith("_seconds"))
-          ? "0.1" : "1";
+        let step = "1";
+        if (k === "movement_jitter_threshold" || k === "visibility_seen_fraction_floor") {
+          step = "0.05";
+        } else if (k.endsWith("_seconds") || k.endsWith("_minutes")) {
+          step = "0.5";
+        }
         return `<label>
           <span>${escapeHtml(label)}</span>
           <input type="number" step="${step}" data-key="${k}" value="${v !== undefined ? v : ""}" />
