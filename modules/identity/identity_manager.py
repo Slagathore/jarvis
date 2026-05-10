@@ -62,6 +62,11 @@ DEFAULTS = {
 # with FaceRecognizer.MODEL_VERSION — when ArcFace is replaced (e.g. by a
 # future buffalo_xl), bump both in lockstep.
 ACTIVE_FACE_MODEL_VERSION = "arcface_buffalo_l_v1"
+# Embedding dimension that ACTIVE_FACE_MODEL_VERSION produces. The
+# centroid bank loader uses this as a hard guard — a row tagged ArcFace
+# but with wrong dims is corrupt and must not enter the live cache.
+# Bump alongside ACTIVE_FACE_MODEL_VERSION when changing the encoder.
+ACTIVE_FACE_EMBEDDING_DIM = 512
 
 # Pending-cluster merge threshold — if a new unknown sample's cosine to an
 # existing pending-cluster centroid is at least this, fold into that cluster
@@ -145,6 +150,7 @@ class IdentityManager:
     async def init(self) -> None:
         """Run schema-migration from legacy tables, then load caches."""
         await self._migrate_legacy_if_needed()
+        await self._repair_mistagged_face_samples()
         await self._reload_caches()
         logger.info(
             f"[Identity] Ready ({len(self._persons)} persons, "
@@ -230,11 +236,48 @@ class IdentityManager:
             )
             if seen is not None:
                 continue
+            # Legacy `faces` rows are 128-dim DeepFace/Facenet vectors.
+            # Tag them as 'facenet_v1' so _reload_caches's
+            # model_version filter excludes them from the live ArcFace
+            # centroid bank — mixing 128-dim and 512-dim blobs in the
+            # same cosine bucket corrupts identification. Re-enrolling
+            # under ArcFace produces fresh 512-dim samples; the legacy
+            # rows stay only for audit trail / dashboard history.
             await self._db.execute(
                 "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source, model_version) "
-                "VALUES (?, ?, ?, ?, 'migration', ?)",
-                (pid, emb_blob, "candid", _now_iso(), ACTIVE_FACE_MODEL_VERSION),
+                "VALUES (?, ?, ?, ?, 'migration', 'facenet_v1')",
+                (pid, emb_blob, "candid", _now_iso()),
             )
+
+    async def _repair_mistagged_face_samples(self) -> None:
+        """One-time DB repair for face_samples rows mistagged as ArcFace
+        but holding 128-dim Facenet blobs. Idempotent — safe to run on
+        every boot. Fixes the bug introduced by an earlier version of
+        `_migrate_legacy_if_needed` that wrote ACTIVE_FACE_MODEL_VERSION
+        for legacy migration rows.
+        """
+        try:
+            row = await self._db.fetchone(
+                "SELECT COUNT(*) AS n FROM face_samples "
+                "WHERE model_version = ? AND length(embedding) = ?",
+                (ACTIVE_FACE_MODEL_VERSION, 128 * 4),
+            )
+        except Exception as e:
+            logger.debug(f"[Identity] mistagged-face check failed: {e}")
+            return
+        n = int(row["n"]) if row and row["n"] is not None else 0
+        if n == 0:
+            return
+        await self._db.execute(
+            "UPDATE face_samples SET model_version = 'facenet_v1' "
+            "WHERE model_version = ? AND length(embedding) = ?",
+            (ACTIVE_FACE_MODEL_VERSION, 128 * 4),
+        )
+        logger.warning(
+            f"[Identity] repaired {n} face_samples row(s) mistagged as "
+            f"{ACTIVE_FACE_MODEL_VERSION} (held 128-dim Facenet blobs). "
+            "Re-enroll affected residents under ArcFace to restore live identification."
+        )
 
     async def _reload_caches(self) -> None:
         self._persons.clear()
@@ -258,6 +301,9 @@ class IdentityManager:
         # Filter to the active face model — old facenet_v1 (128-dim) rows
         # stay in the DB for history but don't enter the live centroid
         # bank since they're incomparable with current ArcFace embeddings.
+        # Defense-in-depth: even when model_version says ArcFace, refuse
+        # to load anything that isn't 512-dim. A bad row would otherwise
+        # poison cosine similarity for the whole person.
         for r in await self._db.fetchall(
             "SELECT person_id, embedding FROM face_samples WHERE model_version = ?",
             (ACTIVE_FACE_MODEL_VERSION,),
@@ -265,7 +311,14 @@ class IdentityManager:
             pid = int(r["person_id"])
             try:
                 emb = np.frombuffer(r["embedding"], dtype=np.float32).copy()
-                if emb.size and pid in self._face_samples:
+                if emb.size != ACTIVE_FACE_EMBEDDING_DIM:
+                    logger.warning(
+                        f"[Identity] skipping face_sample for person {pid}: "
+                        f"got {emb.size}-dim embedding, expected "
+                        f"{ACTIVE_FACE_EMBEDDING_DIM}"
+                    )
+                    continue
+                if pid in self._face_samples:
                     self._face_samples[pid].append(emb)
             except Exception:
                 continue

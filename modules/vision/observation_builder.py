@@ -190,13 +190,22 @@ class ObservationBuilder:
                     observations = await self._build_for_frame(
                         room_id, frame, ts
                     )
-                    if observations:
-                        await self.bus.publish("vision.observation", {
-                            "camera": room_id,
-                            "room": room_id,
-                            "ts": ts,
-                            "observations": observations,
-                        })
+                    # Always publish — empty `observations` is exactly
+                    # the signal WorldModel needs to fire LOST_VISIBILITY
+                    # for entities that were PRESENT in this camera last
+                    # tick but vanished this tick (under-desk, walked
+                    # off-frame, etc.). Suppressing empty batches breaks
+                    # every disappearance-driven state transition in
+                    # §17, §22.9, §29.2. Camera capture failure (frame
+                    # is None) is different — that's silence, not an
+                    # empty observation; the WorldModel handles it via
+                    # camera.health from CameraManager.
+                    await self.bus.publish("vision.observation", {
+                        "camera": room_id,
+                        "room": room_id,
+                        "ts": ts,
+                        "observations": observations,
+                    })
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -318,20 +327,38 @@ class ObservationBuilder:
         person_id: Optional[int] = None
         person_name: Optional[str] = None
         identity_conf: float = 0.0
+        identity_status: str = "no_face"
         face_metadata: dict[str, Any] = {}
         if face is not None:
+            identity_status = "no_match"
             try:
                 match = await self.identity.identify_from_embedding_async(
                     face["embedding"], modality="face"
                 )
-                if match is not None:
+                # Treat ambiguous matches as "unknown for now". The
+                # margin gate inside IdentityManager flagged this match
+                # as too close to a runner-up — committing person_id
+                # would let the WorldModel attribute observations to
+                # the wrong resident, which corrupts every downstream
+                # answer ("where's Cole?" returns Anna's office, etc.).
+                # False unknowns are recoverable; false positives aren't.
+                if match is not None and not match.is_ambiguous:
                     person_id = int(match.person_id)
                     person_name = match.name
                     identity_conf = float(match.similarity)
+                    identity_status = "matched"
+                elif match is not None and match.is_ambiguous:
+                    identity_status = "ambiguous"
+                    logger.debug(
+                        f"[ObservationBuilder] ambiguous face match in '{room}' "
+                        f"(top candidate: {match.name}, sim={match.similarity:.3f}); "
+                        "treating as unknown"
+                    )
             except Exception as e:
                 logger.debug(
                     f"[ObservationBuilder] identity match failed in '{room}': {e}"
                 )
+                identity_status = "error"
             face_metadata = {
                 "face_embedding": face["embedding"],
                 "yaw": float(face.get("yaw", 0.0)),
@@ -357,6 +384,12 @@ class ObservationBuilder:
                 "frame_height": fh,
                 "hand_bboxes": hand_bboxes,
                 "posture": posture,
+                # 'matched' | 'ambiguous' | 'no_match' | 'no_face' | 'error' —
+                # consumers can branch on ambiguous (e.g. dashboard
+                # highlights pending review) without re-deriving from
+                # null person_id (which conflates "no face" with
+                # "ambiguous match").
+                "identity_status": identity_status,
                 **face_metadata,
             },
         )

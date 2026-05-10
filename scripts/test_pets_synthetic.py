@@ -681,6 +681,81 @@ async def test_cluster_builder_below_threshold() -> None:
     print("PASS: AnimalClusterBuilder respects threshold")
 
 
+async def test_bootstrapped_pet_is_candidate_in_home_room() -> None:
+    """A freshly-bootstrapped resident cat (no last_seen_ts yet) must be
+    in the candidate pool for its declared home_room. Without this the
+    very first observation creates a new anonymous entity instead of
+    linking to e.g. Spooky on day 1."""
+    db = InMemoryDB(); await db.init()
+    try:
+        store = WorldStore(db); await store.ensure_schema()
+        await bootstrap_pets_from_config(store, HOUSEHOLD_CONFIG)
+        # Add the bedroom camera to ROOMS_CONFIG (Spooky's home_room)
+        rooms_with_bedroom = ROOMS_CONFIG  # already includes bedroom
+        wm = WorldModel(
+            bus=StubBus(), store=store,
+            rooms_config=rooms_with_bedroom,
+            identity_manager=StubIdentityManager(),
+            config={},
+        )
+        await wm.start()
+
+        # HOUSEHOLD_CONFIG (this file's abbreviated lineup) declares:
+        #   Spooky — home_room=bedroom
+        #   Velcro — home_room=jeff_room (unmonitored)
+        #   Summer — home_rooms=[bedroom, living_room, outdoor]
+        # All start with last_seen_ts=None.
+        bedroom_candidates = wm._candidate_entities_for_camera("bedroom")
+        names = sorted(e.display_name for e in bedroom_candidates if e.display_name)
+        # Spooky declares bedroom as home_room. Summer declares
+        # bedroom in home_rooms. Both must be present.
+        assert "Spooky" in names, names
+        assert "Summer" in names, names
+
+        living_room_candidates = wm._candidate_entities_for_camera("living_room")
+        lr_names = sorted(
+            e.display_name for e in living_room_candidates if e.display_name
+        )
+        # Summer's home_rooms includes living_room — must show up there.
+        assert "Summer" in lr_names, lr_names
+
+        # Velcro's home is jeff_room — no camera there, so the bedroom
+        # / living_room camera shouldn't pick him up by home rule.
+        assert "Velcro" not in names, names
+        assert "Velcro" not in lr_names, lr_names
+    finally:
+        await db.close()
+    print("PASS: bootstrapped pets are candidates in their home rooms")
+
+
+async def test_archived_pet_excluded_from_candidate_pool() -> None:
+    """An archived pet must NOT enter the home-room candidate path —
+    archived = soft-deleted, no live observations should link to it."""
+    db = InMemoryDB(); await db.init()
+    try:
+        store = WorldStore(db); await store.ensure_schema()
+        await bootstrap_pets_from_config(store, HOUSEHOLD_CONFIG)
+        loaded = await store.load_entities()
+        spooky = next(e for e in loaded if e.display_name == "Spooky")
+        spooky.archived_at = datetime.utcnow()
+        await store.upsert_entity(spooky)
+        wm = WorldModel(
+            bus=StubBus(), store=store,
+            rooms_config=ROOMS_CONFIG,
+            identity_manager=StubIdentityManager(),
+            config={},
+        )
+        await wm.start()
+        cands = wm._candidate_entities_for_camera("bedroom")
+        names = [e.display_name for e in cands]
+        assert "Spooky" not in names, (
+            f"archived pet leaked into candidate pool: {names}"
+        )
+    finally:
+        await db.close()
+    print("PASS: archived pets excluded from home-room candidate pool")
+
+
 async def main() -> None:
     await test_resolve_residents()
     await test_bootstrap_idempotent_and_affinities()
@@ -692,6 +767,8 @@ async def main() -> None:
     await test_pet_care_summary_aggregates_events()
     await test_object_pair_cost_class_match()
     await test_where_is_pet_uses_unmonitored_home()
+    await test_bootstrapped_pet_is_candidate_in_home_room()
+    await test_archived_pet_excluded_from_candidate_pool()
     await test_cluster_builder_below_threshold()
     print("\nAll Phase 4 (§22) synthetic tests passed.")
 

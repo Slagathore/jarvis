@@ -36,9 +36,30 @@ mediapipe==0.10.14
 opencv-python==4.10.0.84
 Pillow==10.4.0
 aiohttp==3.13.5
-# Face recognition (pure Python, TF-backed Facenet model, ~92MB weights downloaded
-# automatically on first call; cached at ~/.deepface/weights/)
+# Face recognition — primary stack is InsightFace's `buffalo_l` (ArcFace,
+# 512-dim embeddings). DeepFace stays installed only because old dashboard
+# call sites use it as a compatibility shim (FaceRecognizer wraps both).
+# Once those call sites are migrated, deepface can come out — but its
+# 92MB Facenet weights are already cached so dropping it isn't urgent.
+#
+# Pin chain caveats (see WORLD_MODEL_RESUME.md §2):
+#   • numpy<2.0 — TF 2.17 + InsightFace coexistence
+#   • onnx==1.16.2 — anything past 1.20 demands ml-dtypes>=0.5 which TF forbids
+#   • ml-dtypes<0.5 — TF 2.17's hard pin
+#   • albumentations is deliberately NOT installed; FaceAnalysis's
+#     mask_renderer import is patched in-tree (re-applies after pip
+#     reinstall of insightface).
+insightface>=0.7.3
+onnxruntime-gpu>=1.18.0
+onnx==1.16.2
 deepface==0.0.99
+
+# ── World Model + ML deps ──────────────────────────────────────────────────
+# Hungarian assignment in WorldModel._associate (modules/world_model/world_model.py).
+scipy>=1.11.0
+# K-means in modules/world_model/cluster_builder.py — Phase 4 cold-start
+# protocol. Light usage; sklearn's other modules aren't imported.
+scikit-learn>=1.4.0
 
 # ── Audio Classification ───────────────────────────────────────────────────
 tensorflow==2.17.0

@@ -874,15 +874,62 @@ class WorldModel:
         await self.bus.publish("world.entity_event", payload)
 
     def _candidate_entities_for_camera(self, camera: str) -> list[WorldEntity]:
+        """Pool of entities a new observation on `camera` could plausibly
+        match. Two paths union'd (deduped by id):
+
+          1. Spatio-temporal: entities recently seen on this camera or a
+             neighbor. Original behavior — favors continuity.
+          2. Resident pets in their declared home_room (or for cyclic
+             cats, any of `cyclic_home_rooms`; for dogs, `home_rooms`).
+             Without this, freshly-bootstrapped pets — which start with
+             last_seen_ts=None — never enter the candidate pool, so
+             every animal observation creates a new anonymous entity
+             instead of linking to Spooky/Velcro/Sparta/etc. on day 1.
+             Per §22, attribution on a sparse-data day is *hedged*, not
+             absent: the cost function should at least *consider* the
+             declared resident.
+        """
         lookback = int(self.cfg.get("candidate_lookback_minutes", 2))
         cutoff = datetime.utcnow() - timedelta(minutes=lookback)
-        return [
-            e for e in self.entities.values()
-            if e.last_seen_ts and e.last_seen_ts > cutoff and (
-                e.last_seen_camera == camera
-                or self._cameras_are_neighbors(e.last_seen_camera, camera)
+        cam_room = self.cameras.get(camera, {}).get("room")
+
+        out: dict[str, WorldEntity] = {}
+        for e in self.entities.values():
+            recent_here = bool(
+                e.last_seen_ts and e.last_seen_ts > cutoff and (
+                    e.last_seen_camera == camera
+                    or self._cameras_are_neighbors(e.last_seen_camera, camera)
+                )
             )
-        ]
+            home_match = bool(
+                e.is_resident
+                and e.entity_type in ("cat", "dog")
+                and e.archived_at is None
+                and cam_room is not None
+                and self._pet_home_room_matches(e, cam_room)
+            )
+            if recent_here or home_match:
+                out[e.id] = e
+        return list(out.values())
+
+    @staticmethod
+    def _pet_home_room_matches(ent: WorldEntity, room: str) -> bool:
+        """Does this resident pet declare `room` as one of its home rooms?
+        Reads the seed metadata that pets.bootstrap_pets_from_config wrote
+        — handles cats (home_room / cyclic_home_rooms) and dogs (home_rooms)."""
+        seed = ent.metadata.get("seed", {}) or {}
+        # Cats: single home_room, or cyclic with a list.
+        hr = seed.get("home_room")
+        if hr and hr != "cyclic" and hr == room:
+            return True
+        cyclic = seed.get("cyclic_home_rooms") or []
+        if isinstance(cyclic, list) and room in cyclic:
+            return True
+        # Dogs: list of home_rooms.
+        home_rooms = seed.get("home_rooms") or []
+        if isinstance(home_rooms, list) and room in home_rooms:
+            return True
+        return False
 
     def _cameras_are_neighbors(
         self, a: Optional[str], b: Optional[str]
