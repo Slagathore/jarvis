@@ -1357,18 +1357,35 @@ function renderPending(items) {
     row.className = "pending-row";
     const isCluster = p.kind && p.kind.startsWith("pending_cluster_");
     const modality = p.kind && p.kind.includes("voice") ? "voice" : "face";
-    const hint = isCluster
-      ? `Unknown ${modality} cluster #${p.cluster_id || "?"} — best match ${(p.similarity || 0).toFixed(2)}`
-      : `Drift on ${escapeHtml(p.person_name || "unknown")} — sim ${(p.similarity || 0).toFixed(2)} (anchored via ${p.anchored_via || "?"})`;
+    // Backend ships a suggestion for cluster rows — the unconstrained
+    // top match against the live centroid bank. Use it both to label
+    // the hint ("Looks like Cole 0.42") and to pre-select the dropdown.
+    let hint;
+    if (isCluster) {
+      const baseSim = (p.similarity || 0).toFixed(2);
+      if (p.suggested_person_name) {
+        const sugSim = (p.suggested_similarity || 0).toFixed(2);
+        hint = `Unknown ${modality} cluster #${p.cluster_id || "?"} — looks like ` +
+               `<b>${escapeHtml(p.suggested_person_name)}</b> (${sugSim}). ` +
+               `Cluster centroid sim ${baseSim}.`;
+      } else {
+        hint = `Unknown ${modality} cluster #${p.cluster_id || "?"} — no enrolled match (${baseSim})`;
+      }
+    } else {
+      hint = `Drift on ${escapeHtml(p.person_name || "unknown")} — sim ${
+        (p.similarity || 0).toFixed(2)
+      } (anchored via ${p.anchored_via || "?"})`;
+    }
     let preview = "";
     if (p.has_image) {
       preview = `<img class="pending-thumb" src="/api/identity/pending/${p.id}/image.jpg" alt="capture" />`;
     } else if (p.has_audio) {
       preview = `<audio controls class="pending-audio" src="/api/identity/pending/${p.id}/audio.wav"></audio>`;
     }
-    // Pre-select the existing person if this is a drift case, so a one-click
-    // assign actually reuses the right person row.
-    const optionsHtml = _personOptions(p.person_name);
+    // Drift rows: pre-select the anchored person. Cluster rows: pre-
+    // select the suggested top-match person so a single click confirms.
+    const preselect = p.person_name || p.suggested_person_name || null;
+    const optionsHtml = _personOptions(preselect);
     row.innerHTML = `
       ${preview}
       <div class="pending-meta">

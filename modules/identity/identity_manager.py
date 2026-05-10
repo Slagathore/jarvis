@@ -502,6 +502,26 @@ class IdentityManager:
             match.pending_verification = other
         return match
 
+    def _top_match_unconstrained(
+        self, modality: str, emb: np.ndarray
+    ) -> Optional[tuple[int, float]]:
+        """Return (best person_id, similarity) ignoring match/margin
+        thresholds. Used by the pending-review dashboard to suggest a
+        likely person on a row that didn't pass the strict match
+        threshold — better than the user picking blindly. None if no
+        enrolled samples in the chosen modality."""
+        samples = self._voice_samples if modality == "voice" else self._face_samples
+        if not samples or emb is None:
+            return None
+        best: Optional[tuple[int, float]] = None
+        for pid, embs in samples.items():
+            if not embs:
+                continue
+            sim = max(_cosine(emb, e) for e in embs)
+            if best is None or sim > best[1]:
+                best = (pid, sim)
+        return best
+
     def _match_against(
         self, modality: str, emb: np.ndarray
     ) -> Optional[PersonMatch]:
@@ -1241,10 +1261,15 @@ class IdentityManager:
                 continue
 
     async def list_pending(self) -> list[dict]:
-        """Pending review items (drift conflicts + unknown clusters)."""
+        """Pending review items (drift conflicts + unknown clusters).
+        For cluster rows we also compute an unconstrained top-match
+        suggestion so the dashboard dropdown can pre-select the most
+        likely person — saves the user from picking blindly when the
+        face is borderline."""
         rows = await self._db.fetchall(
-            "SELECT id, kind, person_id, cluster_id, similarity, anchored_via, "
-            "captured_at, image_jpeg IS NOT NULL AS has_image, "
+            "SELECT id, kind, person_id, cluster_id, embedding, similarity, "
+            "anchored_via, captured_at, "
+            "image_jpeg IS NOT NULL AS has_image, "
             "audio_pcm16 IS NOT NULL AS has_audio "
             "FROM identity_pending WHERE resolved = 0 "
             "AND NOT (kind = 'pending_cluster_face' AND image_jpeg IS NULL) "
@@ -1254,9 +1279,41 @@ class IdentityManager:
         out: list[dict] = []
         for r in rows:
             pid = r["person_id"]
+            suggested_id: Optional[int] = None
+            suggested_name: Optional[str] = None
+            suggested_sim: Optional[float] = None
+            kind = r["kind"] or ""
+            if pid is None and kind.startswith("pending_cluster_"):
+                # Cluster row — no anchor person. Score the row's
+                # embedding against the live centroid bank for the
+                # right modality and surface the top hit.
+                blob = r["embedding"]
+                if blob:
+                    try:
+                        emb = np.frombuffer(blob, dtype=np.float32)
+                        modality = "voice" if "voice" in kind else "face"
+                        # Expected dim guard — voice (256 ECAPA) vs face
+                        # (512 ArcFace). Skip suggestion if the blob's
+                        # shape is wrong rather than silently misranking.
+                        expected = (
+                            256 if modality == "voice"
+                            else ACTIVE_FACE_EMBEDDING_DIM
+                        )
+                        if emb.size == expected:
+                            top = self._top_match_unconstrained(modality, emb)
+                            if top is not None:
+                                suggested_id, suggested_sim = top
+                                suggested_name = self._persons.get(
+                                    suggested_id
+                                )
+                    except Exception as e:
+                        logger.debug(
+                            f"[Identity] pending suggestion failed for "
+                            f"row {r['id']}: {e}"
+                        )
             out.append({
                 "id": int(r["id"]),
-                "kind": r["kind"],
+                "kind": kind,
                 "person_id": int(pid) if pid is not None else None,
                 "person_name": self._persons.get(int(pid)) if pid is not None else None,
                 "cluster_id": r["cluster_id"],
@@ -1265,6 +1322,9 @@ class IdentityManager:
                 "captured_at": r["captured_at"],
                 "has_image": bool(r["has_image"]),
                 "has_audio": bool(r["has_audio"]),
+                "suggested_person_id": suggested_id,
+                "suggested_person_name": suggested_name,
+                "suggested_similarity": suggested_sim,
             })
         return out
 
