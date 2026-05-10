@@ -176,6 +176,11 @@ class WorldQueryTools:
                 continue
             if not e.is_resident:
                 continue
+            # Surface the seed metadata that bootstrap_pets_from_config
+            # writes to e.metadata['seed']. The dashboard pet card renders
+            # color/coat/personality/notes; missing keys come back as
+            # None and are filtered client-side.
+            seed = (e.metadata or {}).get("seed") or {}
             out.append({
                 "name": e.display_name,
                 "species": e.entity_type,
@@ -184,6 +189,7 @@ class WorldQueryTools:
                 "last_seen_room": e.last_seen_room,
                 "unmonitored_home": e.unmonitored_home_room,
                 "is_archived": e.archived_at is not None,
+                "seed": seed,
             })
         return sorted(out, key=lambda d: (d["species"], d["name"] or ""))
 

@@ -2701,7 +2701,9 @@ function formatRelativeTs(ts) {
 
 function renderPetCard(pet) {
   const div = document.createElement("div");
-  div.className = `pet-row pet-${pet.species || "unknown"}`;
+  div.className = `pet-row pet-${pet.species || "unknown"} pet-row-clickable`;
+  div.title = "Click for details + recent events";
+  div.addEventListener("click", () => openPetLoreModal(pet));
 
   // Where the pet "is". When we haven't seen them recently and the
   // pet has an unmonitored_home, render with a hedge — matches the
@@ -2796,6 +2798,143 @@ loadPets();
 // (food/litterbox events fire on the order of hours), state changes
 // flow in via the WebSocket world.entity_event handler below.
 setInterval(loadPets, 30000);
+
+// ── Pet lore card modal ───────────────────────────────────────────────────
+// Click a pet row → open a modal with the full seed metadata (color,
+// coat, personality, notes, distinctive features, etc.) and a tail of
+// recent events for that pet. Closes on backdrop click or ESC.
+
+function _kvRows(obj) {
+  if (!obj || typeof obj !== "object") return "";
+  const rows = [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === null || v === undefined || v === "" ||
+        (Array.isArray(v) && v.length === 0)) continue;
+    let pretty;
+    if (Array.isArray(v)) {
+      pretty = v.map((x) => escapeHtml(String(x))).join(", ");
+    } else if (typeof v === "object") {
+      pretty = escapeHtml(JSON.stringify(v));
+    } else {
+      pretty = escapeHtml(String(v));
+    }
+    const label = k.replace(/_/g, " ");
+    rows.push(
+      `<div class="lore-row"><span class="lore-key">${escapeHtml(label)}</span>` +
+      `<span class="lore-val">${pretty}</span></div>`,
+    );
+  }
+  return rows.join("");
+}
+
+async function _fetchPetEvents(name) {
+  try {
+    const res = await fetch(
+      `/api/world_model/pets/${encodeURIComponent(name)}/events?limit=30&hours_ago=168`,
+    );
+    if (!res.ok) return [];
+    const body = await res.json();
+    return Array.isArray(body.events) ? body.events : [];
+  } catch (e) {
+    console.warn("[fetchPetEvents] failed:", e);
+    return [];
+  }
+}
+
+function _renderPetEventList(events) {
+  if (!events || events.length === 0) {
+    return '<div class="who-empty">No events in the last week.</div>';
+  }
+  return events
+    .map((e) => {
+      const ts = e.ts ? new Date(e.ts).toLocaleString() : "?";
+      const room = e.room ? ` · ${escapeHtml(e.room)}` : "";
+      const lm = (e.metadata && e.metadata.landmark)
+        ? ` <span class="lore-lm">${escapeHtml(e.metadata.landmark)}</span>` : "";
+      const glyph = EVENT_TYPE_GLYPH[e.event_type] || "·";
+      return `<div class="lore-event">
+        <span class="lore-evt-glyph">${glyph}</span>
+        <span class="lore-evt-type">${escapeHtml(e.event_type || "?")}</span>${lm}
+        <span class="lore-evt-room">${room}</span>
+        <span class="lore-evt-ts">${ts}</span>
+      </div>`;
+    })
+    .join("");
+}
+
+function closePetLoreModal() {
+  const m = document.getElementById("pet-lore-modal");
+  if (m) m.remove();
+  document.removeEventListener("keydown", _petLoreKeydown);
+}
+
+function _petLoreKeydown(e) {
+  if (e.key === "Escape") closePetLoreModal();
+}
+
+async function openPetLoreModal(pet) {
+  closePetLoreModal();
+  const seed = pet.seed || {};
+  const speciesGlyph = pet.species === "dog" ? "𓃡" : "𓃠";
+  const overlay = document.createElement("div");
+  overlay.id = "pet-lore-modal";
+  overlay.className = "modal-overlay";
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) closePetLoreModal();
+  });
+
+  overlay.innerHTML = `
+    <div class="modal-card">
+      <div class="modal-head">
+        <span class="pet-glyph">${speciesGlyph}</span>
+        <span class="modal-title">${escapeHtml(pet.name || "?")}</span>
+        <span class="modal-sub">${escapeHtml(pet.species || "")}</span>
+        <button class="modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-section">
+          <div class="modal-section-label">CURRENT STATE</div>
+          <div class="lore-rows">
+            <div class="lore-row"><span class="lore-key">state</span>
+              <span class="lore-val">${escapeHtml(pet.state || "?")}</span></div>
+            <div class="lore-row"><span class="lore-key">likely room</span>
+              <span class="lore-val">${escapeHtml(pet.likely_room || pet.last_seen_room || "?")}${
+                pet.likely_room_inferred ? " (inferred)" : ""
+              }</span></div>
+            <div class="lore-row"><span class="lore-key">last seen</span>
+              <span class="lore-val">${
+                pet.last_seen_ts ? new Date(pet.last_seen_ts).toLocaleString() : "—"
+              }</span></div>
+          </div>
+        </div>
+        <div class="modal-section">
+          <div class="modal-section-label">LORE</div>
+          <div class="lore-rows">${_kvRows(seed) ||
+            '<div class="who-empty">No seed metadata in config.yaml for this pet.</div>'
+          }</div>
+        </div>
+        <div class="modal-section">
+          <div class="modal-section-label">RECENT EVENTS (7 days)</div>
+          <div class="lore-events" id="lore-events-list">
+            <div class="who-empty">Loading…</div>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <a href="/clusters" class="modal-link" target="_blank">
+            Wrong pet? Open cluster labeler →
+          </a>
+        </div>
+      </div>
+    </div>`;
+
+  overlay.querySelector(".modal-close").addEventListener("click", closePetLoreModal);
+  document.body.appendChild(overlay);
+  document.addEventListener("keydown", _petLoreKeydown);
+
+  const events = await _fetchPetEvents(pet.name);
+  const slot = overlay.querySelector("#lore-events-list");
+  if (slot) slot.innerHTML = _renderPetEventList(events);
+}
 
 // ── World Events tail (live tail of world_entity_events) ──────────────────
 

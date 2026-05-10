@@ -1965,6 +1965,91 @@ main {
   gap: 4px;
   background: rgba(255, 255, 255, 0.02);
 }
+.pet-row-clickable {
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.pet-row-clickable:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--accent, #6cf);
+}
+
+/* Pet lore modal */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.modal-card {
+  background: var(--card, #0f1419);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-width: 640px; width: 100%; max-height: 90vh;
+  display: flex; flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+}
+.modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-title {
+  font-size: 1.15rem; font-weight: 600; color: var(--text);
+}
+.modal-sub {
+  color: var(--text-dim, #888); font-size: 0.85rem;
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.modal-close {
+  margin-left: auto;
+  background: transparent; border: none; color: var(--text);
+  font-size: 1.4rem; cursor: pointer; line-height: 1;
+  padding: 2px 8px; border-radius: 4px;
+}
+.modal-close:hover { background: rgba(255, 255, 255, 0.08); }
+.modal-body { padding: 14px 18px; overflow-y: auto; }
+.modal-section { margin-bottom: 18px; }
+.modal-section-label {
+  font-size: 0.7rem; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--text-dim, #888); margin-bottom: 6px;
+}
+.lore-rows { display: flex; flex-direction: column; gap: 4px; }
+.lore-row {
+  display: flex; gap: 12px; font-size: 0.85rem;
+  padding: 3px 0; border-bottom: 1px dashed rgba(255,255,255,0.05);
+}
+.lore-key {
+  min-width: 130px; color: var(--text-dim, #888);
+  text-transform: capitalize;
+}
+.lore-val { color: var(--text); flex: 1; word-break: break-word; }
+.lore-events { display: flex; flex-direction: column; gap: 2px; }
+.lore-event {
+  display: grid;
+  grid-template-columns: 18px 1fr auto auto;
+  align-items: center; gap: 6px;
+  font-size: 0.8rem; padding: 3px 0;
+  border-bottom: 1px dashed rgba(255,255,255,0.04);
+}
+.lore-evt-glyph { color: var(--accent, #6cf); }
+.lore-evt-type { color: var(--text); font-family: var(--mono, monospace); }
+.lore-evt-room { color: var(--text-dim, #888); font-size: 0.75rem; }
+.lore-evt-ts { color: var(--text-dim, #888); font-size: 0.72rem; }
+.lore-lm {
+  color: var(--accent, #6cf); font-size: 0.72rem;
+  padding: 1px 5px; border-radius: 3px;
+  background: rgba(108, 207, 255, 0.1);
+}
+.modal-foot {
+  padding-top: 8px; border-top: 1px solid var(--border);
+  text-align: center;
+}
+.modal-link {
+  color: var(--accent, #6cf); text-decoration: none;
+  font-size: 0.85rem;
+}
+.modal-link:hover { text-decoration: underline; }
 .pet-row-head {
   display: flex;
   align-items: baseline;

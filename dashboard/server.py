@@ -1415,12 +1415,55 @@ class DashboardServer:
                             "duration_in_state_seconds"
                         ),
                         "care": care.get("by_kind", {}),
+                        # Lore card data — seed metadata from config
+                        # (color, coat, personality, notes, etc.).
+                        "seed": p.get("seed") or {},
                     })
                 return JSONResponse({
                     "pets": pets_out, "available": True,
                 })
             except Exception as e:
                 logger.warning(f"[/api/world_model/pets] {e}")
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
+        @app.get("/api/world_model/pets/{name}/events")
+        async def world_model_pet_events(
+            name: str, limit: int = 30, hours_ago: int = 168
+        ):
+            """Recent events for a single pet — drives the lore-card
+            modal in the dashboard so the user can see the pet's
+            recent activity (where it's been, what landmarks it
+            interacted with, etc.)."""
+            orch = self._orchestrator
+            wq = getattr(orch, "world_query_tools", None) if orch else None
+            if wq is None:
+                return JSONResponse({"events": [], "available": False})
+            try:
+                limit = max(1, min(int(limit), 200))
+                hours_ago = max(1, min(int(hours_ago), 24 * 30))
+                rows = await wq.search_recent_events(
+                    entity_name=name,
+                    hours_ago=hours_ago,
+                    limit=limit,
+                )
+                import json as _json
+                out: list[dict] = []
+                for r in rows:
+                    d = dict(r)
+                    raw = d.get("metadata")
+                    if isinstance(raw, str) and raw:
+                        try:
+                            d["metadata"] = _json.loads(raw)
+                        except Exception:
+                            d["metadata"] = {}
+                    elif raw is None:
+                        d["metadata"] = {}
+                    out.append(d)
+                return JSONResponse({"events": out, "available": True})
+            except Exception as e:
+                logger.warning(
+                    f"[/api/world_model/pets/{name}/events] {e}"
+                )
                 raise HTTPException(status_code=500, detail=str(e)) from e
 
         # ── §29.8 Clown alarm (v4.1) ──────────────────────────────────────
