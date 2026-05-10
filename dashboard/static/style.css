@@ -2077,6 +2077,48 @@ main {
 .logs-stream .log-success { color: #5dd99a; }
 .logs-stream .log-name { color: #6c8ea0; }
 
+.event-count {
+  display: inline-block;
+  padding: 1px 6px;
+  margin-left: 4px;
+  font-size: 0.7rem;
+  background: rgba(108,207,255,0.12);
+  color: var(--accent, #6cf);
+  border-radius: 8px;
+  font-family: var(--mono, monospace);
+}
+
+.interaction-thumb-clickable { cursor: zoom-in; }
+
+.img-lightbox-overlay { padding: 16px; }
+.lightbox-card {
+  background: #0a0d11;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-width: 90vw; max-height: 92vh;
+  display: flex; flex-direction: column;
+  position: relative;
+}
+.lightbox-close {
+  position: absolute; top: 6px; right: 8px;
+  z-index: 2;
+  color: #fff;
+  background: rgba(0,0,0,0.6);
+  border-radius: 4px;
+}
+.lightbox-img {
+  max-width: 90vw; max-height: 80vh;
+  object-fit: contain;
+  display: block;
+}
+.lightbox-caption {
+  padding: 8px 12px;
+  display: flex; justify-content: space-between; gap: 12px;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+.lightbox-ts { color: var(--text-dim, #888); font-size: 0.78rem; }
+
 .pet-row {
   border: 1px solid var(--border);
   border-radius: var(--radius);

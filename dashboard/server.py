@@ -1803,6 +1803,9 @@ class DashboardServer:
                     "stationary_long_minutes": float(wm_cfg.get(
                         "stationary_long_minutes", 5.0
                     )),
+                    "person_continuity_seconds": float(wm_cfg.get(
+                        "person_continuity_seconds", 5.0
+                    )),
                 },
                 "snapshots": snap_intervals,
                 "logs": {"console_debug_blacklist": log_blacklist},
@@ -1831,6 +1834,7 @@ class DashboardServer:
                         "movement_jitter_threshold", "posture_debounce_frames",
                         "interaction_debounce_frames", "landmark_dwell_frames",
                         "T_handoff_seconds", "stationary_long_minutes",
+                        "person_continuity_seconds",
                     }:
                         errors.append(f"unknown world_model key: {k}")
                         continue

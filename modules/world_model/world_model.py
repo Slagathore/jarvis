@@ -76,7 +76,7 @@ class WorldModel:
         self.cfg: dict[str, Any] = {
             "cost_reject": 1.0,
             "enrollment_min_conf": 0.85,
-            "movement_jitter_threshold": 0.08,
+            "movement_jitter_threshold": 0.15,
             "posture_debounce_frames": 3,
             "interaction_debounce_frames": 3,
             "T_handoff_seconds": 8,
@@ -92,9 +92,15 @@ class WorldModel:
             # transition state out of PRESENT and emit LOST_VISIBILITY.
             # Without this, YOLO false-negatives produce ~25 lost/
             # reappeared events per second per entity.
-            "visibility_grace_misses": 3,
-            "visibility_grace_seconds": 1.5,
+            "visibility_grace_misses": 5,
+            "visibility_grace_seconds": 3.0,
             "landmark_dwell_frames": 3,
+            # Spatial continuity for person obs that lost face
+            # attribution. Within this window, an unattributed person
+            # detection in the same room is merged into the nearest
+            # known person entity instead of spawning a duplicate
+            # unknown_person_*. See _handle_unmatched_observation.
+            "person_continuity_seconds": 5.0,
             **(config or {}),
         }
 
@@ -634,6 +640,61 @@ class WorldModel:
                 await self._update_matched(existing, obs, ts, attribution_conf)
                 return
 
+        # Face attribution dropped out (no person_id) but a known named
+        # person was just here. Prefer routing to them over spawning a
+        # duplicate `unknown_person_*` that ping-pongs with the real
+        # entity every frame the face match fails. Criteria:
+        #   - same room, last seen within `person_continuity_seconds`
+        #   - bbox center distance below 25% of frame diagonal
+        # If both pass we treat this as the same person; the entity
+        # keeps its name and we avoid the entity-split flicker that
+        # produced the dashboard spam.
+        if obs.obj_class == "person" and obs.person_id is None:
+            continuity_s = float(self.cfg.get("person_continuity_seconds", 5.0))
+            cam_cfg = self.cameras.get(obs.camera, {})
+            fw = float(cam_cfg.get("frame_width", 640))
+            fh = float(cam_cfg.get("frame_height", 480))
+            diag = (fw * fw + fh * fh) ** 0.5
+            max_dist = 0.25 * diag
+            obs_center = bbox_center(obs.bbox)
+            best_ent: Optional[WorldEntity] = None
+            best_dist = max_dist + 1.0
+            for ent in self.entities.values():
+                if ent.entity_type != "person":
+                    continue
+                if ent.last_seen_room != obs.room:
+                    continue
+                if ent.last_seen_ts is None or ent.last_seen_bbox is None:
+                    continue
+                age = (ts - _as_utc(ent.last_seen_ts)).total_seconds()
+                if age > continuity_s:
+                    continue
+                # Prefer named (resident) entities; fall back to merging
+                # with a recent unknown to avoid a chain of duplicates.
+                ent_center = bbox_center(ent.last_seen_bbox)
+                dist = (
+                    (ent_center[0] - obs_center[0]) ** 2
+                    + (ent_center[1] - obs_center[1]) ** 2
+                ) ** 0.5
+                if dist > max_dist:
+                    continue
+                # Strong preference for the named person if both a named
+                # and an unknown candidate exist — sort by (named first,
+                # then closer).
+                key = (0 if ent.display_name else 1, dist)
+                best_key = (
+                    0 if (best_ent is not None and best_ent.display_name) else 1,
+                    best_dist,
+                )
+                if best_ent is None or key < best_key:
+                    best_ent, best_dist = ent, dist
+            if best_ent is not None:
+                await self._update_matched(
+                    best_ent, obs, ts,
+                    attribution_conf=obs.person_match_confidence or 0.0,
+                )
+                return
+
         # Wider pool for cats/objects: same-type entity with strong
         # embedding match. People are caught by the person_id path above.
         # §23.8 — for objects we additionally lower the threshold when
@@ -738,20 +799,27 @@ class WorldModel:
         # Hysteresis: detectors flicker frame-to-frame (especially YOLO on
         # cluttered scenes). Without a grace window we'd emit
         # LOST_VISIBILITY + REAPPEARED dozens of times per second for a
-        # stationary entity. Count consecutive misses; only commit a
-        # state transition once we've missed for `visibility_grace_misses`
-        # batches in a row OR `visibility_grace_seconds` of wall time.
-        # If the entity is near an exit, skip the grace — exits are
+        # stationary entity. Hold state until BOTH:
+        #   - we've missed `visibility_grace_misses` batches in a row, AND
+        #   - `visibility_grace_seconds` of wall time have elapsed
+        #     since the last confirmed sighting.
+        # AND-semantics protect us from two failure modes:
+        #   - high-fps cameras hitting the miss count in <1s (frames-only
+        #     would fire too eagerly).
+        #   - low-fps cameras taking too long to accumulate misses
+        #     (time-only would fire on a single skipped frame at 1fps).
+        # Exit-polygon hits skip the grace entirely — exits are
         # deliberate, low-flicker events worth firing fast on.
         exit_match = self._classify_exit(ent.last_seen_bbox, camera)
         if exit_match is None:
-            grace_misses = int(self.cfg.get("visibility_grace_misses", 3))
-            grace_seconds = float(self.cfg.get("visibility_grace_seconds", 1.5))
+            grace_misses = int(self.cfg.get("visibility_grace_misses", 5))
+            grace_seconds = float(self.cfg.get("visibility_grace_seconds", 3.0))
             miss_count = int(ent.metadata.get("miss_streak", 0)) + 1
             ent.metadata["miss_streak"] = miss_count
             last_seen = _as_utc(ent.last_seen_ts) if ent.last_seen_ts else None
             elapsed = (ts - last_seen).total_seconds() if last_seen else 0.0
-            if miss_count < grace_misses and elapsed < grace_seconds:
+            # Hold (return) while EITHER threshold is still under-budget.
+            if miss_count < grace_misses or elapsed < grace_seconds:
                 # Below threshold — hold state, no event. Do NOT upsert,
                 # in-memory miss_streak is enough; persistence happens
                 # when we actually transition.

@@ -2985,20 +2985,57 @@ function renderEventRow(ev) {
   const lm = meta.landmark ? ` <span class="event-landmark">@${escapeHtml(meta.landmark)}</span>` : "";
   const name = ev.entity_name || `?_${ev.entity_type || "ent"}`;
   const ago = formatRelativeTs(ev.ts);
+  // Coalesced run counter ("Anna lost_visibility ×4 over 8s") — only
+  // shown when the renderer collapsed multiple adjacent identical
+  // events. Span stays hidden for singleton rows.
+  const countBadge = (ev._collapse_count && ev._collapse_count > 1)
+    ? ` <span class="event-count" title="${ev._collapse_count} consecutive identical events">×${ev._collapse_count}</span>`
+    : "";
   const div = document.createElement("div");
   div.className = `event-row event-type-${ev.event_type || "unknown"}`;
   div.innerHTML = `
     <span class="event-glyph">${glyph}</span>
     <span class="event-name">${escapeHtml(name)}</span>
-    <span class="event-label">${escapeHtml(label)}</span>${room}${lm}
+    <span class="event-label">${escapeHtml(label)}</span>${countBadge}${room}${lm}
     <span class="event-ago">${ago}</span>
   `;
   return div;
 }
 
+function _coalesceEvents(events, maxGapSeconds = 30) {
+  // Server returns DESC by ts. Walk from newest to oldest; if the
+  // next-older event has the same entity_id + event_type + room and
+  // happened within `maxGapSeconds`, fold its count into the current
+  // entry instead of emitting a new row. Lets the UI show
+  // "Anna lost_visibility ×7" instead of seven near-identical rows.
+  const out = [];
+  let cur = null;
+  for (const ev of events) {
+    const sameKey = (
+      cur &&
+      cur.entity_id === ev.entity_id &&
+      cur.event_type === ev.event_type &&
+      cur.room === ev.room
+    );
+    const dt = cur
+      ? Math.abs(new Date(cur.ts).getTime() - new Date(ev.ts).getTime()) / 1000
+      : Infinity;
+    if (sameKey && dt <= maxGapSeconds) {
+      cur._collapse_count = (cur._collapse_count || 1) + 1;
+    } else {
+      cur = { ...ev, _collapse_count: 1 };
+      out.push(cur);
+    }
+  }
+  return out;
+}
+
 async function loadWorldEvents() {
   try {
-    const res = await fetch("/api/world_model/events?limit=20");
+    // Pull a bigger window so collapsing has signal — the panel still
+    // renders ~20 rows, but they each represent a real change rather
+    // than a flicker.
+    const res = await fetch("/api/world_model/events?limit=120");
     if (!res.ok) return;
     const body = await res.json();
     const list = document.getElementById("world-events-list");
@@ -3014,8 +3051,9 @@ async function loadWorldEvents() {
         '<div class="who-empty">No events yet (last 12h).</div>';
       return;
     }
+    const coalesced = _coalesceEvents(events).slice(0, 25);
     list.innerHTML = "";
-    events.forEach((ev) => list.appendChild(renderEventRow(ev)));
+    coalesced.forEach((ev) => list.appendChild(renderEventRow(ev)));
   } catch (err) {
     console.warn("[loadWorldEvents] failed:", err);
   }
@@ -3062,8 +3100,10 @@ function renderInteractionRow(ev) {
   const room = ev.room
     ? `<span class="event-room">${escapeHtml(ev.room)}</span>`
     : "";
-  const thumb = ev.thumbnail_url
-    ? `<img class="interaction-thumb" src="${ev.thumbnail_url}"
+  const hasThumb = !!ev.thumbnail_url;
+  const thumb = hasThumb
+    ? `<img class="interaction-thumb interaction-thumb-clickable"
+            src="${ev.thumbnail_url}"
             alt="snapshot" loading="lazy"
             onerror="this.style.display='none';" />`
     : '<div class="interaction-thumb empty"></div>';
@@ -3081,7 +3121,56 @@ function renderInteractionRow(ev) {
       <div class="interaction-meta">${room}<span class="interaction-ago">${ago}</span></div>
     </div>
   `;
+  if (hasThumb) {
+    const img = div.querySelector("img");
+    if (img) {
+      img.title = "Click to enlarge";
+      img.addEventListener("click", () => openImageLightbox(
+        ev.thumbnail_url,
+        sentence,
+        ev.ts,
+      ));
+    }
+  }
   return div;
+}
+
+// Simple lightbox for full-size snapshot viewing — used by the
+// interactions thumbnail click handler. Reuses the modal-overlay CSS.
+
+function _imgLightboxKeydown(e) {
+  if (e.key === "Escape") closeImageLightbox();
+}
+
+function closeImageLightbox() {
+  const m = document.getElementById("img-lightbox");
+  if (m) m.remove();
+  document.removeEventListener("keydown", _imgLightboxKeydown);
+}
+
+function openImageLightbox(url, caption, ts) {
+  closeImageLightbox();
+  const overlay = document.createElement("div");
+  overlay.id = "img-lightbox";
+  overlay.className = "modal-overlay img-lightbox-overlay";
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) closeImageLightbox();
+  });
+  const tsStr = ts ? new Date(ts).toLocaleString() : "";
+  overlay.innerHTML = `
+    <div class="lightbox-card">
+      <button class="modal-close lightbox-close" aria-label="Close">×</button>
+      <img class="lightbox-img" src="${url}" alt="snapshot" />
+      <div class="lightbox-caption">
+        <span>${escapeHtml(caption || "")}</span>
+        <span class="lightbox-ts">${escapeHtml(tsStr)}</span>
+      </div>
+    </div>`;
+  overlay.querySelector(".lightbox-close").addEventListener(
+    "click", closeImageLightbox
+  );
+  document.body.appendChild(overlay);
+  document.addEventListener("keydown", _imgLightboxKeydown);
 }
 
 async function loadInteractions() {
@@ -3307,6 +3396,7 @@ setInterval(loadClownStatus, 8000);
 const _SETTINGS_WM_LABELS = {
   visibility_grace_misses: "Visibility grace (missed frames)",
   visibility_grace_seconds: "Visibility grace (seconds)",
+  person_continuity_seconds: "Person continuity (seconds)",
   movement_jitter_threshold: "Movement jitter threshold (0-1)",
   posture_debounce_frames: "Posture debounce (frames)",
   interaction_debounce_frames: "Interaction debounce (frames)",
