@@ -771,6 +771,20 @@ class WorldModel:
         metadata: Optional[dict] = None,
     ) -> None:
         ts = obs.ts if obs else datetime.utcnow()
+        # For cat/dog events, blend the observation's visual descriptors
+        # into event metadata so §22.5's AnimalClusterBuilder has signal
+        # to work with at cold-start. Color histogram is excluded — too
+        # large for the per-event log; cluster builder uses color_class
+        # + room + size, which is sufficient for the household's
+        # discriminating pairs (Spooky/Velcro by room, Sparta/Serval by
+        # size).
+        merged_metadata: dict = dict(metadata or {})
+        if obs is not None and obs.obj_class in ("cat", "dog"):
+            for k in ("color_class", "size_normalized",
+                      "coat_texture", "breed_class"):
+                v = obs.metadata.get(k)
+                if v is not None and k not in merged_metadata:
+                    merged_metadata[k] = v
         payload = {
             "id": str(uuid.uuid4()),
             "ts": ts.isoformat(),
@@ -788,7 +802,7 @@ class WorldModel:
             "state": ent.state.value,
             "confidence": ent.confidence,
             "snapshot_path": (obs.metadata.get("crop_path") if obs else None),
-            "metadata": metadata or {},
+            "metadata": merged_metadata,
         }
         await self.store.append_event(payload)
         await self.bus.publish("world.entity_event", payload)

@@ -17,6 +17,10 @@ from modules.world_model.pets import (
     BehavioralProfileBuilder,
     bootstrap_pets_from_config,
 )
+from modules.world_model.cluster_builder import (
+    AnimalClusterBuilder,
+    apply_cluster_labels,
+)
 
 __all__ = [
     "EntityState",
@@ -30,4 +34,6 @@ __all__ = [
     "Affinity",
     "BehavioralProfileBuilder",
     "bootstrap_pets_from_config",
+    "AnimalClusterBuilder",
+    "apply_cluster_labels",
 ]
