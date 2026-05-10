@@ -30,12 +30,39 @@ Classes: MicSourceWakeAdapter
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncIterator, Optional
+import math
+import time
+from typing import AsyncIterator, Awaitable, Callable, Optional
 
 import numpy as np
 from loguru import logger
 
 from modules.voice.sources.base import MicCallback, MicSource
+
+
+# Audio-level tap signature: (room, rms_db, peak_db, sample_rate).
+# rms_db and peak_db are dBFS (negative numbers; 0 = clipping). Used by
+# the dashboard to render per-room mic bars for wake-word diagnosis.
+AudioLevelTap = Callable[[str, float, float, int], Awaitable[None]]
+
+
+def _pcm_levels(pcm: bytes) -> tuple[float, float]:
+    """Return (rms_db, peak_db) for int16 PCM bytes. dBFS scale; -90
+    floor when input is silence."""
+    if not pcm:
+        return -90.0, -90.0
+    samples = np.frombuffer(pcm, dtype=np.int16)
+    if samples.size == 0:
+        return -90.0, -90.0
+    # Avoid float overflow on the square — promote to int64 first.
+    sq = samples.astype(np.int64)
+    sq = sq * sq
+    mean = float(sq.mean())
+    rms = math.sqrt(mean) if mean > 0 else 0.0
+    peak = float(np.max(np.abs(samples)))
+    rms_db = 20.0 * math.log10(rms / 32768.0) if rms > 0 else -90.0
+    peak_db = 20.0 * math.log10(peak / 32768.0) if peak > 0 else -90.0
+    return max(rms_db, -90.0), max(peak_db, -90.0)
 
 # OWW's required frame size; chunks shorter than this get padded by the
 # WakeRunner with a logged warning. Chunks longer get split.
@@ -80,6 +107,13 @@ class MicSourceWakeAdapter:
         # detection on top.
         self._recording_tap: Optional[MicCallback] = None
         self._recording_sample_rate: int = 16000
+        # Audio-level tap: see AudioLevelTap. Computed once per chunk and
+        # forwarded for the dashboard's per-room mic bars. Throttled to
+        # one event per `_audio_level_min_interval_s` per room so a fast
+        # mic at 80ms chunks doesn't drown the WebSocket.
+        self._audio_level_tap: Optional[AudioLevelTap] = None
+        self._audio_level_last_emit: float = 0.0
+        self._audio_level_min_interval_s: float = 0.1  # ~10Hz
 
     @property
     def room(self) -> str:
@@ -122,6 +156,16 @@ class MicSourceWakeAdapter:
         """Remove the recording tap. No-op if none was attached."""
         self._recording_tap = None
 
+    def attach_audio_level_tap(self, callback: AudioLevelTap) -> None:
+        """Install an audio-level tap. RMS + peak (dBFS) are computed
+        per chunk and forwarded to `callback` at ~10Hz. Used by the
+        dashboard to render per-room mic bars for wake-word debugging."""
+        self._audio_level_tap = callback
+
+    def detach_audio_level_tap(self) -> None:
+        """Remove the audio-level tap. No-op if none was attached."""
+        self._audio_level_tap = None
+
     @property
     def recording_sample_rate(self) -> int:
         """Best-known sample rate for chunks delivered to the recording tap.
@@ -153,6 +197,21 @@ class MicSourceWakeAdapter:
                 logger.warning(
                     f"[WakeAdapter:{self.room}] recording tap raised: {e}"
                 )
+        # Audio-level tap — throttled. Compute once per chunk; emit only
+        # if enough wall time has passed since the last emit. Wake-debug
+        # bars don't need every 80ms sample.
+        level_tap = self._audio_level_tap
+        if level_tap is not None:
+            now = time.monotonic()
+            if now - self._audio_level_last_emit >= self._audio_level_min_interval_s:
+                self._audio_level_last_emit = now
+                try:
+                    rms_db, peak_db = _pcm_levels(pcm)
+                    await level_tap(self.room, rms_db, peak_db, sample_rate)
+                except Exception as e:
+                    logger.debug(
+                        f"[WakeAdapter:{self.room}] audio_level tap raised: {e}"
+                    )
         target_bytes = _OWW_CHUNK_SIZE * 2  # int16 = 2 bytes per sample
         self._partial.extend(pcm)
         while len(self._partial) >= target_bytes:

@@ -133,7 +133,7 @@ function applyEvent(event) {
       updateRoomVision(event.room, event);
       break;
     case "audio_level":
-      updateRoomAudio(event.room, event.db);
+      updateRoomAudio(event.room, event.db, event.peak_db);
       break;
     case "reminder_added":
       addReminder(event);
@@ -547,10 +547,11 @@ function updateRoomVision(roomId, data) {
   setTimeout(() => card.classList.remove("active"), 2000);
 }
 
-function updateRoomAudio(roomId, db) {
+function updateRoomAudio(roomId, db, peakDb) {
   if (!roomId || db == null) return;
   roomsCache[roomId] = Object.assign({}, roomsCache[roomId] || {}, {
     audio_db: db,
+    audio_peak_db: peakDb,
   });
   const card = document.getElementById(`room-${roomId}`);
   if (!card) return;
@@ -558,15 +559,38 @@ function updateRoomAudio(roomId, db) {
   if (!meter) {
     meter = document.createElement("div");
     meter.className = "room-meter";
-    meter.innerHTML = '<div class="room-meter-fill"></div><div class="room-meter-label">—</div>';
+    meter.innerHTML = `
+      <div class="room-meter-fill"></div>
+      <div class="room-meter-peak"></div>
+      <div class="room-meter-label">—</div>`;
     card.appendChild(meter);
   }
-  // Map -60 dBFS → 0%, 0 dBFS → 100%, clamp.
-  const pct = Math.max(0, Math.min(100, Math.round((db + 60) * (100 / 60))));
+  // Map -60 dBFS → 0%, 0 dBFS → 100%, clamp. Peak is rendered as a
+  // thin marker line so we can see clipping margins for wake-word
+  // debugging.
+  const dbToPct = (v) => Math.max(0, Math.min(100, Math.round((v + 60) * (100 / 60))));
+  const pct = dbToPct(db);
+  const peakPct = peakDb != null ? dbToPct(peakDb) : null;
   const fill = meter.querySelector(".room-meter-fill");
+  const peak = meter.querySelector(".room-meter-peak");
   const label = meter.querySelector(".room-meter-label");
-  if (fill) fill.style.width = `${pct}%`;
-  if (label) label.textContent = `${db.toFixed(0)} dBFS`;
+  if (fill) {
+    fill.style.width = `${pct}%`;
+    // Visual cue for clipping risk: turn the fill warmer above -6dB.
+    fill.classList.toggle("hot", db > -6);
+  }
+  if (peak && peakPct != null) {
+    peak.style.left = `${peakPct}%`;
+    peak.style.display = "block";
+    peak.classList.toggle("clipping", peakDb > -1);
+  } else if (peak) {
+    peak.style.display = "none";
+  }
+  if (label) {
+    label.textContent = peakDb != null
+      ? `${db.toFixed(0)} / pk ${peakDb.toFixed(0)} dBFS`
+      : `${db.toFixed(0)} dBFS`;
+  }
 }
 
 function updateNodeStatus(roomId, online) {

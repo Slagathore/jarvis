@@ -601,7 +601,7 @@ main {
 
 .room-meter {
   position: relative;
-  height: 6px;
+  height: 8px;
   margin-top: 6px;
   background: var(--border);
   border-radius: 3px;
@@ -613,7 +613,24 @@ main {
   inset: 0 auto 0 0;
   width: 0%;
   background: linear-gradient(90deg, var(--green), var(--amber), var(--red));
-  transition: width 0.15s ease-out;
+  transition: width 0.1s ease-out;
+}
+.room-meter-fill.hot {
+  filter: brightness(1.3) saturate(1.4);
+}
+
+.room-meter-peak {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 2px;
+  background: rgba(255,255,255,0.85);
+  pointer-events: none;
+  transition: left 0.08s ease-out;
+  display: none;
+}
+.room-meter-peak.clipping {
+  background: var(--red, #ff4060);
+  box-shadow: 0 0 6px var(--red, #ff4060);
 }
 
 .room-meter-label {

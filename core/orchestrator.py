@@ -452,7 +452,24 @@ class Orchestrator:
                 )
                 continue
             try:
-                self.wake_sources.register(MicSourceWakeAdapter(src))
+                adapter = MicSourceWakeAdapter(src)
+                # Audio-level tap — publishes per-room mic RMS / peak to
+                # the bus. The existing _on_audio_level subscriber
+                # forwards to the dashboard so the UI bars work the same
+                # way as the office PC mic (which goes through wake_word).
+                # Throttled to ~10Hz inside the adapter.
+                async def _level_cb(
+                    room: str, rms_db: float, peak_db: float,
+                    sample_rate: int,
+                ) -> None:
+                    await self.bus.publish("audio.level", {
+                        "room": room,
+                        "db": rms_db,
+                        "peak_db": peak_db,
+                        "sample_rate": sample_rate,
+                    })
+                adapter.attach_audio_level_tap(_level_cb)
+                self.wake_sources.register(adapter)
                 logger.info(f"[Init] Registered wake adapter for '{room_id}'")
             except Exception as e:
                 logger.warning(
@@ -746,12 +763,20 @@ class Orchestrator:
         return fallback
 
     async def _on_audio_level(self, event: dict) -> None:
-        """Forward periodic mic dBFS readings from wake_word to the dashboard."""
-        await self._broadcast({
+        """Forward periodic mic dBFS readings from wake_word + wake adapters
+        to the dashboard. Wake_word emits {room, db}; wake adapters emit
+        the richer {room, db, peak_db, sample_rate}. Forward whatever's
+        present so the bar widgets see both fields when available."""
+        payload = {
             "type": "audio_level",
             "room": event.get("room", "office"),
             "db": event.get("db", -100.0),
-        })
+        }
+        if "peak_db" in event:
+            payload["peak_db"] = event["peak_db"]
+        if "sample_rate" in event:
+            payload["sample_rate"] = event["sample_rate"]
+        await self._broadcast(payload)
 
     # ── Wake Word + Conversation Pipeline ─────────────────────────────────
 
