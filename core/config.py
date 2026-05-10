@@ -337,6 +337,330 @@ def validate_personas(config: dict) -> tuple[dict[str, PersonaConfig], str, Pers
     return out, overlay.strip(), revert_cfg
 
 
+# ── World Model config (§7, §22, §32) ────────────────────────────────────────
+
+
+# Allowed values for various typed enums in the world_model config tree.
+# Maintained here (not in the world_model module) because we want the
+# typed validators in this file to be the single source of truth at
+# startup; the runtime can still defensively accept extras at the
+# raw-dict level if it has to, but config-loaded values must conform.
+_AFFINITY_CONTEXTS: tuple[str, ...] = (
+    "sleeping", "physical_contact", "rubbing",
+    "proximity_general", "authority", "feeding",
+)
+# Note: affinity `strength` is enforced by Literal["low","medium","high"]
+# on AffinityCfg directly — Pydantic raises on bad input there.
+_KNOWN_TRACKED_SPECIES: tuple[str, ...] = ("cat", "dog")
+
+
+class ExitDef(BaseModel):
+    """One exit polygon in a room's world_model.exits list. Drives the
+    bounded-house disappearance state machine (§17): bbox center inside
+    a `to_room` polygon → TRANSITIONING; inside `exterior_exit` → DEPARTED;
+    inside `to_unmonitored_zone` → IN_HOUSE_UNMONITORED."""
+    kind: Literal["to_room", "to_unmonitored_zone", "exterior_exit"]
+    polygon: list[list[float]]
+    # to_room → next room id; exterior_exit → human-readable name (e.g.
+    # "front_door"); to_unmonitored_zone → unmonitored room id.
+    to: Optional[str] = None
+    name: Optional[str] = None
+
+
+class LandmarkDef(BaseModel):
+    """A named region inside a room frame. §22.9 dwell-event firing
+    (litterbox_visit etc.) hangs off these names."""
+    name: str
+    polygon: list[list[float]]
+
+
+class RoomWorldModelCfg(BaseModel):
+    """Per-room geometry block. Optional in YAML — rooms without it
+    get a default `enabled=true` shell wired by orchestrator boot."""
+    enabled: bool = True
+    frame_width: int = 640
+    frame_height: int = 480
+    exits: list[ExitDef] = Field(default_factory=list)
+    landmarks: list[LandmarkDef] = Field(default_factory=list)
+
+
+class WorldModelNightlyCfg(BaseModel):
+    """Knobs for the §22.6 nightly profile rebuild loop."""
+    interval_hours: float = 24.0
+    startup_grace_seconds: float = 60.0
+    profile_days_back: int = 30
+
+
+class WorldModelCfg(BaseModel):
+    """Top-level world_model: block. Distinct from per-room blocks
+    above — this is the household-wide configuration."""
+    tracked_species: list[str] = Field(
+        default_factory=lambda: list(_KNOWN_TRACKED_SPECIES)
+    )
+    visiting_animal_retention_minutes: int = 60
+    nightly: WorldModelNightlyCfg = Field(
+        default_factory=WorldModelNightlyCfg
+    )
+
+
+class ResidentCfg(BaseModel):
+    """One human resident — links a config-level token (cole/anna/jeff)
+    to a display_name + primary_room. The token is what pets reference
+    via household_owner / affinity.person."""
+    id: str
+    display_name: str
+    primary_room: Optional[str] = None
+
+
+class AffinityCfg(BaseModel):
+    person: str
+    strength: Literal["low", "medium", "high"]
+    contexts: list[str] = Field(default_factory=list)
+
+
+class PetCommonCfg(BaseModel):
+    """Shared fields between PetCatCfg and PetDogCfg. Keeping them in
+    one base avoids drift between the two species blocks."""
+    name: str
+    household_owner: Optional[str] = None
+    expected_size: Optional[str] = None
+    size_basis: Optional[str] = None
+    color_class: Optional[str] = None
+    personality: Optional[str] = None
+    archived: bool = False
+    affinities: list[AffinityCfg] = Field(default_factory=list)
+    notes: Optional[str] = None
+
+
+class PetCatCfg(PetCommonCfg):
+    coat_length: Optional[str] = None
+    coat_texture: Optional[str] = None
+    home_room: Optional[str] = None
+    cyclic_home_rooms: list[str] = Field(default_factory=list)
+    unmonitored_home: Optional[str] = None
+    preferred_perches: list[str] = Field(default_factory=list)
+    preferred_landmarks: list[str] = Field(default_factory=list)
+    conflicts_with: list[str] = Field(default_factory=list)
+    hyper_alert_to: list[str] = Field(default_factory=list)
+    distinctive_features: list[str] = Field(default_factory=list)
+    sees_ghosts: bool = False
+    age_state: Optional[str] = None
+
+
+class PetDogCfg(PetCommonCfg):
+    breed_class: Optional[str] = None
+    home_rooms: list[str] = Field(default_factory=list)
+    feeding_room: Optional[str] = None
+    anxiety_triggers: list[str] = Field(default_factory=list)
+    nicknames: list[str] = Field(default_factory=list)
+
+
+class PetsCfg(BaseModel):
+    cats: list[PetCatCfg] = Field(default_factory=list)
+    dogs: list[PetDogCfg] = Field(default_factory=list)
+
+
+def validate_world_model_config(
+    config: dict,
+) -> tuple[
+    Optional[WorldModelCfg],
+    list[ResidentCfg],
+    Optional[PetsCfg],
+    dict[str, RoomWorldModelCfg],
+]:
+    """Validate the world_model / residents / pets / per-room
+    world_model blocks together. Cross-references enforced:
+      • every pet's household_owner is a known resident.id
+      • every affinity.person is a known resident.id
+      • affinity contexts ∈ enum
+      • exit.to_room refers to an existing rooms[].id
+      • tracked_species and pets.* are consistent (warn-only on extras)
+
+    Returns (wm_cfg, residents, pets, rooms_wm) — any of which may be
+    None / empty when not declared. Raises ConfigError on cross-ref
+    violations or pydantic field errors. Polygon issues (<3 points,
+    out of frame) are logged as warnings only — they're geometry,
+    not config schema, and the polygon viewer is the right place to
+    fix them at runtime.
+    """
+    # ── Top-level world_model: ─────────────────────────────────────
+    wm_cfg: Optional[WorldModelCfg] = None
+    raw_wm = config.get("world_model")
+    if raw_wm is not None:
+        if not isinstance(raw_wm, dict):
+            raise ConfigError(
+                "config.yaml: 'world_model' must be a mapping, got "
+                f"{type(raw_wm).__name__}"
+            )
+        try:
+            wm_cfg = WorldModelCfg.model_validate(raw_wm)
+        except ValidationError as e:
+            first = e.errors()[0]
+            loc = ".".join(str(p) for p in first.get("loc", ()))
+            raise ConfigError(
+                f"config.yaml: 'world_model.{loc}' invalid: "
+                f"{first.get('msg', 'validation failed')}"
+            ) from e
+
+    # ── residents: ─────────────────────────────────────────────────
+    residents: list[ResidentCfg] = []
+    raw_residents = config.get("residents") or []
+    if not isinstance(raw_residents, list):
+        raise ConfigError(
+            f"config.yaml: 'residents' must be a list, got "
+            f"{type(raw_residents).__name__}"
+        )
+    seen_ids: set[str] = set()
+    for idx, raw in enumerate(raw_residents):
+        if not isinstance(raw, dict):
+            raise ConfigError(
+                f"config.yaml: residents[{idx}] must be a mapping"
+            )
+        try:
+            r = ResidentCfg.model_validate(raw)
+        except ValidationError as e:
+            first = e.errors()[0]
+            raise ConfigError(
+                f"config.yaml: resident[{idx}] invalid at "
+                f"'{'.'.join(str(p) for p in first.get('loc', ()))}': "
+                f"{first.get('msg')}"
+            ) from e
+        if r.id in seen_ids:
+            raise ConfigError(
+                f"config.yaml: duplicate resident id '{r.id}'"
+            )
+        seen_ids.add(r.id)
+        residents.append(r)
+
+    # ── pets: ───────────────────────────────────────────────────────
+    pets: Optional[PetsCfg] = None
+    raw_pets = config.get("pets")
+    if raw_pets is not None:
+        if not isinstance(raw_pets, dict):
+            raise ConfigError(
+                f"config.yaml: 'pets' must be a mapping, got "
+                f"{type(raw_pets).__name__}"
+            )
+        try:
+            pets = PetsCfg.model_validate(raw_pets)
+        except ValidationError as e:
+            first = e.errors()[0]
+            loc = ".".join(str(p) for p in first.get("loc", ()))
+            raise ConfigError(
+                f"config.yaml: 'pets.{loc}' invalid: "
+                f"{first.get('msg', 'validation failed')}"
+            ) from e
+
+    # ── Cross-references: pets ↔ residents ─────────────────────────
+    # Note: PetCatCfg / PetDogCfg both inherit PetCommonCfg, so iterating
+    # them as a flat sequence is type-safe at runtime; we annotate the
+    # collection as Sequence[PetCommonCfg] to satisfy invariant `list`
+    # type-checker complaints.
+    resident_ids = {r.id for r in residents}
+    if pets is not None:
+        from typing import Sequence
+        all_pets: Sequence[PetCommonCfg] = [*pets.cats, *pets.dogs]
+        for p in all_pets:
+            if (p.household_owner is not None
+                    and p.household_owner not in resident_ids):
+                raise ConfigError(
+                    f"config.yaml: pet '{p.name}' household_owner="
+                    f"'{p.household_owner}' is not a declared resident "
+                    f"(known: {sorted(resident_ids) or '[]'})"
+                )
+            for aff in p.affinities:
+                if aff.person not in resident_ids:
+                    raise ConfigError(
+                        f"config.yaml: pet '{p.name}' affinity references "
+                        f"unknown resident '{aff.person}' "
+                        f"(known: {sorted(resident_ids) or '[]'})"
+                    )
+                bad_ctx = [
+                    c for c in aff.contexts
+                    if c not in _AFFINITY_CONTEXTS
+                ]
+                if bad_ctx:
+                    raise ConfigError(
+                        f"config.yaml: pet '{p.name}' affinity has invalid "
+                        f"context(s) {bad_ctx} for resident '{aff.person}'. "
+                        f"Allowed: {list(_AFFINITY_CONTEXTS)}"
+                    )
+
+    # ── Cross-references: tracked_species ↔ pets ───────────────────
+    if wm_cfg is not None and pets is not None:
+        if "cat" not in wm_cfg.tracked_species and pets.cats:
+            logger.warning(
+                f"[Config] {len(pets.cats)} cat(s) declared but 'cat' "
+                "missing from world_model.tracked_species — they won't "
+                "be tracked at runtime"
+            )
+        if "dog" not in wm_cfg.tracked_species and pets.dogs:
+            logger.warning(
+                f"[Config] {len(pets.dogs)} dog(s) declared but 'dog' "
+                "missing from world_model.tracked_species"
+            )
+
+    # ── Per-room world_model: blocks ───────────────────────────────
+    rooms_wm: dict[str, RoomWorldModelCfg] = {}
+    room_ids: set[str] = set()
+    for raw_room in config.get("rooms", []) or []:
+        if not isinstance(raw_room, dict):
+            continue
+        rid = raw_room.get("id")
+        if not rid:
+            continue
+        room_ids.add(rid)
+        raw_block = raw_room.get("world_model")
+        if raw_block is None:
+            continue
+        if not isinstance(raw_block, dict):
+            raise ConfigError(
+                f"config.yaml: rooms.{rid}.world_model must be a "
+                f"mapping, got {type(raw_block).__name__}"
+            )
+        try:
+            block = RoomWorldModelCfg.model_validate(raw_block)
+        except ValidationError as e:
+            first = e.errors()[0]
+            loc = ".".join(str(p) for p in first.get("loc", ()))
+            raise ConfigError(
+                f"config.yaml: rooms.{rid}.world_model.{loc}: "
+                f"{first.get('msg', 'validation failed')}"
+            ) from e
+        rooms_wm[rid] = block
+
+    # ── Cross-references: exits.to_room → existing room id ─────────
+    for rid, block in rooms_wm.items():
+        for i, ex in enumerate(block.exits):
+            # exterior_exit needs a name; to_room/to_unmonitored need `to`
+            if ex.kind == "exterior_exit" and not ex.name:
+                raise ConfigError(
+                    f"config.yaml: rooms.{rid}.world_model.exits[{i}] "
+                    "exterior_exit missing 'name' (used in alarm copy)"
+                )
+            if ex.kind in ("to_room", "to_unmonitored_zone") and not ex.to:
+                raise ConfigError(
+                    f"config.yaml: rooms.{rid}.world_model.exits[{i}] "
+                    f"{ex.kind} missing 'to' field"
+                )
+            if ex.kind == "to_room" and ex.to not in room_ids:
+                raise ConfigError(
+                    f"config.yaml: rooms.{rid}.world_model.exits[{i}] "
+                    f"to_room references unknown room '{ex.to}' "
+                    f"(known: {sorted(room_ids)})"
+                )
+            # Polygon shape sanity — warn-only, geometry is hands-on
+            # via the polygon viewer.
+            if len(ex.polygon) < 3:
+                logger.warning(
+                    f"[Config] rooms.{rid}.world_model.exits[{i}] "
+                    f"polygon has {len(ex.polygon)} points (need ≥3); "
+                    "exit detection won't fire until fixed"
+                )
+
+    return wm_cfg, residents, pets, rooms_wm
+
+
 # ── Public entry points ──────────────────────────────────────────────────────
 
 
@@ -464,4 +788,21 @@ def expand_and_validate(config: dict) -> tuple[dict, list[RoomConfig]]:
         expanded["_typed_personas"] = personas
         expanded["_persona_overlay"] = overlay
         expanded["_persona_revert_cfg"] = revert_cfg
+    # World Model + residents + pets validation (§7, §22, §32 cross-refs).
+    # Same pattern as personas: stash typed results on the dict so
+    # downstream consumers can grab them without re-validating, and
+    # cross-reference errors fail at boot instead of at observation time.
+    try:
+        wm_cfg, residents, pets, rooms_wm = validate_world_model_config(
+            expanded
+        )
+        expanded["_typed_world_model"] = wm_cfg
+        expanded["_typed_residents"] = residents
+        expanded["_typed_pets"] = pets
+        expanded["_typed_rooms_world_model"] = rooms_wm
+    except ConfigError:
+        # Re-raise so boot fails fast — but log the section first so the
+        # error message in the user's terminal makes it obvious WHY.
+        logger.error("[Config] world_model / residents / pets validation failed")
+        raise
     return expanded, rooms

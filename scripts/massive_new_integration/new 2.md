@@ -21,8 +21,9 @@ A complete spec for adding persistent entity tracking on top of the existing Jar
 6. [Event Taxonomy](#6-event-taxonomy) <!-- DONE 2026-05-10: EventType enum in types.py -->
 7. [Camera Topology Config](#7-camera-topology-config) <!-- DONE 2026-05-10: world_model: blocks added to all 5 rooms in config.yaml with placeholder polygons + REPLACE_ME comments. Pydantic validates clean. Real polygon coordinates need tuning against live frames in the polygon-viewer dashboard (Phase 3.4). -->
 8. [Storage Layer (Async, Linked to persons)](#8-storage-layer-async-linked-to-persons) <!-- DONE 2026-05-10: WorldStore.ensure_schema covers all three tables -->
-9. [Identity Integration: Who vs. Where](#9-identity-integration-who-vs-where)
-10. [Auto-Enrollment Inside IdentityManager](#10-auto-enrollment-inside-identitymanager)
+9. [Identity Integration: Who vs. Where](#9-identity-integration-who-vs-where) <!-- DONE 2026-05-10: ObservationBuilder calls IdentityManager.identify_from_embedding_async; ambiguous matches now skipped (review-driven Bug 3 fix); WorldModel emits NAME_LINKED on anonymous→named resolution and respects identity-overrode-continuity per §9. -->
+10. [Auto-Enrollment Inside IdentityManager](#10-auto-enrollment-inside-identitymanager) <!-- DONE 2026-05-10: IdentityManager.consider_new_sample_async lands the §10 diversity-replacement coreset — quality gates (face area / yaw / pitch / blur / association_confidence), pause-during-merge-ambiguity, near-duplicate rejection at 0.95, capacity cap of 30, swap-most-redundant only when it increases diversity. WorldModel passes face_area_px + association_confidence through. Voice-side coreset is a future variant (constants present). -->
+
 11. [The ArcFace Upgrade (Done From Day One)](#11-the-arcface-upgrade-done-from-day-one) <!-- DONE 2026-05-10 (code): face_recognizer.py rewritten on InsightFace buffalo_l, IdentityManager filters/writes model_version, face thresholds bumped to ArcFace scale (0.5/0.10). Live enrollment test (Cole + Anna 5 photos each, identify ≥0.6 + margin gating refusal) is gated on dashboard re-enrollment — pending. -->
 12. [The ObservationBuilder Adapter](#12-the-observationbuilder-adapter) <!-- DONE 2026-05-10: observation_builder.py written, per-room polling at fps_active, identity_from_embedding_async added to IM -->
 <!-- §18 (Full Code: ObservationBuilder) DONE 2026-05-10 — adapted to repo's pull-style capture_frame_async API; 5 fps → 10 obs / 2 s verified -->
@@ -42,12 +43,14 @@ A complete spec for adding persistent entity tracking on top of the existing Jar
 24. [Phase 5: Interactions](#24-phase-5-interactions)
 25. [Phase 5: Cross-Day Patterns & Anomalies](#25-phase-5-cross-day-patterns--anomalies)
 26. [Build Order with Verification Gates](#26-build-order-with-verification-gates) <!-- 2026-05-10: Phase 1 code complete (1.1–1.6, §19 synthetic tests pass); Phase 2 config polygons placed with REPLACE_ME markers; Phase 3.1 query tools verified; Phase 3.2 tool-registry wired; Phase 3.3 prompt snapshot verified at ~117 tokens; Phase 3.4 polygon viewer page + APIs serving (visit /polygons in dashboard). Hands-on gates (Phase 1.7 under-desk live test, Phase 2 polygon-tuning walks, Phase 3.2 LLM-tool-pick observation, Phase 3 demo gate) remain pending until you can run Jarvis. -->
-27. [Failure Modes & Defenses](#27-failure-modes--defenses)
-28. [Tunables Reference](#28-tunables-reference)
+27. [Failure Modes & Defenses](#27-failure-modes--defenses) <!-- REFERENCE 2026-05-10: prose-only chapter; the defenses it describes (drift verification, camera-degraded suspension, hysteresis, archive-aware candidate filtering, pause-during-ambiguity, dim guard) are all implemented and cited inline in their owning modules. No standalone code. -->
+28. [Tunables Reference](#28-tunables-reference) <!-- REFERENCE 2026-05-10: prose-only chapter; tunables live as constants near their use-site (ACTIVE_FACE_*, SAMPLES_*, _COST_WEIGHTS, ENROLLMENT_QUALITY_GATES, etc.) plus the world_model.* config block. No standalone code. -->
+
 29. [Alarm Subsystem](#29-alarm-subsystem) <!-- DONE 2026-05-10 (framework + cat-escape): modules/safety/alarms/{state,alarm,audio,dispatcher,cat_escape}.py. AlarmDispatcher with priority + audio-owner + voice-silence; Alarm base class with state machine + condition-clearance auto-resolve + mute-timer rearm + per-cat / global suppression; CatEscapeAlarm subscribes to vision.observation + world.entity_event. 7-scenario synthetic test pass. DoorOpenAlarm + FireAlarm classes still pending — both require additional detector signals (door-state vision, fire detector) that aren't in scope yet. -->
 30. [Wake Words and Personas](#30-wake-words-and-personas)
 31. [Notification Dispatcher](#31-notification-dispatcher) <!-- DONE 2026-05-10: modules/notifications/{dispatcher,channels}.py with Alert dataclass, NotificationDispatcher, NtfyChannel/TelegramChannel/HAChannel, build_channels_from_config factory, persistent delivery log; legacy NotificationManager preserved at modules.notifications.manager. Routing + per-channel error capture + delivery-log roundtrip verified. Live phone-side test (§31.4 dashboard test buttons + Cole's phone) pending. -->
-32. [v4 Schema Migrations Summary](#32-v4-schema-migrations-summary)
+32. [v4 Schema Migrations Summary](#32-v4-schema-migrations-summary) <!-- DONE 2026-05-10: world_entities (+ household_owner_id / unmonitored_home_room / archived_at / is_resident), pet_affinities, alarm_state, alarm_fires, door_state all created via WorldStore.ensure_schema; notification_deliveries created lazily by NotificationDispatcher. Schema-validation cross-references enforced by core.config.validate_world_model_config (resident-owner / affinity / context / exit.to_room). Polygon bounds enforced as warnings only — geometry is hands-on via the polygon viewer. -->
+
 
 ---
 

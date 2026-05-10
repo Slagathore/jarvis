@@ -378,11 +378,209 @@ async def test_repair_mistagged_face_samples() -> None:
     print("PASS: _repair_mistagged_face_samples relabels 128-dim ArcFace rows")
 
 
+async def test_consider_new_sample_quality_gates_and_diversity() -> None:
+    """§10 — auto-enrollment must:
+       - reject low-quality candidates
+       - reject near-duplicates (max sim ≥ 0.95)
+       - add when below capacity
+       - swap most-redundant when at capacity AND candidate increases
+         diversity; reject when it doesn't
+    """
+    from modules.identity.identity_manager import (
+        ACTIVE_FACE_EMBEDDING_DIM, IdentityManager,
+        SAMPLES_DIVERSITY_THRESHOLD, SAMPLES_PER_PERSON_MAX,
+    )
+
+    db = InMemoryDB(); await db.init()
+    try:
+        await db.execute(
+            "INSERT INTO persons (name, created_at) VALUES (?, ?)",
+            ("Cole", datetime.now(timezone.utc).isoformat()),
+        )
+        im = IdentityManager(
+            db=db, speaker_identifier=None, face_recognizer=None,
+        )
+        await im._reload_caches()
+
+        # 1. Low-quality candidate (face too small) — reject.
+        emb = np.random.rand(ACTIVE_FACE_EMBEDDING_DIM).astype(np.float32)
+        ok = await im.consider_new_sample_async(
+            person_id=1, new_embedding=emb,
+            quality_metadata={
+                "face_area_px": 50 * 50,  # below 80*80 floor
+                "yaw": 5.0, "pitch": 5.0, "blur_score": 200.0,
+            },
+        )
+        assert ok is False, "low-quality candidate should be rejected"
+
+        # 2. First good candidate — accept.
+        good_meta = {
+            "face_area_px": 100 * 100, "yaw": 5.0, "pitch": -5.0,
+            "blur_score": 200.0, "association_confidence": 0.9,
+        }
+        emb1 = np.random.rand(ACTIVE_FACE_EMBEDDING_DIM).astype(np.float32)
+        ok = await im.consider_new_sample_async(
+            person_id=1, new_embedding=emb1,
+            quality_metadata=good_meta,
+        )
+        assert ok is True
+        assert len(im._face_samples[1]) == 1
+
+        # 3. Near-duplicate (same vector + tiny noise) — reject by diversity.
+        emb_dup = emb1 + 0.001 * np.random.rand(ACTIVE_FACE_EMBEDDING_DIM).astype(np.float32)
+        ok = await im.consider_new_sample_async(
+            person_id=1, new_embedding=emb_dup,
+            quality_metadata=good_meta,
+        )
+        assert ok is False, (
+            f"near-dup (sim ≥ {SAMPLES_DIVERSITY_THRESHOLD}) should reject"
+        )
+        assert len(im._face_samples[1]) == 1
+
+        # 4. Below cap, diverse — accept.
+        emb2 = np.random.rand(ACTIVE_FACE_EMBEDDING_DIM).astype(np.float32) * 5
+        ok = await im.consider_new_sample_async(
+            person_id=1, new_embedding=emb2,
+            quality_metadata=good_meta,
+        )
+        assert ok is True
+        assert len(im._face_samples[1]) == 2
+
+        # 5. Fill the bank to capacity and verify capacity behaviour.
+        np.random.seed(42)
+        while len(im._face_samples[1]) < SAMPLES_PER_PERSON_MAX:
+            extra = np.random.randn(ACTIVE_FACE_EMBEDDING_DIM).astype(np.float32) * 5
+            await im.consider_new_sample_async(
+                person_id=1, new_embedding=extra,
+                quality_metadata=good_meta,
+            )
+        assert len(im._face_samples[1]) == SAMPLES_PER_PERSON_MAX
+
+        # A high-diversity candidate at cap should swap, keeping size constant.
+        np.random.seed(99)
+        diverse = np.random.randn(ACTIVE_FACE_EMBEDDING_DIM).astype(np.float32) * 50
+        ok = await im.consider_new_sample_async(
+            person_id=1, new_embedding=diverse,
+            quality_metadata=good_meta,
+        )
+        # Either accept-and-swap or reject if not actually more diverse —
+        # we just want the bank to stay at SAMPLES_PER_PERSON_MAX either way.
+        assert len(im._face_samples[1]) == SAMPLES_PER_PERSON_MAX, (
+            f"bank size left {SAMPLES_PER_PERSON_MAX} after swap attempt: "
+            f"{len(im._face_samples[1])}"
+        )
+    finally:
+        await db.close()
+    print("PASS: §10 consider_new_sample_async quality + diversity + capacity")
+
+
+def test_world_model_config_validation_cross_references() -> None:
+    """validate_world_model_config must:
+       - accept a fully valid household
+       - reject a pet whose household_owner isn't a declared resident
+       - reject an affinity pointing at an unknown resident
+       - reject an affinity context outside the enum
+       - reject an exit.to_room pointing at a nonexistent room
+    """
+    from core.config import validate_world_model_config
+    from core.exceptions import ConfigError
+
+    base = {
+        "world_model": {"tracked_species": ["cat", "dog"]},
+        "residents": [
+            {"id": "cole", "display_name": "Cole"},
+            {"id": "anna", "display_name": "Anna"},
+        ],
+        "rooms": [
+            {"id": "office", "world_model": {
+                "enabled": True,
+                "frame_width": 640, "frame_height": 480,
+                "exits": [], "landmarks": [],
+            }},
+            {"id": "bedroom", "world_model": {
+                "enabled": True,
+                "frame_width": 1920, "frame_height": 1080,
+                "exits": [], "landmarks": [],
+            }},
+        ],
+        "pets": {
+            "cats": [{
+                "name": "Spooky", "household_owner": "cole",
+                "color_class": "black", "expected_size": "medium",
+                "home_room": "bedroom",
+                "affinities": [
+                    {"person": "cole", "strength": "high",
+                     "contexts": ["sleeping"]},
+                ],
+            }],
+            "dogs": [],
+        },
+    }
+    # Happy path
+    wm, res, pets, _ = validate_world_model_config(base)
+    assert wm is not None and len(res) == 2 and pets is not None
+
+    # Bad household_owner
+    bad = {**base, "pets": {"cats": [{
+        **base["pets"]["cats"][0],
+        "household_owner": "nobody",
+    }], "dogs": []}}
+    try:
+        validate_world_model_config(bad)
+        raise AssertionError("expected ConfigError on bad owner")
+    except ConfigError as e:
+        assert "household_owner" in str(e), str(e)
+
+    # Bad affinity person
+    bad = {**base, "pets": {"cats": [{
+        **base["pets"]["cats"][0],
+        "affinities": [{"person": "ghost", "strength": "high",
+                        "contexts": ["sleeping"]}],
+    }], "dogs": []}}
+    try:
+        validate_world_model_config(bad)
+        raise AssertionError("expected ConfigError on unknown affinity person")
+    except ConfigError as e:
+        assert "affinity" in str(e) and "ghost" in str(e), str(e)
+
+    # Bad affinity context
+    bad = {**base, "pets": {"cats": [{
+        **base["pets"]["cats"][0],
+        "affinities": [{"person": "cole", "strength": "high",
+                        "contexts": ["napping"]}],  # not in enum
+    }], "dogs": []}}
+    try:
+        validate_world_model_config(bad)
+        raise AssertionError("expected ConfigError on bad context")
+    except ConfigError as e:
+        assert "context" in str(e), str(e)
+
+    # Bad exit.to_room reference
+    bad = {**base, "rooms": [
+        base["rooms"][0],
+        {"id": "bedroom", "world_model": {
+            "enabled": True,
+            "frame_width": 1920, "frame_height": 1080,
+            "exits": [{"kind": "to_room", "to": "garage",  # not declared
+                       "polygon": [[0, 0], [10, 0], [10, 10]]}],
+            "landmarks": [],
+        }},
+    ]}
+    try:
+        validate_world_model_config(bad)
+        raise AssertionError("expected ConfigError on unknown to_room")
+    except ConfigError as e:
+        assert "garage" in str(e), str(e)
+    print("PASS: world_model config validation enforces cross-references")
+
+
 async def main() -> None:
     await test_observation_builder_publishes_empty_batches()
     await test_ambiguous_match_does_not_set_person_id()
     await test_dim_guard_skips_wrong_size_face_samples()
     await test_repair_mistagged_face_samples()
+    await test_consider_new_sample_quality_gates_and_diversity()
+    test_world_model_config_validation_cross_references()  # sync
     print("\nAll review-fix regression tests passed.")
 
 

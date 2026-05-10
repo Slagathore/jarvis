@@ -121,6 +121,34 @@ class WorldStore:
                 PRIMARY KEY (pet_entity_id, person_id)
             )""",
             "CREATE INDEX IF NOT EXISTS idx_pet_affinities_pet ON pet_affinities(pet_entity_id)",
+            # ── §32 v4 schema — alarm + door tables ─────────────────────────
+            # Created here for now because WorldStore is the only module with
+            # a deterministic ensure_schema entry-point. When the §29.3 door
+            # alarm and §29's alarm_fires/state persistence land, ownership
+            # moves to those modules; the CREATEs are idempotent so a
+            # double-create is a no-op. notification_deliveries is owned by
+            # NotificationDispatcher (lazy-created on first send).
+            """CREATE TABLE IF NOT EXISTS alarm_state (
+                alarm_type   TEXT PRIMARY KEY,
+                state        TEXT NOT NULL,
+                state_since  TEXT NOT NULL,
+                metadata     TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS alarm_fires (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                alarm_type   TEXT NOT NULL,
+                fired_at     TEXT NOT NULL,
+                resolved_at  TEXT,
+                resolution   TEXT,
+                metadata     TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_alarm_fires_type_time ON alarm_fires(alarm_type, fired_at DESC)",
+            """CREATE TABLE IF NOT EXISTS door_state (
+                door_id      TEXT PRIMARY KEY,
+                state        TEXT NOT NULL CHECK (state IN ('open','closed','unknown')),
+                state_since  TEXT NOT NULL,
+                source       TEXT NOT NULL CHECK (source IN ('vision','reed','manual'))
+            )""",
         ]
         for stmt in statements:
             await self.db.execute(stmt)

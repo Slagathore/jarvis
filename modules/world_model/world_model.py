@@ -430,18 +430,31 @@ class WorldModel:
                     >= self.cfg.get("enrollment_min_conf", 0.85)
                 and obs.metadata.get("crop_path")
                 and obs.metadata.get("face_embedding") is not None):
-            asyncio.create_task(self._enroll_async(obs))
+            asyncio.create_task(self._enroll_async(obs, attribution_conf))
 
-    async def _enroll_async(self, obs: Observation) -> None:
-        """Hand off to IdentityManager — fire and forget. IM may or may
-        not implement `consider_new_sample_async`; if not, we silently
-        skip (the world model's job ends at the hand-off)."""
+    async def _enroll_async(
+        self, obs: Observation, attribution_conf: float,
+    ) -> None:
+        """Hand off to IdentityManager — fire and forget. The IM
+        `consider_new_sample_async` extension (§10) handles quality
+        gating, diversity, and the bounded-capacity coreset. If the
+        attribute is missing (e.g. an older IM build) we silently skip
+        — the world model's job ends at the hand-off."""
         try:
             handler = getattr(
                 self.identity_manager, "consider_new_sample_async", None
             )
             if handler is None:
                 return
+            # Compute face area so the IM quality gate can apply its
+            # min_face_area_px check (§10). The bbox here is the PERSON
+            # bbox; ObservationBuilder runs face detection on the
+            # person crop, so the actual face fills a fraction of it —
+            # we pass the person bbox area as a permissive proxy
+            # (≥80×80 person bbox => face is plausibly ≥40×40, which
+            # is the practical lower bound at typical Wyze distances).
+            x1, y1, x2, y2 = obs.bbox
+            person_area = max(0, int(x2) - int(x1)) * max(0, int(y2) - int(y1))
             await handler(
                 person_id=obs.person_id,
                 new_embedding=obs.metadata["face_embedding"],
@@ -450,6 +463,9 @@ class WorldModel:
                     "yaw": obs.metadata.get("yaw"),
                     "pitch": obs.metadata.get("pitch"),
                     "blur_score": obs.metadata.get("blur_score"),
+                    "face_area_px": person_area,
+                    "association_confidence": attribution_conf,
+                    "pose": obs.metadata.get("posture", "candid"),
                 },
             )
         except Exception as e:

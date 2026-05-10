@@ -68,6 +68,28 @@ ACTIVE_FACE_MODEL_VERSION = "arcface_buffalo_l_v1"
 # Bump alongside ACTIVE_FACE_MODEL_VERSION when changing the encoder.
 ACTIVE_FACE_EMBEDDING_DIM = 512
 
+# §10 auto-enrollment thresholds. The diversity-replacement coreset
+# algorithm caps samples per person and rejects near-duplicates,
+# preventing both bank bloat and the silent-overfit failure where a
+# person's centroid drifts toward whatever pose was most recently
+# captured. Override per-person via config.identity.face.* if needed.
+SAMPLES_PER_PERSON_MAX = 30        # capacity cap; matches §10 default
+SAMPLES_DIVERSITY_THRESHOLD = 0.95  # reject candidate if max sim ≥ this
+ENROLLMENT_QUALITY_GATES = {
+    "min_face_area_px":      80 * 80,   # face crop must be ≥ 80×80
+    "max_abs_yaw_deg":       45.0,
+    "max_abs_pitch_deg":     35.0,
+    "min_blur_score":        100.0,     # Laplacian variance
+    "min_assoc_confidence":  0.85,      # WorldModel attribution conf
+}
+
+# §10 voice auto-enrollment. Same coreset algorithm, looser diversity
+# threshold + smaller cap because voice clips have less effective
+# entropy than face crops. Quality gates are duration / SNR / VAD /
+# music — gated by the YAMNet pass per §10.
+VOICE_SAMPLES_PER_PERSON_MAX = 20
+VOICE_SAMPLES_DIVERSITY_THRESHOLD = 0.92
+
 # Pending-cluster merge threshold — if a new unknown sample's cosine to an
 # existing pending-cluster centroid is at least this, fold into that cluster
 # rather than starting a new one.
@@ -98,6 +120,89 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── §10 auto-enrollment helpers ─────────────────────────────────────────────
+
+
+def _passes_face_quality_gates(meta: dict) -> bool:
+    """Reject candidate face samples that wouldn't help the centroid bank.
+    Missing keys are treated as worst-case (rejection) so a stripped-down
+    upstream — e.g. a fast-path observation that didn't compute pose —
+    can't sneak through. The blur and pose fields are produced by
+    ObservationBuilder._build_person_obs; assoc_conf is from the
+    World Model."""
+    g = ENROLLMENT_QUALITY_GATES
+    # Face area: derive from bbox if metadata didn't pre-compute it.
+    area = meta.get("face_area_px")
+    if area is None:
+        bbox = meta.get("face_bbox")
+        if bbox and len(bbox) == 4:
+            x1, y1, x2, y2 = bbox
+            area = max(0, int(x2) - int(x1)) * max(0, int(y2) - int(y1))
+    if area is None or area < g["min_face_area_px"]:
+        return False
+    yaw = meta.get("yaw")
+    if yaw is None or abs(float(yaw)) > g["max_abs_yaw_deg"]:
+        return False
+    pitch = meta.get("pitch")
+    if pitch is None or abs(float(pitch)) > g["max_abs_pitch_deg"]:
+        return False
+    blur = meta.get("blur_score")
+    if blur is None or float(blur) < g["min_blur_score"]:
+        return False
+    # association confidence is the WorldModel's per-match attribution
+    # confidence — only available after entity association ran. Default
+    # to "passing" when the upstream skipped it (worldmodel-less
+    # enrollment, e.g. dashboard manual flow).
+    assoc = meta.get("association_confidence")
+    if assoc is not None and float(assoc) < g["min_assoc_confidence"]:
+        return False
+    return True
+
+
+def _most_redundant_index(embeddings: list[np.ndarray]) -> int:
+    """Index of the embedding whose mean cosine similarity to the rest of
+    the bank is highest — i.e. the sample that contributes the least
+    diversity. Used to pick an eviction target when at capacity."""
+    n = len(embeddings)
+    if n < 2:
+        return 0
+    M = np.stack([
+        e.astype(np.float32) / (np.linalg.norm(e) + 1e-9)
+        for e in embeddings
+    ])
+    S = M @ M.T
+    np.fill_diagonal(S, 0.0)
+    return int(np.argmax(S.sum(axis=1) / (n - 1)))
+
+
+def _avg_pairwise_sim(embeddings: list[np.ndarray]) -> float:
+    """Mean off-diagonal cosine similarity over the bank. The diversity-
+    replacement swap is only allowed if the *replaced* bank has lower
+    avg pairwise sim than the original — otherwise we'd be lowering
+    diversity, not raising it."""
+    n = len(embeddings)
+    if n < 2:
+        return 0.0
+    M = np.stack([
+        e.astype(np.float32) / (np.linalg.norm(e) + 1e-9)
+        for e in embeddings
+    ])
+    S = M @ M.T
+    np.fill_diagonal(S, 0.0)
+    return float(S.sum() / (n * (n - 1)))
+
+
+def _would_increase_diversity(
+    existing: list[np.ndarray],
+    evict_idx: int,
+    candidate: np.ndarray,
+) -> bool:
+    """Replacing existing[evict_idx] with `candidate` decreases avg sim?"""
+    replaced = list(existing)
+    replaced[evict_idx] = candidate
+    return _avg_pairwise_sim(replaced) < _avg_pairwise_sim(existing)
 
 
 class IdentityManager:
@@ -483,6 +588,176 @@ class IdentityManager:
         self._voice_samples.setdefault(pid, []).append(emb.astype(np.float32))
         logger.info(f"[Identity] Enrolled voice for '{name}' (prompt={prompt_id}, id={sample_id})")
         return sample_id
+
+    # ── §10 auto-enrollment (diversity-replacement coreset) ─────────────────
+
+    async def consider_new_sample_async(
+        self,
+        person_id: Optional[int],
+        new_embedding: Optional[np.ndarray],
+        crop_path: Optional[str] = None,
+        quality_metadata: Optional[dict] = None,
+    ) -> bool:
+        """
+        Auto-enrollment entry point. Called by WorldModel after every
+        confident person observation that's been linked to a non-anonymous
+        entity. Returns True if the sample was added to the bank, False
+        if rejected (quality gate, ambiguity pause, near-duplicate, or
+        not-more-diverse-than-most-redundant).
+
+        Fire-and-forget: WorldModel's hot path doesn't await the result;
+        a rejection here doesn't surface anywhere except the debug log.
+        Identity ownership stays with this module — the World Model has
+        nothing to do with sample storage or the centroid bank.
+
+        Spec: new 2.md §10. Algorithm:
+          1. Quality gates (face area, yaw, pitch, blur, assoc conf).
+          2. Pause if person is in an active merge-candidate flag.
+          3. Diversity gate: max cos sim to existing < 0.95.
+          4. Below capacity → add directly.
+          5. At capacity → swap the most-redundant existing sample only
+             if doing so DECREASES the bank's average pairwise similarity
+             (i.e. the candidate is genuinely more diverse).
+        """
+        if person_id is None or new_embedding is None:
+            return False
+
+        # 1. Quality gates.
+        if not _passes_face_quality_gates(quality_metadata or {}):
+            logger.debug(
+                f"[Identity] auto-enroll rejected (quality) for person {person_id}"
+            )
+            return False
+
+        # 2. Pause during merge ambiguity. The merge-candidate set is
+        # populated when two persons' centroids cross the 0.7–0.85 band.
+        # This list is intentionally small and short-lived — it gets
+        # cleared on manual confirm/reject in the dashboard or auto-merge
+        # at >0.85. Empty until that subsystem lands; the lookup is cheap.
+        if person_id in self._merge_candidate_persons:
+            logger.debug(
+                f"[Identity] auto-enroll paused for person {person_id} "
+                "(merge ambiguity)"
+            )
+            return False
+
+        # Sanity: incoming embedding must match active model's dim. Defense
+        # against an upstream regression that pipes a Facenet 128-dim blob
+        # into the ArcFace bank.
+        try:
+            new_emb = np.asarray(new_embedding, dtype=np.float32).copy()
+        except Exception:
+            return False
+        if new_emb.size != ACTIVE_FACE_EMBEDDING_DIM:
+            logger.debug(
+                f"[Identity] auto-enroll dim mismatch for person {person_id}: "
+                f"{new_emb.size} != {ACTIVE_FACE_EMBEDDING_DIM}"
+            )
+            return False
+
+        existing = list(self._face_samples.get(person_id, []))
+
+        # 3. Diversity gate: reject if too similar to any existing sample.
+        if existing:
+            max_sim = max(_cosine(new_emb, e) for e in existing)
+            if max_sim >= SAMPLES_DIVERSITY_THRESHOLD:
+                logger.debug(
+                    f"[Identity] auto-enroll rejected (near-dup, max_sim="
+                    f"{max_sim:.3f}) for person {person_id}"
+                )
+                return False
+
+        # 4. Below capacity → just add.
+        cap = int(SAMPLES_PER_PERSON_MAX)
+        if len(existing) < cap:
+            await self._persist_face_sample(
+                person_id, new_emb,
+                pose=(quality_metadata or {}).get("pose", "candid"),
+                source="auto",
+            )
+            self._face_samples.setdefault(person_id, []).append(new_emb)
+            logger.info(
+                f"[Identity] auto-enrolled face for person {person_id} "
+                f"(now {len(existing) + 1}/{cap})"
+            )
+            return True
+
+        # 5. At capacity → diversity-replacement swap.
+        redundant_idx = _most_redundant_index(existing)
+        if not _would_increase_diversity(existing, redundant_idx, new_emb):
+            logger.debug(
+                f"[Identity] auto-enroll rejected (not more diverse than "
+                f"most-redundant existing) for person {person_id}"
+            )
+            return False
+
+        # Find the DB row for the most-redundant in-memory embedding so we
+        # can drop it from disk too. Order in self._face_samples mirrors
+        # the SELECT order in _reload_caches (no explicit ORDER BY → SQLite
+        # default is rowid ASC), so we can map redundant_idx → row id by
+        # re-querying. Safer than tracking indices in-band.
+        rows = await self._db.fetchall(
+            "SELECT id, embedding FROM face_samples "
+            "WHERE person_id = ? AND model_version = ? "
+            "ORDER BY id ASC",
+            (person_id, ACTIVE_FACE_MODEL_VERSION),
+        )
+        evict_id: Optional[int] = None
+        for i, r in enumerate(rows):
+            if i == redundant_idx:
+                evict_id = int(r["id"])
+                break
+        if evict_id is not None:
+            await self._db.execute(
+                "DELETE FROM face_samples WHERE id = ?", (evict_id,)
+            )
+        # Update in-memory bank.
+        replaced = list(existing)
+        replaced[redundant_idx] = new_emb
+        self._face_samples[person_id] = replaced
+        await self._persist_face_sample(
+            person_id, new_emb,
+            pose=(quality_metadata or {}).get("pose", "candid"),
+            source="auto",
+        )
+        logger.info(
+            f"[Identity] auto-enrolled face for person {person_id}: "
+            f"swapped most-redundant sample (id={evict_id})"
+        )
+        return True
+
+    async def _persist_face_sample(
+        self,
+        person_id: int,
+        embedding: np.ndarray,
+        pose: str = "candid",
+        source: str = "auto",
+    ) -> Optional[int]:
+        """Single insert path so quality + dim guards live in one place."""
+        try:
+            return await self._db.execute(
+                "INSERT INTO face_samples (person_id, embedding, pose, "
+                "captured_at, source, model_version) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    person_id,
+                    embedding.astype(np.float32).tobytes(),
+                    pose,
+                    _now_iso(),
+                    source,
+                    ACTIVE_FACE_MODEL_VERSION,
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"[Identity] face sample persist failed: {e}")
+            return None
+
+    @property
+    def _merge_candidate_persons(self) -> set[int]:
+        """Persons currently flagged as merge candidates (centroid sim
+        0.7–0.85). Empty until the merge-candidate subsystem lands;
+        consider_new_sample_async pauses enrollment when populated."""
+        return getattr(self, "_merge_candidates", set()) or set()
 
     # ── drift verify (passive, anchored) ────────────────────────────────────
 
