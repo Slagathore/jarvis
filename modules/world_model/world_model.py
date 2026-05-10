@@ -314,6 +314,17 @@ class WorldModel:
     # MATCHED ENTITY UPDATE
     # ────────────────────────────────────────────────────────────────────────
 
+    # Landmark name → interaction kind. The kind feeds into event metadata
+    # so the dashboard / LLM can filter (e.g. last_litterbox_visit) without
+    # re-deriving from the landmark name. Add new pairs as landmarks land.
+    _LANDMARK_INTERACTION_KIND: dict[str, str] = {
+        "litterbox": "litterbox_visit",
+        "food_dish": "food_dish_visit",
+        "dog_food_dish": "dog_food_visit",
+        "dog_water_bowl": "dog_water_visit",
+        "leash_hook": "leash_interaction",
+    }
+
     async def _update_matched(
         self,
         ent: WorldEntity,
@@ -397,6 +408,17 @@ class WorldModel:
                 EventType.INTERACTED_WITH, ent, obs, metadata=interaction_event
             )
 
+        # §22.9 species-specific landmark dwell. Per-entity, per-landmark
+        # consecutive-frame counter; once it reaches debounce, we emit a
+        # specialized INTERACTED_WITH with metadata.interaction_kind so
+        # the dashboard can filter (last_litterbox_visit, etc.). Resets
+        # when the entity moves off the landmark.
+        landmark_event = self._classify_landmark_dwell(ent, new_landmark)
+        if landmark_event:
+            await self._emit(
+                EventType.INTERACTED_WITH, ent, obs, metadata=landmark_event
+            )
+
         await self.store.upsert_entity(ent)
 
         # Hand off confident person matches to IdentityManager for
@@ -473,6 +495,43 @@ class WorldModel:
             return None
         ent.metadata["stable_posture"] = new_posture
         return {"from": stable, "to": new_posture}
+
+    def _classify_landmark_dwell(
+        self, ent: WorldEntity, landmark: Optional[str],
+    ) -> Optional[dict]:
+        """§22.9 — fire INTERACTED_WITH once an entity has been over a
+        registered landmark for `landmark_dwell_frames` consecutive
+        observations. Returns the event metadata when the threshold is
+        crossed; returns None on every other tick.
+
+        State is kept in `ent.metadata['landmark_dwell']` so it survives
+        upsert. The {landmark: count} map is reset to {} when the entity
+        steps off (`landmark` becomes None or changes); we only debounce
+        the *current* landmark to avoid double-firing during walks across
+        multiple landmarks.
+        """
+        threshold = int(self.cfg.get("landmark_dwell_frames", 3))
+        dwell: dict = ent.metadata.setdefault("landmark_dwell", {})
+        if landmark is None:
+            if dwell:
+                ent.metadata["landmark_dwell"] = {}
+            return None
+        # Reset other landmark counters — the entity is now on `landmark`.
+        if list(dwell.keys()) != [landmark]:
+            dwell = {landmark: 0}
+            ent.metadata["landmark_dwell"] = dwell
+        dwell[landmark] = int(dwell.get(landmark, 0)) + 1
+        if dwell[landmark] != threshold:
+            # Already fired (count > threshold) or still ramping up.
+            return None
+        kind = self._LANDMARK_INTERACTION_KIND.get(landmark)
+        if kind is None:
+            return None
+        return {
+            "landmark": landmark,
+            "interaction_kind": kind,
+            "dwell_frames": int(dwell[landmark]),
+        }
 
     def _classify_interaction(
         self, ent: WorldEntity, obs: Observation
@@ -560,6 +619,13 @@ class WorldModel:
             is_resident=(obs.person_id is not None),
         )
         self.entities[new_ent.id] = new_ent
+        # Carry the YOLO class label onto the entity for objects so the
+        # cost function can do hard class matching on subsequent ticks
+        # (a cup obs must not link to a phone entity, etc.).
+        if obs.obj_class == "object":
+            detected = obs.metadata.get("detected_class")
+            if detected:
+                new_ent.metadata["detected_class"] = detected
         if obs.visual_embedding is not None:
             new_ent.metadata["_visual_embedding"] = obs.visual_embedding
             await self.store.upsert_embedding(new_ent.id, obs.visual_embedding)
@@ -1080,9 +1146,60 @@ class WorldModel:
                 return other.display_name
         return None
 
-    # Object cost stub — §23 fills this in.
-    def _object_pair_cost(self, obs: Observation, ent: WorldEntity) -> float:  # noqa: ARG002
-        return self.cfg["cost_reject"] * 2
+    # ── Object cost (§23 closed-vocab portion) ────────────────────────────
+
+    def _object_pair_cost(self, obs: Observation, ent: WorldEntity) -> float:
+        """Closed-vocab object association — for the YOLO-detected
+        TRACKED_OBJECT_CLASSES (cell phone, cup, book, laptop, bottle,
+        remote). Open-vocab + CLIP embedding matching is §23.4-§23.6
+        and lands when the encoder is bootstrapped.
+
+        Cost components:
+          - Class match (hard): a phone observation can't link to a cup
+            entity. Class is read from obs.metadata.detected_class /
+            ent.metadata.detected_class because obs.obj_class is the
+            generic "object" label.
+          - Same-room continuity: an object is overwhelmingly likely
+            to be the same instance if observed in the same room
+            within the candidate-lookback window (default 2 minutes).
+          - Bbox-center distance + IoU: tighter spatial match wins.
+          - Time gap penalty.
+        """
+        obs_class = obs.metadata.get("detected_class")
+        ent_class = ent.metadata.get("detected_class")
+        if (obs_class and ent_class and obs_class != ent_class):
+            return self.cfg["cost_reject"] * 2
+
+        if not ent.last_seen_ts:
+            # No history → fresh object, let the unmatched path pick it up.
+            return self.cfg["cost_reject"] * 2
+        seconds_gone = (obs.ts - ent.last_seen_ts).total_seconds()
+        # Objects don't move themselves — broad lookback is fine, but
+        # stale entities (>15 min idle) shouldn't capture new sightings.
+        if seconds_gone > 15 * 60:
+            return self.cfg["cost_reject"] * 2
+
+        if obs.room == ent.last_seen_room:
+            room_cost = 0.0
+        else:
+            # Different room is a strong negative — a coffee cup
+            # appearing on a different camera is more likely a new
+            # cup than the old one teleporting.
+            room_cost = 0.7
+
+        spatial = self._spatial_distance(obs, ent)
+        iou = bbox_iou(obs.bbox, ent.last_seen_bbox) if ent.last_seen_bbox else 0.0
+        # IoU is a positive bonus — higher overlap, lower cost.
+        iou_term = 1.0 - float(iou)
+
+        time_cost = min(seconds_gone / (15 * 60.0), 1.0)
+
+        return float(max(0.0, (
+            0.5 * room_cost
+            + 0.25 * spatial
+            + 0.15 * iou_term
+            + 0.10 * time_cost
+        )))
 
 
 # ── Module-level helpers (§22.7) ────────────────────────────────────────────

@@ -2204,6 +2204,88 @@ class Orchestrator:
                 },
             },
         },
+        # ── Pet-aware tools (§22) ────────────────────────────────────────
+        {
+            "type": "function",
+            "function": {
+                "name": "where_is_pet",
+                "description": (
+                    "Pet-flavored 'where is X'. Use for 'where's Spooky', "
+                    "'is Velcro in Jeff's room?', 'has Summer been outside?'. "
+                    "Returns last-seen room/landmark + a `likely_room` field "
+                    "that falls back to the pet's unmonitored_home (e.g. "
+                    "Velcro → jeff_room) when no recent observation exists. "
+                    "Phrase 'likely_room_inferred=true' results as a hedge "
+                    "('probably in Jeff's room')."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Pet name. Case-insensitive. Examples: "
+                                "'Spooky', 'Velcro', 'Summer', 'Dalila'."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_pets",
+                "description": (
+                    "List the resident pets the system knows about. Use for "
+                    "'how many cats do I have?', 'what pets live here?'. "
+                    "Optional `species` filter ('cat' or 'dog')."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "species": {
+                            "type": "string",
+                            "description": (
+                                "Optional filter — 'cat' or 'dog'. Omit "
+                                "for both."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "pet_care_summary",
+                "description": (
+                    "Per-pet summary of recent care-relevant events. Use for "
+                    "'has Spooky used the litterbox today', 'when did Summer "
+                    "last eat', 'is anyone going on a walk soon' (LEASH_INTERACTION). "
+                    "Returns counts + last-seen timestamp grouped by "
+                    "interaction_kind: litterbox_visit, food_dish_visit, "
+                    "dog_food_visit, dog_water_visit, leash_interaction."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Pet name. Case-insensitive.",
+                        },
+                        "hours_ago": {
+                            "type": "integer",
+                            "description": (
+                                "Lookback window. Default 24 hours."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
     ]
 
     def _world_tool_handlers(self) -> dict:
@@ -2236,11 +2318,23 @@ class Orchestrator:
                 event_types=event_types, hours_ago=hours_ago, limit=limit,
             )
 
+        async def _where_pet(name: str) -> dict:
+            return await wq.where_is_pet(name)
+
+        async def _list_pets(species: Optional[str] = None) -> list[dict]:
+            return await wq.list_pets(species=species)
+
+        async def _pet_care(name: str, hours_ago: int = 24) -> dict:
+            return await wq.pet_care_summary(name, hours_ago=hours_ago)
+
         return {
             "get_entity_status":     _entity,
             "list_entities_in_room": _in_room,
             "who_is_home":           _home,
             "search_recent_events":  _events,
+            "where_is_pet":          _where_pet,
+            "list_pets":             _list_pets,
+            "pet_care_summary":      _pet_care,
         }
 
     _GET_SNAPSHOT_TOOL = {

@@ -143,3 +143,133 @@ class WorldQueryTools:
             since=since,
             limit=limit,
         )
+
+    # ── Pet-aware queries (§22) ────────────────────────────────────────────
+
+    async def list_pets(
+        self,
+        species: Optional[str] = None,
+        include_archived: bool = False,
+    ) -> list[dict]:
+        """List resident pets — every cat and/or dog the world model
+        knows about. `species` filters to "cat" or "dog"; default is
+        both. `include_archived` defaults False so rehomed/passed pets
+        don't pollute current-state queries.
+        """
+        out: list[dict] = []
+        for e in self.world.entities.values():
+            if e.entity_type not in ("cat", "dog"):
+                continue
+            if species and e.entity_type != species:
+                continue
+            if e.archived_at is not None and not include_archived:
+                continue
+            if not e.is_resident:
+                continue
+            out.append({
+                "name": e.display_name,
+                "species": e.entity_type,
+                "owner_person_id": e.household_owner_id,
+                "state": e.state.value,
+                "last_seen_room": e.last_seen_room,
+                "unmonitored_home": e.unmonitored_home_room,
+                "is_archived": e.archived_at is not None,
+            })
+        return sorted(out, key=lambda d: (d["species"], d["name"] or ""))
+
+    async def where_is_pet(self, name: str) -> dict:
+        """Pet-flavored variant of get_entity_status. Includes
+        unmonitored_home so 'where's Velcro?' resolves cleanly to
+        'jeff_room (no camera)' even when no recent observation exists.
+        """
+        ent = self.world.find_entity_by_name(name)
+        if not ent or ent.entity_type not in ("cat", "dog"):
+            return {"found": False,
+                    "message": f"No pet named {name} in registry."}
+        elapsed = datetime.utcnow() - ent.last_state_change_ts
+        unmon = ent.unmonitored_home_room
+        # If we haven't seen the pet AND it has an unmonitored home,
+        # surface that as the most likely location.
+        likely_room = ent.last_seen_room
+        is_likely_inferred = False
+        if (ent.state.value in ("in_house_unmonitored", "in_room_unseen")
+                and unmon and not likely_room):
+            likely_room = unmon
+            is_likely_inferred = True
+        return {
+            "found": True,
+            "name": ent.display_name,
+            "species": ent.entity_type,
+            "state": ent.state.value,
+            "last_seen_room": ent.last_seen_room,
+            "last_seen_landmark": ent.last_seen_landmark,
+            "last_seen_ts": (
+                ent.last_seen_ts.isoformat() if ent.last_seen_ts else None
+            ),
+            "duration_in_state_seconds": int(elapsed.total_seconds()),
+            "likely_room": likely_room,
+            "likely_room_inferred": is_likely_inferred,
+            "unmonitored_home": unmon,
+            "owner_person_id": ent.household_owner_id,
+            "is_archived": ent.archived_at is not None,
+        }
+
+    async def pet_care_summary(
+        self, name: str, hours_ago: int = 24,
+    ) -> dict:
+        """§22.9 — answer 'has Spooky used the litterbox today?',
+        'when did Summer last eat?'. Reads INTERACTED_WITH events for
+        the named pet within `hours_ago` and groups by interaction_kind.
+
+        Returns a dict {interaction_kind: {count, last_ts, last_room}}
+        plus the pet's current state and a `found` flag.
+        """
+        ent = self.world.find_entity_by_name(name)
+        if not ent or ent.entity_type not in ("cat", "dog"):
+            return {"found": False,
+                    "message": f"No pet named {name} in registry."}
+        since = datetime.utcnow() - timedelta(hours=hours_ago)
+        events = await self.world.store.search_events(
+            entity_id=ent.id,
+            event_types=["interacted_with"],
+            since=since,
+            limit=200,
+        )
+        # Aggregate by interaction_kind. Events stored metadata as JSON
+        # strings — decode and pick out the kind.
+        import json
+        by_kind: dict[str, dict] = {}
+        for ev in events:
+            raw_meta = ev.get("metadata")
+            if isinstance(raw_meta, str) and raw_meta:
+                try:
+                    meta = json.loads(raw_meta)
+                except Exception:
+                    meta = {}
+            elif isinstance(raw_meta, dict):
+                meta = raw_meta
+            else:
+                meta = {}
+            kind = meta.get("interaction_kind")
+            if not kind:
+                continue
+            slot = by_kind.setdefault(kind, {
+                "count": 0, "last_ts": None, "last_room": None,
+                "last_landmark": meta.get("landmark"),
+            })
+            slot["count"] += 1
+            ts = ev.get("ts")
+            # Events are returned DESC, so the first hit per kind is
+            # automatically the most recent — only stamp once.
+            if slot["last_ts"] is None and ts:
+                slot["last_ts"] = ts
+                slot["last_room"] = ev.get("room")
+                slot["last_landmark"] = meta.get("landmark")
+        return {
+            "found": True,
+            "name": ent.display_name,
+            "species": ent.entity_type,
+            "state": ent.state.value,
+            "window_hours": hours_ago,
+            "by_kind": by_kind,
+        }

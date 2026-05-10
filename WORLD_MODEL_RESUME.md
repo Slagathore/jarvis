@@ -1,3 +1,4 @@
+<!-- markdownlint-disable -->
 # World Model integration — resume notes
 
 Last updated: **2026-05-10** (post-§22 chunk: pets-by-name code-complete)
@@ -28,7 +29,10 @@ top of that doc** mark every section that's been completed (search for
 | Phase 3.4 (polygon viewer) | `dashboard/static/polygon_viewer.html` + `/api/world_model/rooms{,/.../polygons}` + `/polygons` page | Endpoints + page serve via TestClient ✅ |
 | §31 (notifications) | `modules/notifications/{dispatcher,channels}.py` | Routing + parallel dispatch + delivery-log roundtrip ✅ |
 | §29 (alarm framework + cat-escape) | `modules/safety/alarms/{state,alarm,audio,dispatcher,cat_escape}.py` | 7-scenario synthetic test ✅ |
-| §22 (Phase 4 — pets by name) | `modules/world_model/pets.py`, `modules/world_model/cluster_builder.py`; `_animal_pair_cost` + `_build_cat_obs`/`_build_dog_obs` rewrite; `pet_affinities` schema; orchestrator nightly profile loop | 7-scenario synthetic test (`scripts/test_pets_synthetic.py`) ✅ |
+| §22 (Phase 4 — pets by name) | `modules/world_model/pets.py`, `modules/world_model/cluster_builder.py`; `_animal_pair_cost` + `_build_cat_obs`/`_build_dog_obs` rewrite; `pet_affinities` schema; orchestrator nightly profile loop | 11-scenario synthetic test (`scripts/test_pets_synthetic.py`) ✅ |
+| §22.9 species-specific events | `WorldModel._classify_landmark_dwell` + `_LANDMARK_INTERACTION_KIND` map; landmark scaffolding in `config.yaml` (laundry: litterbox + food_dish; living_room: dog_food_dish, dog_water_bowl, leash_hook) | Debounced INTERACTED_WITH(metadata.interaction_kind=...) emits once after 3 frames ✅ |
+| §23 closed-vocab object cost | `WorldModel._object_pair_cost` — same-class hard filter + same-room continuity + bbox IoU/center distance + 15-min staleness window. CLIP/open-vocab portion (§23.4-§23.6) deferred. | Class-match + cross-room + class-mismatch all behave per spec ✅ |
+| Pet-aware query tools (§20+§22) | `WorldQueryTools.where_is_pet` (with unmonitored_home fallback), `list_pets`, `pet_care_summary`; orchestrator `_WORLD_TOOLS` registers all three for the LLM tool registry | Synthetic tests cover unmonitored fallback + interaction-kind aggregation ✅ |
 
 **Hands-on verify gates still pending** (need Cole + running Jarvis):
 - Phase 1.2 — re-enroll Cole + Anna with 5 ArcFace photos each, confirm `identify ≥0.6` + margin-gate refusal.

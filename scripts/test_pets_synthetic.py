@@ -410,6 +410,245 @@ async def test_behavioral_profile_builder() -> None:
     print("PASS: BehavioralProfileBuilder room_distribution + bbox_size_per_room")
 
 
+async def test_landmark_dwell_emits_litterbox_event() -> None:
+    """§22.9 — three consecutive observations over the litterbox should
+    emit one INTERACTED_WITH event with metadata.interaction_kind=
+    'litterbox_visit'. The fourth tick must NOT re-emit (debounce)."""
+    db = InMemoryDB(); await db.init()
+    try:
+        store = WorldStore(db); await store.ensure_schema()
+        await bootstrap_pets_from_config(store, HOUSEHOLD_CONFIG)
+
+        bus = StubBus()
+        rooms_with_landmark = [{
+            "id": "laundry_room",
+            "world_model": {
+                "enabled": True,
+                "frame_width": 800, "frame_height": 600,
+                "exits": [],
+                "landmarks": [
+                    {"name": "litterbox",
+                     "polygon": [[100, 400], [300, 400], [300, 550], [100, 550]]},
+                ],
+            },
+        }]
+        wm = WorldModel(
+            bus=bus, store=store,
+            rooms_config=rooms_with_landmark,
+            identity_manager=StubIdentityManager(),
+            config={"landmark_dwell_frames": 3},
+        )
+        await wm.start()
+
+        # Use Spooky's id as the matching black-cat entity. Drop it into
+        # the laundry_room so candidate-lookup picks it up.
+        spooky = wm.find_entity_by_name("Spooky")
+        assert spooky is not None
+        spooky.last_seen_room = "laundry_room"
+        spooky.last_seen_camera = "laundry_room"
+        spooky.last_seen_ts = datetime.utcnow()
+        spooky.state = EntityState.PRESENT
+        spooky.last_seen_bbox = (200, 480, 220, 520)
+
+        # Tick 1, 2, 3: bbox center over litterbox polygon.
+        for i in range(3):
+            t = datetime.utcnow() + timedelta(seconds=i)
+            await wm._on_observation_batch({
+                "camera": "laundry_room", "room": "laundry_room", "ts": t,
+                "observations": [Observation(
+                    camera="laundry_room", room="laundry_room",
+                    obj_class="cat",
+                    bbox=(180, 460, 220, 500),  # center over litterbox
+                    confidence=0.9, ts=t,
+                    metadata={"color_class": "black",
+                              "size_normalized": 0.04},
+                )],
+            })
+
+        # Verify the event was emitted exactly once.
+        litterbox_events = [
+            p for (topic, p) in bus.events
+            if topic == "world.entity_event"
+            and p.get("metadata", {}).get("interaction_kind") == "litterbox_visit"
+        ]
+        assert len(litterbox_events) == 1, (
+            f"expected 1 litterbox_visit, got {len(litterbox_events)}: "
+            f"{litterbox_events}"
+        )
+
+        # Tick 4: still over litterbox — must NOT re-fire (debounce).
+        t4 = datetime.utcnow() + timedelta(seconds=10)
+        await wm._on_observation_batch({
+            "camera": "laundry_room", "room": "laundry_room", "ts": t4,
+            "observations": [Observation(
+                camera="laundry_room", room="laundry_room",
+                obj_class="cat",
+                bbox=(180, 460, 220, 500),
+                confidence=0.9, ts=t4,
+                metadata={"color_class": "black",
+                          "size_normalized": 0.04},
+            )],
+        })
+        litterbox_events = [
+            p for (topic, p) in bus.events
+            if topic == "world.entity_event"
+            and p.get("metadata", {}).get("interaction_kind") == "litterbox_visit"
+        ]
+        assert len(litterbox_events) == 1, "debounce broke — re-fired"
+    finally:
+        await db.close()
+    print("PASS: §22.9 landmark dwell emits exactly once + debounces")
+
+
+async def test_pet_care_summary_aggregates_events() -> None:
+    """pet_care_summary groups INTERACTED_WITH events by interaction_kind."""
+    from modules.world_model.query_tools import WorldQueryTools
+
+    db = InMemoryDB(); await db.init()
+    try:
+        store = WorldStore(db); await store.ensure_schema()
+        await bootstrap_pets_from_config(store, HOUSEHOLD_CONFIG)
+        wm = WorldModel(
+            bus=StubBus(), store=store,
+            rooms_config=ROOMS_CONFIG,
+            identity_manager=StubIdentityManager(),
+            config={},
+        )
+        await wm.start()
+        spooky = wm.find_entity_by_name("Spooky")
+        assert spooky is not None
+
+        # Seed three interaction events.
+        base = datetime.utcnow() - timedelta(hours=1)
+        for i, kind in enumerate([
+            "litterbox_visit", "food_dish_visit", "litterbox_visit",
+        ]):
+            await store.append_event({
+                "id": f"int-{i}",
+                "ts": (base + timedelta(minutes=i * 5)).isoformat(),
+                "entity_id": spooky.id, "entity_name": "Spooky",
+                "entity_type": "cat", "person_id": None,
+                "event_type": "interacted_with",
+                "room": "laundry_room", "camera": "laundry_room",
+                "bbox": None,
+                "landmark": "litterbox" if "litterbox" in kind else "food_dish",
+                "state": "present", "confidence": 0.9,
+                "metadata": {
+                    "interaction_kind": kind,
+                    "landmark": "litterbox" if "litterbox" in kind else "food_dish",
+                },
+            })
+
+        wq = WorldQueryTools(wm)
+        summary = await wq.pet_care_summary("Spooky", hours_ago=2)
+        assert summary["found"] is True
+        assert "litterbox_visit" in summary["by_kind"]
+        assert summary["by_kind"]["litterbox_visit"]["count"] == 2
+        assert summary["by_kind"]["food_dish_visit"]["count"] == 1
+        assert summary["by_kind"]["litterbox_visit"]["last_room"] == "laundry_room"
+    finally:
+        await db.close()
+    print("PASS: pet_care_summary aggregates INTERACTED_WITH events")
+
+
+async def test_object_pair_cost_class_match() -> None:
+    """Closed-vocab object cost: same class + same room + recent →
+    low cost; different class → reject; different room → high cost."""
+    db = InMemoryDB(); await db.init()
+    try:
+        store = WorldStore(db); await store.ensure_schema()
+        wm = WorldModel(
+            bus=StubBus(), store=store,
+            rooms_config=ROOMS_CONFIG,
+            identity_manager=StubIdentityManager(),
+            config={"cost_reject": 1.0},
+        )
+        await wm.start()
+
+        ts = datetime.utcnow()
+        # Manually inject a phone entity in the office.
+        from modules.world_model.types import WorldEntity as WE
+        phone = WE(
+            id="phone-1", entity_type="object",
+            display_name=None, state=EntityState.PRESENT,
+            last_seen_ts=ts - timedelta(seconds=30),
+            last_seen_camera="office", last_seen_room="office",
+            last_seen_bbox=(100, 100, 200, 200),
+            last_state_change_ts=ts - timedelta(seconds=30),
+            metadata={"detected_class": "cell phone"},
+        )
+        wm.entities[phone.id] = phone
+
+        # Same class + same room + recent → low cost.
+        phone_obs = Observation(
+            camera="office", room="office", obj_class="object",
+            bbox=(105, 105, 205, 205), confidence=0.9, ts=ts,
+            metadata={"detected_class": "cell phone",
+                      "frame_width": 640, "frame_height": 480},
+        )
+        cost_match = wm._object_pair_cost(phone_obs, phone)
+        assert cost_match < 0.3, f"expected low cost, got {cost_match}"
+
+        # Different class → hard reject.
+        cup_obs = Observation(
+            camera="office", room="office", obj_class="object",
+            bbox=(105, 105, 205, 205), confidence=0.9, ts=ts,
+            metadata={"detected_class": "cup",
+                      "frame_width": 640, "frame_height": 480},
+        )
+        cost_class_mismatch = wm._object_pair_cost(cup_obs, phone)
+        assert cost_class_mismatch >= 2.0
+
+        # Same class but different room → much higher than the match.
+        phone_other_room = Observation(
+            camera="bedroom", room="bedroom", obj_class="object",
+            bbox=(105, 105, 205, 205), confidence=0.9, ts=ts,
+            metadata={"detected_class": "cell phone",
+                      "frame_width": 1920, "frame_height": 1080},
+        )
+        cost_other_room = wm._object_pair_cost(phone_other_room, phone)
+        assert cost_other_room > cost_match
+    finally:
+        await db.close()
+    print("PASS: closed-vocab _object_pair_cost (class match + room continuity)")
+
+
+async def test_where_is_pet_uses_unmonitored_home() -> None:
+    """When a pet has unmonitored_home and isn't currently observed,
+    where_is_pet should fall back to that room with likely_inferred=True."""
+    from modules.world_model.query_tools import WorldQueryTools
+
+    db = InMemoryDB(); await db.init()
+    try:
+        store = WorldStore(db); await store.ensure_schema()
+        await bootstrap_pets_from_config(store, HOUSEHOLD_CONFIG)
+        wm = WorldModel(
+            bus=StubBus(), store=store,
+            rooms_config=ROOMS_CONFIG,
+            identity_manager=StubIdentityManager(),
+            config={},
+        )
+        await wm.start()
+        velcro = wm.find_entity_by_name("Velcro")
+        assert velcro is not None
+        # Velcro starts in IN_ROOM_UNSEEN (per bootstrap) with no
+        # last_seen_room set — so likely_room should fall through to
+        # unmonitored_home (jeff_room).
+        velcro.last_seen_room = None
+        velcro.state = EntityState.IN_HOUSE_UNMONITORED
+        await store.upsert_entity(velcro)
+
+        wq = WorldQueryTools(wm)
+        result = await wq.where_is_pet("Velcro")
+        assert result["found"] is True
+        assert result["likely_room"] == "jeff_room"
+        assert result["likely_room_inferred"] is True
+        assert result["unmonitored_home"] == "jeff_room"
+    finally:
+        await db.close()
+    print("PASS: where_is_pet falls back to unmonitored_home")
+
+
 async def test_cluster_builder_below_threshold() -> None:
     """Cluster builder returns {} when fewer than threshold events exist.
     Below-threshold means clustering doesn't run — but the path still
@@ -449,6 +688,10 @@ async def main() -> None:
     await test_animal_cost_color_filter()
     await test_archived_pet_never_matches()
     await test_behavioral_profile_builder()
+    await test_landmark_dwell_emits_litterbox_event()
+    await test_pet_care_summary_aggregates_events()
+    await test_object_pair_cost_class_match()
+    await test_where_is_pet_uses_unmonitored_home()
     await test_cluster_builder_below_threshold()
     print("\nAll Phase 4 (§22) synthetic tests passed.")
 

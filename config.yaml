@@ -154,8 +154,14 @@ rooms:
         polygon: [[200, 300], [450, 300], [450, 550], [200, 550]]
       - name: dryer
         polygon: [[450, 300], [700, 300], [700, 550], [450, 550]]
-      # Litterbox + food_dish landmarks here would feed §22.9
-      # cat-specific events. Add when polygon viewer is built.
+      # §22.9 cat-specific event landmarks — feed LITTERBOX_VISIT and
+      # FOOD_DISH_VISIT (INTERACTED_WITH events with metadata.landmark
+      # and metadata.interaction_kind). REPLACE_ME polygon coords
+      # against a real laundry_room frame in the polygon viewer.
+      - name: litterbox
+        polygon: [[100, 400], [300, 400], [300, 550], [100, 550]]
+      - name: food_dish
+        polygon: [[400, 450], [550, 450], [550, 550], [400, 550]]
 - id: bedroom
   display_name: Bedroom
   video:
@@ -296,6 +302,14 @@ rooms:
         polygon: [[600, 600], [1400, 600], [1400, 950], [600, 950]]
       - name: tv
         polygon: [[700, 100], [1300, 100], [1300, 450], [700, 450]]
+      # §22.9 dog-specific landmarks — DOG_FOOD_VISIT, DOG_WATER_VISIT,
+      # LEASH_INTERACTION events. REPLACE_ME polygon coords.
+      - name: dog_food_dish
+        polygon: [[450, 700], [580, 700], [580, 800], [450, 800]]
+      - name: dog_water_bowl
+        polygon: [[600, 700], [720, 700], [720, 800], [600, 800]]
+      - name: leash_hook
+        polygon: [[50, 100], [150, 100], [150, 200], [50, 200]]
 # Auxiliary ESP32 nodes — boxes physically present in rooms whose primary
 # mic/cam is *not* an esp32_* driver. NodeManager would auto-register these
 # on first MQTT heartbeat with a warning; listing them here acknowledges the
