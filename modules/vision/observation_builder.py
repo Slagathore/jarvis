@@ -44,6 +44,9 @@ from typing import Any, Optional
 import numpy as np
 from loguru import logger
 
+from modules.vision.hand_detector import (
+    bbox_overlaps_or_within as _bbox_overlaps_or_within,
+)
 from modules.world_model.types import Observation
 
 
@@ -103,6 +106,7 @@ class ObservationBuilder:
         posture_analyzer: Optional[Any],
         rooms_config: list[dict],
         snapshot_dir: Optional[Path] = None,
+        hand_detector: Optional[Any] = None,
     ) -> None:
         self.bus = bus
         self.cm = camera_manager
@@ -110,6 +114,11 @@ class ObservationBuilder:
         self.face = face_recognizer
         self.identity = identity_manager
         self.posture = posture_analyzer
+        # §24.1 — MediaPipe Hands. Optional; without it the hand_bboxes
+        # field on person observations stays empty and INTERACTED_WITH /
+        # PICKED_UP / PLACED_DOWN events never fire (state machine
+        # safely degrades). NullHandDetector is the standard test stub.
+        self.hand_detector = hand_detector
         # Index rooms by id for fast `_loop_for_room` lookups; preserve
         # the original dicts so loop reads fps_active etc. directly.
         self.rooms: dict[str, dict] = {r["id"]: r for r in rooms_config}
@@ -234,8 +243,17 @@ class ObservationBuilder:
         raw_dets = await self.detector.detect_async(frame)
         detections = [Detection.from_dict(d) for d in raw_dets]
 
-        # 2. Optional: hand bboxes (Phase 5; for now empty list).
-        hand_bboxes: list[tuple] = []
+        # 2. Hand detection (§24.1) — once per frame, attached per-person
+        # below. Cheap to skip when no detector is wired.
+        all_hands: list[dict] = []
+        if self.hand_detector is not None:
+            try:
+                all_hands = await self.hand_detector.detect_async(frame)
+            except Exception as e:
+                logger.debug(
+                    f"[ObservationBuilder] hand detect failed in "
+                    f"'{room}': {e}"
+                )
 
         # 3. Optional: room-wide posture (Phase 5; for now None).
         posture: Optional[str] = None
@@ -246,9 +264,24 @@ class ObservationBuilder:
             cls = det.class_name
             try:
                 if cls == "person":
+                    # Attach hands whose bbox sits inside (or just at
+                    # the edge of) this person's bbox. Multiple people
+                    # in the same crop may share a hand attribution
+                    # — the InteractionMonitor uses world-model identity
+                    # to disambiguate at the event-correlation layer.
+                    person_hand_details = [
+                        h for h in all_hands
+                        if _bbox_overlaps_or_within(
+                            h.get("bbox", (0, 0, 0, 0)), det.bbox, slack=20,
+                        )
+                    ]
+                    person_hand_bboxes = [
+                        tuple(h["bbox"]) for h in person_hand_details
+                    ]
                     obs = await self._build_person_obs(
                         frame, det, room, ts, frame_w, frame_h,
-                        hand_bboxes, posture,
+                        person_hand_bboxes, posture,
+                        hand_details=person_hand_details,
                     )
                 elif cls in self.ANIMAL_ENRICHERS:
                     obs = self._build_animal_obs(
@@ -279,6 +312,7 @@ class ObservationBuilder:
         fh: int,
         hand_bboxes: list[tuple],
         posture: Optional[str],
+        hand_details: Optional[list[dict]] = None,
     ) -> Observation:
         bbox = det.bbox
         x1, y1, x2, y2 = (int(v) for v in bbox)
@@ -383,6 +417,11 @@ class ObservationBuilder:
                 "frame_width": fw,
                 "frame_height": fh,
                 "hand_bboxes": hand_bboxes,
+                # Per-hand details (handedness label + wrist xy) for the
+                # InteractionMonitor's "Cole picked it up with his right
+                # hand" phrasing. Empty list when no hand detector is
+                # wired or no hands attached to this person.
+                "hand_details": list(hand_details or []),
                 "posture": posture,
                 # 'matched' | 'ambiguous' | 'no_match' | 'no_face' | 'error' —
                 # consumers can branch on ambiguous (e.g. dashboard

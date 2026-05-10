@@ -214,6 +214,113 @@ class WorldQueryTools:
             "is_archived": ent.archived_at is not None,
         }
 
+    # ── §24.5 Interaction queries ──────────────────────────────────────────
+
+    async def what_did_someone_do_with(
+        self,
+        person_name: str,
+        object_name: Optional[str] = None,
+        hours_ago: int = 24,
+    ) -> list[dict]:
+        """'What did Cole do with the wallet?' — chronological list of
+        INTERACTED_WITH / PICKED_UP / PLACED_DOWN events involving the
+        named person, optionally filtered to one object. Oldest first
+        so the LLM can phrase it as a narrative."""
+        person_ent = self.world.find_entity_by_name(person_name)
+        if not person_ent:
+            return []
+        since = datetime.utcnow() - timedelta(hours=hours_ago)
+        events = await self.world.store.search_events(
+            person_id=person_ent.person_id,
+            event_types=["interacted_with", "picked_up", "placed_down"],
+            since=since,
+            limit=200,
+        )
+        if object_name:
+            obj_ent = self.world.find_entity_by_name(object_name)
+            obj_id = obj_ent.id if obj_ent else None
+            if obj_id is not None:
+                # Metadata is stored as a JSON string on the event row;
+                # decode lazily and filter by object_id. Match against
+                # entity_id too for events emitted by InteractionMonitor
+                # where the object is the primary entity.
+                import json as _json
+                filtered: list[dict] = []
+                for e in events:
+                    if e.get("entity_id") == obj_id:
+                        filtered.append(e); continue
+                    raw = e.get("metadata")
+                    meta = (
+                        raw if isinstance(raw, dict)
+                        else (
+                            _json.loads(raw)
+                            if isinstance(raw, str) and raw else {}
+                        )
+                    )
+                    if meta.get("object_id") == obj_id:
+                        filtered.append(e)
+                events = filtered
+            else:
+                # Object name not in registry — fall back to a name-only
+                # text match against metadata.object_name.
+                import json as _json
+                obj_lc = object_name.lower()
+                filtered = []
+                for e in events:
+                    raw = e.get("metadata")
+                    meta = (
+                        raw if isinstance(raw, dict)
+                        else (
+                            _json.loads(raw)
+                            if isinstance(raw, str) and raw else {}
+                        )
+                    )
+                    name = (meta.get("object_name") or "").lower()
+                    if name and obj_lc in name:
+                        filtered.append(e)
+                events = filtered
+        return list(reversed(events))
+
+    async def who_last_touched(self, object_name: str) -> dict:
+        """'Who last touched my wallet?' — most recent PICKED_UP /
+        PLACED_DOWN / INTERACTED_WITH event for this object. Returns
+        {found, object_name, event_type, ts, person_name, room}."""
+        obj_ent = self.world.find_entity_by_name(object_name)
+        if not obj_ent:
+            return {"found": False,
+                    "message": f"No object named {object_name} in registry."}
+        events = await self.world.store.search_events(
+            entity_id=obj_ent.id,
+            event_types=["picked_up", "placed_down", "interacted_with"],
+            limit=1,
+        )
+        if not events:
+            return {
+                "found": False,
+                "message": f"No interaction events for {object_name}.",
+            }
+        e = events[0]
+        raw = e.get("metadata")
+        if isinstance(raw, dict):
+            meta = raw
+        elif isinstance(raw, str) and raw:
+            import json as _json
+            try:
+                meta = _json.loads(raw)
+            except Exception:
+                meta = {}
+        else:
+            meta = {}
+        return {
+            "found": True,
+            "object_name": object_name,
+            "event_type": e["event_type"],
+            "ts": e["ts"],
+            "person_name": meta.get("person_name") or e.get("entity_name"),
+            "person_id": meta.get("person_id") or e.get("person_id"),
+            "room": e.get("room"),
+        }
+
     async def pet_care_summary(
         self, name: str, hours_ago: int = 24,
     ) -> dict:

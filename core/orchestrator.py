@@ -123,6 +123,7 @@ from modules.vision.observation_builder import ObservationBuilder
 from modules.layout import DoorMap
 from modules.world_model import (
     BehavioralProfileBuilder,
+    InteractionMonitor,
     WorldModel,
     WorldQueryTools,
     WorldStore,
@@ -260,6 +261,7 @@ class Orchestrator:
         self.world_store: Optional[WorldStore] = None
         self.world_model: Optional[WorldModel] = None
         self.observation_builder: Optional[ObservationBuilder] = None
+        self.interaction_monitor: Optional[InteractionMonitor] = None
         # LLM-facing query layer — built alongside WorldModel. The four
         # tools (get_entity_status, list_entities_in_room, who_is_home,
         # search_recent_events) ride into _build_tool_registry when this
@@ -2286,6 +2288,65 @@ class Orchestrator:
                 },
             },
         },
+        # ── Interaction tools (§24.5) ────────────────────────────────────
+        {
+            "type": "function",
+            "function": {
+                "name": "what_did_someone_do_with",
+                "description": (
+                    "Chronological list of interaction events involving a "
+                    "person — INTERACTED_WITH, PICKED_UP, PLACED_DOWN. Use "
+                    "for 'what did Cole do with the wallet today', 'has "
+                    "Anna touched the keys'. Optional `object_name` filter "
+                    "narrows to one object. Returned oldest-first so the "
+                    "LLM can phrase it as a narrative."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["person_name"],
+                    "properties": {
+                        "person_name": {
+                            "type": "string",
+                            "description": "Resident name, case-insensitive.",
+                        },
+                        "object_name": {
+                            "type": "string",
+                            "description": (
+                                "Optional object filter. Substring-matches "
+                                "metadata.object_name when no entity exists."
+                            ),
+                        },
+                        "hours_ago": {
+                            "type": "integer",
+                            "description": "Lookback window. Default 24h.",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "who_last_touched",
+                "description": (
+                    "Most recent interaction event for a tracked object. "
+                    "Use for 'who last touched my wallet', 'who put this "
+                    "down here'. Returns event_type + ts + person_name + "
+                    "room. Returns {found: false} when the object isn't "
+                    "in the world model's entity registry."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "required": ["object_name"],
+                    "properties": {
+                        "object_name": {
+                            "type": "string",
+                            "description": "Object's display name.",
+                        },
+                    },
+                },
+            },
+        },
     ]
 
     def _world_tool_handlers(self) -> dict:
@@ -2327,14 +2388,30 @@ class Orchestrator:
         async def _pet_care(name: str, hours_ago: int = 24) -> dict:
             return await wq.pet_care_summary(name, hours_ago=hours_ago)
 
+        async def _did_with(
+            person_name: str,
+            object_name: Optional[str] = None,
+            hours_ago: int = 24,
+        ) -> list[dict]:
+            return await wq.what_did_someone_do_with(
+                person_name=person_name,
+                object_name=object_name,
+                hours_ago=hours_ago,
+            )
+
+        async def _last_touched(object_name: str) -> dict:
+            return await wq.who_last_touched(object_name)
+
         return {
-            "get_entity_status":     _entity,
-            "list_entities_in_room": _in_room,
-            "who_is_home":           _home,
-            "search_recent_events":  _events,
-            "where_is_pet":          _where_pet,
-            "list_pets":             _list_pets,
-            "pet_care_summary":      _pet_care,
+            "get_entity_status":         _entity,
+            "list_entities_in_room":     _in_room,
+            "who_is_home":               _home,
+            "search_recent_events":      _events,
+            "where_is_pet":              _where_pet,
+            "list_pets":                 _list_pets,
+            "pet_care_summary":          _pet_care,
+            "what_did_someone_do_with":  _did_with,
+            "who_last_touched":          _last_touched,
         }
 
     _GET_SNAPSHOT_TOOL = {
@@ -4654,6 +4731,32 @@ class Orchestrator:
             except Exception as e:
                 logger.debug(f"[Shutdown] MQTT disconnect failed: {e}")
 
+        # World-model side: stop the observation polling loops, the
+        # interaction monitor, and the WorldModel timers. Errors are
+        # non-fatal — we're going down anyway.
+        if self.interaction_monitor is not None:
+            try:
+                await self.interaction_monitor.stop()
+            except Exception as e:
+                logger.debug(f"[Shutdown] interaction_monitor stop failed: {e}")
+        if self.observation_builder is not None:
+            try:
+                await self.observation_builder.stop()
+            except Exception as e:
+                logger.debug(f"[Shutdown] observation_builder stop failed: {e}")
+            # MediaPipe Hands holds GPU buffers on Windows; explicit close.
+            hd = getattr(self.observation_builder, "hand_detector", None)
+            if hd is not None and hasattr(hd, "close"):
+                try:
+                    hd.close()
+                except Exception:
+                    pass
+        if self.world_model is not None:
+            try:
+                await self.world_model.stop()
+            except Exception as e:
+                logger.debug(f"[Shutdown] world_model stop failed: {e}")
+
         if self.cameras:
             try:
                 await self.cameras.close()
@@ -4759,6 +4862,26 @@ class Orchestrator:
                     self.config.get("system", {}).get("data_dir", "data")
                 )
                 snapshot_dir = data_dir / "world_snapshots"
+                # §24.1 — MediaPipe Hands. Optional; if mediapipe isn't
+                # importable in this environment we fall through to no
+                # hand detection (interaction events stop firing).
+                hand_detector = None
+                try:
+                    from modules.vision.hand_detector import HandDetector
+                    hand_cfg = (
+                        self.config.get("world_model", {}) or {}
+                    ).get("hand_detector", {}) or {}
+                    hand_detector = HandDetector(
+                        max_num_hands=int(hand_cfg.get("max_num_hands", 4)),
+                        min_detection_confidence=float(
+                            hand_cfg.get("min_detection_confidence", 0.5)
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[Init] HandDetector unavailable; interactions "
+                        f"will not fire ({e})"
+                    )
                 self.observation_builder = ObservationBuilder(
                     bus=self.bus,
                     camera_manager=self.cameras,
@@ -4768,6 +4891,7 @@ class Orchestrator:
                     posture_analyzer=self.posture,
                     rooms_config=ob_rooms,
                     snapshot_dir=snapshot_dir,
+                    hand_detector=hand_detector,
                 )
                 # Wire the camera-health publisher so WorldModel can
                 # suspend its state machine for offline rooms.
@@ -4777,6 +4901,19 @@ class Orchestrator:
                 # per-room polling tasks in its own start().
                 await self.world_model.start()
                 await self.observation_builder.start()
+                # §24.3 InteractionMonitor — subscribes to entity events
+                # and correlates INTERACTED_WITH × LOST_VISIBILITY into
+                # PICKED_UP, INTERACTED_WITH × FIRST_SEEN into
+                # PLACED_DOWN. No-op if hand detector didn't load
+                # (no interactions to correlate). Stored on the
+                # orchestrator so _shutdown can stop() it.
+                self.interaction_monitor = InteractionMonitor(
+                    bus=self.bus, world=self.world_model,
+                    config=(
+                        self.config.get("world_model", {}) or {}
+                    ).get("interactions", {}),
+                )
+                await self.interaction_monitor.start()
                 # Query layer over the live model — registered into the
                 # LLM tool registry by _build_tool_registry below.
                 self.world_query_tools = WorldQueryTools(self.world_model)

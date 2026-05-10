@@ -21,6 +21,7 @@ from modules.world_model.cluster_builder import (
     AnimalClusterBuilder,
     apply_cluster_labels,
 )
+from modules.world_model.interactions import InteractionMonitor
 
 __all__ = [
     "EntityState",
@@ -36,4 +37,5 @@ __all__ = [
     "bootstrap_pets_from_config",
     "AnimalClusterBuilder",
     "apply_cluster_labels",
+    "InteractionMonitor",
 ]
