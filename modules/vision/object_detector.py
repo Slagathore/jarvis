@@ -128,6 +128,14 @@ class ObjectDetector:
         if frame is None or model is None:
             return []
 
+        # Perf tracking — per-frame YOLO inference is the most common
+        # culprit when the dashboard feels laggy, so we record every
+        # call.
+        from modules.context.perf_tracker import perf
+        with perf().timeit(f"yolo.{self._model_name.replace('.pt','')}"):
+            return self._detect_inner(frame, model)
+
+    def _detect_inner(self, frame: np.ndarray, model: Any) -> list[dict]:
         try:
             results = model(frame, conf=self._conf_threshold, verbose=False)
             detections = []

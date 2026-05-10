@@ -2120,6 +2120,14 @@ class DashboardServer:
         async def tunables_get():
             return JSONResponse(_gather_config_state())
 
+        @app.get("/api/perf")
+        async def perf_get():
+            """Snapshot the per-component timing tracker so the Perf tab
+            can show where the lag is. Cheap aggregation — just walks
+            the rolling deques."""
+            from modules.context.perf_tracker import perf as _perf
+            return JSONResponse(_perf().snapshot())
+
         @app.patch("/api/tunables")
         async def tunables_patch(request: Request):
             body = await request.json()

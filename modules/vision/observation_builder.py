@@ -231,15 +231,18 @@ class ObservationBuilder:
         logger.debug(
             f"[ObservationBuilder] '{room_id}' polling at {fps} fps"
         )
+        from modules.context.perf_tracker import perf
         while not self._stopped:
             t0 = asyncio.get_event_loop().time()
             try:
-                frame = await self.cm.capture_frame_async(room_id)
+                with perf().timeit(f"capture.{room_id}"):
+                    frame = await self.cm.capture_frame_async(room_id)
                 if frame is not None:
                     ts = datetime.now(timezone.utc)
-                    observations = await self._build_for_frame(
-                        room_id, frame, ts
-                    )
+                    with perf().timeit(f"build_for_frame.{room_id}"):
+                        observations = await self._build_for_frame(
+                            room_id, frame, ts
+                        )
                     # Always publish — empty `observations` is exactly
                     # the signal WorldModel needs to fire LOST_VISIBILITY
                     # for entities that were PRESENT in this camera last

@@ -265,6 +265,11 @@ class WorldModel:
 
     async def _on_observation_batch(self, payload: dict) -> None:
         """payload: {camera, room, ts, observations: [Observation, ...]}"""
+        from modules.context.perf_tracker import perf
+        with perf().timeit("world_model.observation_batch"):
+            await self._on_observation_batch_inner(payload)
+
+    async def _on_observation_batch_inner(self, payload: dict) -> None:
         async with self._lock:
             camera = payload["camera"]
             ts = payload["ts"] if isinstance(payload["ts"], datetime) \
@@ -742,7 +747,7 @@ class WorldModel:
                         # below handle the obs as an unidentified person.
                         obs.person_id = None
                         obs.person_name = None
-                        obs.person_match_confidence = None
+                        obs.person_match_confidence = 0.0
                     else:
                         existing.metadata["identity_overrode_continuity"] = True
                         await self._update_matched(

@@ -3934,6 +3934,7 @@ setInterval(loadClownStatus, 8000);
   const panes = {
     home: document.getElementById("tab-pane-home"),
     reviews: document.getElementById("tab-pane-reviews"),
+    perf: document.getElementById("tab-pane-perf"),
     settings: document.getElementById("tab-pane-settings"),
     logs: document.getElementById("tab-pane-logs"),
   };
@@ -3949,6 +3950,8 @@ setInterval(loadClownStatus, 8000);
       if (target === "reviews") loadReviewsTab();
       if (target === "logs") connectLogStream();
       if (target !== "logs") disconnectLogStream();
+      if (target === "perf") startPerfRefresh();
+      else stopPerfRefresh();
     });
   });
   // Keep the tab badge in sync independent of which tab is open.
@@ -4193,6 +4196,107 @@ function _updateReviewsCount() {
 
   assignBtn.addEventListener("click", () => doBulk("assign"));
   rejectBtn.addEventListener("click", () => doBulk("reject"));
+})();
+
+// ── Perf tab ──────────────────────────────────────────────────────────────
+
+let _perfTimer = null;
+
+async function loadPerfTab() {
+  try {
+    const res = await fetch("/api/perf");
+    if (!res.ok) return;
+    const body = await res.json();
+    renderPerf(body);
+  } catch (e) {
+    console.warn("[perf] load failed:", e);
+  }
+}
+
+function renderPerf(state) {
+  const grid = document.getElementById("perf-grid");
+  if (!grid) return;
+  const uptimeEl = document.getElementById("perf-uptime");
+  if (uptimeEl) {
+    const s = Math.round(state.uptime_s || 0);
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    uptimeEl.textContent = `uptime: ${m}m ${sec}s`;
+  }
+  const timings = state.timings || {};
+  const entries = Object.entries(timings);
+  if (entries.length === 0) {
+    grid.innerHTML = '<div class="who-empty">No timing samples yet. Wait a few seconds for the hot paths to fire.</div>';
+    return;
+  }
+  // Sort by avg_ms descending — heaviest at top so the lag culprit is
+  // visible without scrolling.
+  entries.sort((a, b) => (b[1].avg_ms || 0) - (a[1].avg_ms || 0));
+  // The "lag budget" reference: for a 30fps loop you have ~33ms; for
+  // 5fps you have 200ms. Color avg by where it sits in the 0-100ms range.
+  const _color = (ms) => {
+    if (ms < 10) return "perf-green";
+    if (ms < 30) return "perf-amber";
+    if (ms < 60) return "perf-orange";
+    return "perf-red";
+  };
+  grid.innerHTML = entries.map(([name, t]) => `
+    <div class="perf-card">
+      <div class="perf-name">${escapeHtml(name)}</div>
+      <div class="perf-row">
+        <span class="perf-label">avg</span>
+        <span class="perf-val ${_color(t.avg_ms)}">${t.avg_ms.toFixed(1)} ms</span>
+      </div>
+      <div class="perf-row">
+        <span class="perf-label">p50</span>
+        <span class="perf-val">${t.p50_ms.toFixed(1)} ms</span>
+      </div>
+      <div class="perf-row">
+        <span class="perf-label">p95</span>
+        <span class="perf-val ${_color(t.p95_ms)}">${t.p95_ms.toFixed(1)} ms</span>
+      </div>
+      <div class="perf-row">
+        <span class="perf-label">max</span>
+        <span class="perf-val">${t.max_ms.toFixed(1)} ms</span>
+      </div>
+      <div class="perf-row">
+        <span class="perf-label">last</span>
+        <span class="perf-val">${t.last_ms.toFixed(1)} ms</span>
+      </div>
+      <div class="perf-row">
+        <span class="perf-label">n</span>
+        <span class="perf-val">${t.n}</span>
+      </div>
+    </div>
+  `).join("");
+}
+
+function startPerfRefresh() {
+  stopPerfRefresh();
+  loadPerfTab();
+  const auto = document.getElementById("perf-auto-refresh");
+  if (auto && auto.checked) {
+    _perfTimer = setInterval(loadPerfTab, 2000);
+  }
+}
+
+function stopPerfRefresh() {
+  if (_perfTimer) {
+    clearInterval(_perfTimer);
+    _perfTimer = null;
+  }
+}
+
+(function wirePerfControls() {
+  const auto = document.getElementById("perf-auto-refresh");
+  const refresh = document.getElementById("perf-refresh-now");
+  if (auto) {
+    auto.addEventListener("change", () => {
+      if (auto.checked) startPerfRefresh();
+      else stopPerfRefresh();
+    });
+  }
+  if (refresh) refresh.addEventListener("click", () => loadPerfTab());
 })();
 
 // ── Settings tab ──────────────────────────────────────────────────────────
