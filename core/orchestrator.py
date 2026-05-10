@@ -119,6 +119,7 @@ from modules.vision.light_detector import LightDetector
 from modules.vision.mess_detector import MessDetector
 from modules.vision.object_detector import ObjectDetector
 from modules.vision.posture_analyzer import PostureAnalyzer
+from modules.layout import DoorMap
 from modules.vision.scene_analyzer import SceneAnalyzer
 from modules.vision.wyze_cam_control import WyzeCamControl
 from core.room_settings import RoomSettings
@@ -240,6 +241,9 @@ class Orchestrator:
         self.cameras: Optional[CameraManager] = None
         self.light_detector: Optional[LightDetector] = None
         self.posture: Optional[PostureAnalyzer] = None
+        # House-layout door graph. Built in _init_voice (after data_dir is
+        # known) and consumed by _try_layout_teach + future transit-inference.
+        self.door_map: Optional[DoorMap] = None
         self.object_detector: Optional[ObjectDetector] = None
         self.scene_analyzer: Optional[SceneAnalyzer] = None
         self.face_recognizer: Optional[FaceRecognizer] = None
@@ -366,6 +370,11 @@ class Orchestrator:
             self.config.get("system", {}).get("data_dir", "data")
         )
         self.room_settings = RoomSettings(data_dir / "room_settings.json")
+
+        # House layout (door graph). Persisted next to room_settings so a
+        # backup of data/ captures both. Empty file is fine — entries
+        # accumulate as Cole teaches doors via voice.
+        self.door_map = DoorMap(data_dir / "house_layout.json")
 
         self.stt = WhisperSTT(self.config)
         # WhisperSTT.load() is synchronous (blocking GPU/CPU work) — run in thread
@@ -885,7 +894,6 @@ class Orchestrator:
         # turn's LLM is still doing.
         from modules.voice.audio_utils import (
             SAMPLE_RATE,
-            chime_bytes,
             db_from_rms,
             play_chime_async,
             record_until_silence,
@@ -938,10 +946,13 @@ class Orchestrator:
                         )
                     else:
                         try:
-                            pcm, rate = chime_bytes()
-                            played = await self.speaker_manager.play(
-                                room, pcm, rate
-                            )
+                            # play_chime() takes the pre-staged fast path
+                            # for sinks that support it (Wyze SSH today),
+                            # cutting ~300-500 ms of SCP latency off the
+                            # wake-chime → record-start sequence. Falls
+                            # back to plain play() with the same PCM bytes
+                            # for sinks that don't.
+                            played = await self.speaker_manager.play_chime(room)
                             chimed_in_room = bool(played)
                             if not chimed_in_room:
                                 await self._emit_issue(
@@ -1223,6 +1234,12 @@ class Orchestrator:
 
         # Reminder intent fast path: "remind me to X in N minutes" / "at HH:MM"
         if await self._try_create_reminder(text, room):
+            return
+
+        # House-layout teaching: "this door goes to the kitchen" / "list
+        # doors" / "forget all doors here". Persisted into door_map so a
+        # future transit-inference pass can use them.
+        if await self._try_layout_teach(text, room):
             return
 
         # Calendar intents are handled by the LLM via tool calling below —
@@ -2216,6 +2233,205 @@ class Orchestrator:
             fallback=f"Got it — I'll remind you to {task}.",
         )
         await self._speak(confirmation, room=room, priority="conversation")
+        return True
+
+    # ── House-layout teaching ─────────────────────────────────────────────
+
+    def _resolve_room_phrase(self, phrase: str) -> Optional[str]:
+        """Map a spoken phrase like "the kitchen" or "office" to a room id
+        from config.yaml. Returns None if no obvious match — caller asks
+        the user to try again rather than silently writing the wrong id.
+
+        Match is loose on purpose: spaces vs underscores, partial substring
+        ("bed" → "bedroom"), and config display_name matching all win.
+        """
+        if not phrase:
+            return None
+        needle = phrase.lower().strip().replace(" ", "_")
+        rooms = self.config.get("rooms", []) or []
+        # Pass 1: exact id match.
+        for r in rooms:
+            rid = str(r.get("id", "")).lower()
+            if rid and rid == needle:
+                return r["id"]
+        # Pass 2: display_name (case-insensitive).
+        bare = phrase.lower().strip()
+        for r in rooms:
+            disp = str(r.get("display_name", "")).lower()
+            if disp and disp == bare:
+                return r["id"]
+        # Pass 3: substring match (single hit only — multiple = ambiguous,
+        # better to reject than guess).
+        candidates = []
+        for r in rooms:
+            rid = str(r.get("id", "")).lower()
+            disp = str(r.get("display_name", "")).lower()
+            if needle and (needle in rid or needle in disp.replace(" ", "_")):
+                candidates.append(r["id"])
+            elif bare and bare in disp:
+                candidates.append(r["id"])
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    async def _capture_pointing_xy(self, room: str) -> tuple[float, float]:
+        """Snap a frame in `room` and pull the pointing wrist's normalized
+        (x, y) from PostureAnalyzer. Returns (0.5, 0.5) if no pointing
+        gesture is detected — frame center is a sensible fallback that
+        the dashboard can render and the user can adjust visually later.
+        """
+        default = (0.5, 0.5)
+        if self.cameras is None or self.posture is None:
+            return default
+        try:
+            frame = await self.cameras.capture_frame_async(room)
+        except Exception as e:
+            logger.debug(f"[Layout] capture_frame for '{room}' failed: {e}")
+            return default
+        if frame is None:
+            return default
+        try:
+            full = await self.posture.analyze_full_async(frame)
+        except Exception as e:
+            logger.debug(f"[Layout] posture analyze failed: {e}")
+            return default
+        if not full or full.get("gesture") != "pointing":
+            return default
+        # PostureAnalyzer doesn't currently expose the actual landmark
+        # coordinates of the pointing wrist; only the gesture label. Until
+        # we wire that through, returning the default still saves the
+        # door entry — the user can refine via the dashboard. Logging
+        # here so we don't silently lose the pointing context.
+        logger.debug(
+            f"[Layout] pointing detected in '{room}' but exact xy not "
+            "yet exported by PostureAnalyzer — using frame center."
+        )
+        return default
+
+    async def _try_layout_teach(self, text: str, room: str) -> bool:
+        """Handle "this door goes to X" / "list doors" / "forget all
+        doors". Returns True if handled (caller short-circuits the LLM).
+        """
+        from modules.voice.intents import parse_layout_command
+        if self.door_map is None:
+            return False
+        intent = parse_layout_command(text)
+        if intent is None:
+            return False
+
+        action = intent.get("action")
+
+        if action == "list":
+            doors = self.door_map.get_doors(room)
+            if not doors:
+                summary = f"No doors taught in {room} yet."
+            else:
+                lines = [f"{len(doors)} door(s) in {room}:"]
+                for d in doors:
+                    target = d.get("neighbor_room") or "unknown"
+                    lines.append(
+                        f"  • '{d.get('label', '?')}' → {target}"
+                    )
+                summary = "\n".join(lines)
+            ack = await self._compose_in_character(
+                prompt=(
+                    f"Cole just asked you to list the doors taught for the "
+                    f"current room '{room}'. Here is the data — speak a "
+                    f"single short in-character paraphrase so it sounds "
+                    f"natural, no preamble:\n{summary}"
+                ),
+                fallback=summary,
+            )
+            await self._speak(ack, room=room, priority="conversation")
+            return True
+
+        if action == "clear_all":
+            n = await self.door_map.clear_room(room)
+            ack = await self._compose_in_character(
+                prompt=(
+                    f"Cole just told you to forget every door in '{room}'. "
+                    f"You cleared {n} entries. Speak a single short "
+                    f"in-character acknowledgement, no preamble."
+                ),
+                fallback=f"Cleared {n} doors in {room}.",
+            )
+            await self._speak(ack, room=room, priority="conversation")
+            return True
+
+        if action == "clear_one":
+            phrase = intent.get("room_phrase", "")
+            entry = self.door_map.find_by_label(room, phrase)
+            if entry is None:
+                ack = await self._compose_in_character(
+                    prompt=(
+                        f"Cole asked you to forget the '{phrase}' door in "
+                        f"'{room}', but no matching entry was taught. "
+                        f"Speak a single short in-character note explaining "
+                        f"there's nothing to remove, no preamble."
+                    ),
+                    fallback=f"No '{phrase}' door taught in {room}.",
+                )
+                await self._speak(ack, room=room, priority="conversation")
+                return True
+            await self.door_map.remove_door(room, str(entry.get("id", "")))
+            ack = await self._compose_in_character(
+                prompt=(
+                    f"Cole told you to forget the '{phrase}' door in "
+                    f"'{room}'. You removed it. Speak a single short "
+                    f"in-character acknowledgement, no preamble."
+                ),
+                fallback=f"Forgot the {phrase} door in {room}.",
+            )
+            await self._speak(ack, room=room, priority="conversation")
+            return True
+
+        # action == "add"
+        phrase = intent.get("room_phrase", "")
+        neighbor_id = self._resolve_room_phrase(phrase)
+        # Capture pointing xy in parallel-friendly order (sequential is
+        # fine — single frame fetch + a fast pose pass).
+        fx, fy = await self._capture_pointing_xy(room)
+        label = phrase if phrase else "unlabeled"
+        await self.door_map.add_door(
+            room=room,
+            label=label,
+            neighbor_room=neighbor_id,
+            fx=fx,
+            fy=fy,
+        )
+        await self._broadcast({
+            "type":          "layout_door_added",
+            "room":          room,
+            "label":         label,
+            "neighbor_room": neighbor_id,
+            "fx":            fx,
+            "fy":            fy,
+        })
+        if neighbor_id is None:
+            ack = await self._compose_in_character(
+                prompt=(
+                    f"Cole just taught you a new door in '{room}' that he "
+                    f"called '{phrase}', but no room with that name exists "
+                    f"in the config. You saved the door anyway, but you "
+                    f"don't know where it leads yet. Speak a single short "
+                    f"in-character acknowledgement that mentions the room "
+                    f"name didn't match anything you know, no preamble."
+                ),
+                fallback=(
+                    f"Saved a door in {room}, but '{phrase}' isn't a room "
+                    f"I recognize."
+                ),
+            )
+        else:
+            ack = await self._compose_in_character(
+                prompt=(
+                    f"Cole just taught you a new door in '{room}' leading "
+                    f"to '{neighbor_id}'. Speak a single short in-character "
+                    f"acknowledgement, no preamble."
+                ),
+                fallback=f"Got it — door from {room} to {neighbor_id} saved.",
+            )
+        await self._speak(ack, room=room, priority="conversation")
         return True
 
     async def _on_text_chat(self, text: str, room: str = "office") -> None:
@@ -3363,6 +3579,29 @@ class Orchestrator:
 
     # ── Continuous-conversation follow-up listener ─────────────────────────
 
+    async def _play_followup_beep(self, room: str) -> None:
+        """Play the reply-window beep into `room` via its configured speaker
+        sink, falling back to the PC chime if the room has no usable speaker.
+        Same routing rule as wake-chime: if SpeakerManager has a real sink
+        (anything but Null) for the room, push the chime there; otherwise
+        the local PC speaker is the only option Cole will hear.
+        """
+        from modules.voice.audio_utils import chime_bytes, play_chime_async
+        played_in_room = False
+        try:
+            if self.speaker_manager is not None:
+                spk_type = self.speaker_manager.get_speaker_type(room)
+                if spk_type not in ("none",):
+                    played_in_room = await self.speaker_manager.play_chime(room)
+        except Exception as e:
+            logger.debug(f"[Followup] in-room beep for '{room}' raised: {e}")
+            played_in_room = False
+        if not played_in_room:
+            try:
+                await play_chime_async()
+            except Exception as e:
+                logger.debug(f"[Followup] PC fallback beep failed: {e}")
+
     async def _listen_followup(self, room: str) -> None:
         """
         Open a short listen window after a conversational reply so the user
@@ -3384,8 +3623,14 @@ class Orchestrator:
 
         logger.info(f"[Followup] opening listen window ({listen_seconds}s) for room '{room}'")
 
-        # Brief grace so reverb from our own TTS dies before we open the mic.
-        await asyncio.sleep(0.4)
+        # Pre-record cadence: 1s pause after Jarvis speech (lets reverb die +
+        # gives natural pacing) → in-room beep so the user knows the mic is
+        # hot wherever they are → 300ms gap so the beep itself doesn't bleed
+        # into the recorded audio. Mirrors the wake-chime routing so a
+        # bedroom followup beeps in the bedroom, not on the office PC.
+        await asyncio.sleep(1.0)
+        await self._play_followup_beep(room)
+        await asyncio.sleep(0.3)
 
         # ── CAPTURE PHASE — mic-exclusive, lock held briefly ────────────────
         # Same lock-scope discipline as _on_wake_detected: hold the lock only

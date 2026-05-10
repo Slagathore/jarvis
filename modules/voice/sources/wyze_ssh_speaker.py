@@ -76,6 +76,7 @@ class WyzeSshSpeakerSink(SpeakerSink):
         ssh_password: Optional[str] = None,
         ssh_key_path: Optional[str] = None,
         remote_play_path: str = "/tmp/jarvis_play.wav",
+        remote_chime_path: str = "/tmp/jarvis_chime.wav",
         volume: int = 60,
         sample_rate_hz: int = _CAM_SPEAKER_RATE_HZ,
         connect_timeout_s: float = 5.0,
@@ -88,6 +89,7 @@ class WyzeSshSpeakerSink(SpeakerSink):
         self._password = ssh_password if ssh_password else None
         self._key_path = ssh_key_path if ssh_key_path else None
         self._remote_path = remote_play_path
+        self._remote_chime_path = remote_chime_path
         # audioplay_t20 takes 0-100. Default 60 is "audible across a small
         # room" without clipping; the speaker distorts noticeably above 80.
         self._volume = max(0, min(100, int(volume)))
@@ -99,6 +101,13 @@ class WyzeSshSpeakerSink(SpeakerSink):
         # Lazy: paramiko import is slow and not every install needs it.
         self._client: Optional[Any] = None
         self._client_lock = asyncio.Lock()
+        # Pre-staged chime state. The wake-confirmation chime is played
+        # dozens of times per session — uploading the same 1.5KB WAV every
+        # time costs ~300-500 ms of SCP per wake event before the user even
+        # hears the chime. We stage it once at first use, keyed by the
+        # source bytes' hash so a chime change auto-restages.
+        self._staged_chime_hash: Optional[str] = None
+        self._staged_chime_lock = asyncio.Lock()
 
     @property
     def room(self) -> str:
@@ -212,12 +221,19 @@ class WyzeSshSpeakerSink(SpeakerSink):
         """Sync helper that runs inside a thread. Uses paramiko's SFTP to
         push the WAV, then exec_command to run audioplay and waits for exit.
         """
+        self._sftp_upload(self._remote_path, wav_bytes)
+        self._exec_audioplay(self._remote_path)
+
+    def _sftp_upload(self, remote_path: str, wav_bytes: bytes) -> None:
+        """Push `wav_bytes` to `remote_path` on the cam via SFTP. Caller is
+        responsible for ensuring the SSH session is alive.
+        """
         client = self._client
         if client is None:
             return
         sftp = client.open_sftp()
         try:
-            with sftp.file(self._remote_path, "wb") as remote:
+            with sftp.file(remote_path, "wb") as remote:
                 remote.write(wav_bytes)
         finally:
             try:
@@ -225,6 +241,13 @@ class WyzeSshSpeakerSink(SpeakerSink):
             except Exception:
                 pass
 
+    def _exec_audioplay(self, remote_path: str) -> None:
+        """Run audioplay_t20 against an already-uploaded WAV at `remote_path`
+        and wait for it to finish. Raises AudioError on non-zero exit.
+        """
+        client = self._client
+        if client is None:
+            return
         # LD_LIBRARY_PATH must be set inline because the binary needs
         # libimp.so to find the proprietary Ingenic IMP audio API. The
         # cam's default PATH for ssh exec sessions doesn't include
@@ -232,7 +255,7 @@ class WyzeSshSpeakerSink(SpeakerSink):
         # positional arg (0-100). audioplay returns 0 on success.
         cmd = (
             f"LD_LIBRARY_PATH={_LD_LIBRARY_PATH} "
-            f"{_AUDIOPLAY_BIN} {self._remote_path} {self._volume}"
+            f"{_AUDIOPLAY_BIN} {remote_path} {self._volume}"
         )
         _stdin, stdout, stderr = client.exec_command(cmd, timeout=30.0)
         rc = stdout.channel.recv_exit_status()
@@ -241,6 +264,58 @@ class WyzeSshSpeakerSink(SpeakerSink):
             raise AudioError(
                 f"[WyzeSpeaker:{self._room}] audioplay exit {rc}: {err.strip()}"
             )
+
+    # ── Pre-staged chime fast path ───────────────────────────────────────────
+
+    async def play_chime(self, pcm: bytes, sample_rate: int) -> None:
+        """Play a short chime, lazily staging it on the cam so the next call
+        skips the SCP step entirely. Identical audible result to play(),
+        ~300-500 ms faster on every call after the first because the WAV
+        upload happens once per chime fingerprint instead of every time.
+        Raises AudioError on transport / playback failure, same contract
+        as play().
+        """
+        if not pcm:
+            return
+        if not await self._ensure_connected():
+            raise AudioError(
+                f"[WyzeSpeaker:{self._room}] SSH unavailable to {self._host}"
+            )
+        resampled = self._resample_int16(pcm, sample_rate, self._cam_rate)
+        wav_bytes = self._wrap_in_wav(resampled, self._cam_rate)
+        # Hash the wrapped bytes so a chime tweak (different freq/duration)
+        # auto-restages without manual cache invalidation.
+        import hashlib as _hashlib
+        chime_hash = _hashlib.sha1(wav_bytes).hexdigest()
+
+        async with self._staged_chime_lock:
+            needs_stage = self._staged_chime_hash != chime_hash
+            try:
+                if needs_stage:
+                    await asyncio.to_thread(
+                        self._sftp_upload, self._remote_chime_path, wav_bytes
+                    )
+                    self._staged_chime_hash = chime_hash
+                    logger.debug(
+                        f"[WyzeSpeaker:{self._room}] staged chime "
+                        f"({len(wav_bytes)} B) at {self._remote_chime_path}"
+                    )
+                await asyncio.to_thread(
+                    self._exec_audioplay, self._remote_chime_path
+                )
+            except AudioError:
+                # Stale connection or audioplay failure — drop both the
+                # SSH session AND the staged-chime marker. Next call will
+                # reconnect and re-upload.
+                self._safe_close()
+                self._staged_chime_hash = None
+                raise
+            except Exception as e:
+                self._safe_close()
+                self._staged_chime_hash = None
+                raise AudioError(
+                    f"[WyzeSpeaker:{self._room}] chime playback failed: {e}"
+                ) from e
 
     @staticmethod
     def _resample_int16(pcm_in: bytes, in_rate: int, out_rate: int) -> bytes:

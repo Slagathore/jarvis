@@ -27,7 +27,7 @@ Classes: SpeakerManager
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional, cast
 
 from loguru import logger
 
@@ -60,6 +60,7 @@ def _make_speaker_sink(room_id: str, spk_cfg: dict) -> Optional[SpeakerSink]:
             ssh_password=spk_cfg.get("ssh_password"),
             ssh_key_path=spk_cfg.get("ssh_key_path"),
             remote_play_path=str(spk_cfg.get("remote_play_path", "/tmp/jarvis_play.wav")),
+            remote_chime_path=str(spk_cfg.get("remote_chime_path", "/tmp/jarvis_chime.wav")),
             volume=int(spk_cfg.get("volume", 60)),
             sample_rate_hz=int(spk_cfg.get("sample_rate_hz", 8000)),
             connect_timeout_s=float(spk_cfg.get("connect_timeout_s", 5.0)),
@@ -130,6 +131,57 @@ class SpeakerManager:
         if isinstance(sink, Esp32MqttSpeakerSink):
             return "esp32_i2s_spk"
         return "none"
+
+    async def play_chime(self, room: str) -> bool:
+        """Play the standard wake-confirmation chime in `room`. Sinks that
+        support pre-staging (WyzeSshSpeakerSink today) skip the per-call
+        upload, which removes ~300-500 ms of waiting silence between wake
+        word and chime — the perceived "Jarvis heard me" latency. All
+        other sinks fall through to the regular play() path with the same
+        chime bytes, so the audible result is identical regardless of
+        driver.
+        """
+        sink = self._sinks.get(room)
+        if sink is None:
+            return False
+        # Same mute / volume override semantics as play() — chimes respect
+        # the dashboard's per-room mute toggle.
+        tweaks = self._room_settings.get(room) if self._room_settings is not None else {}
+        if tweaks.get("muted"):
+            return True
+
+        # Lazy-import audio_utils so cold start doesn't pay for the numpy
+        # synthesis cost when nothing has chimed yet.
+        from modules.voice.audio_utils import chime_bytes
+        pcm, rate = chime_bytes()
+
+        prev_volume = None
+        new_volume = tweaks.get("volume")
+        if new_volume is not None and hasattr(sink, "_volume"):
+            try:
+                prev_volume = getattr(sink, "_volume")
+                setattr(sink, "_volume", max(0, min(100, int(new_volume))))
+            except Exception:
+                prev_volume = None
+
+        try:
+            fast_path: Optional[Callable[[bytes, int], Awaitable[None]]] = (
+                getattr(sink, "play_chime", None)
+            )
+            if fast_path is not None:
+                await cast(Awaitable[None], fast_path(pcm, rate))
+            else:
+                await sink.play(pcm, rate)
+            return True
+        except Exception as e:
+            logger.warning(f"[SpeakerManager] play_chime('{room}') failed: {e}")
+            return False
+        finally:
+            if prev_volume is not None:
+                try:
+                    setattr(sink, "_volume", prev_volume)
+                except Exception:
+                    pass
 
     async def play(self, room: str, pcm: bytes, sample_rate: int) -> bool:
         """Send PCM to the room's speaker. Returns False if no sink is
