@@ -2856,6 +2856,94 @@ loadWorldEvents();
 // the endpoint reads the indexed event log + decodes JSON, no I/O fanout.
 setInterval(loadWorldEvents, 5000);
 
+// ── Interactions timeline (§24.6) ─────────────────────────────────────────
+// Pre-filtered tail of INTERACTED_WITH / PICKED_UP / PLACED_DOWN / HANDED_OFF
+// events. The verb-template + thumbnail makes each row read like a sentence
+// ("Cole picked up wallet · office · 3m ago") rather than the raw event log.
+
+const INTERACTION_TEMPLATES = {
+  picked_up: (e, m) =>
+    `${escapeHtml(m.person_name || "?")} picked up ` +
+    `${escapeHtml(m.object_name || e.entity_name || "object")}`,
+  placed_down: (e, m) =>
+    `${escapeHtml(m.person_name || "?")} placed ` +
+    `${escapeHtml(m.object_name || e.entity_name || "object")} ` +
+    `down`,
+  handed_off: (e, m) =>
+    `${escapeHtml(m.from_person_name || "?")} handed ` +
+    `${escapeHtml(m.object_name || e.entity_name || "object")} ` +
+    `to ${escapeHtml(m.to_person_name || "?")}`,
+  interacted_with: (e, m) =>
+    `${escapeHtml(e.entity_name || "?")} touched ` +
+    `${escapeHtml(m.object_name || "an object")}`,
+};
+
+const INTERACTION_GLYPH = {
+  picked_up: "↑",
+  placed_down: "↓",
+  handed_off: "⇄",
+  interacted_with: "·",
+};
+
+function renderInteractionRow(ev) {
+  const meta = ev.metadata || {};
+  const tpl = INTERACTION_TEMPLATES[ev.event_type] ||
+    ((e) => escapeHtml(e.event_type || "interaction"));
+  const sentence = tpl(ev, meta);
+  const room = ev.room
+    ? `<span class="event-room">${escapeHtml(ev.room)}</span>`
+    : "";
+  const thumb = ev.thumbnail_url
+    ? `<img class="interaction-thumb" src="${ev.thumbnail_url}"
+            alt="snapshot" loading="lazy"
+            onerror="this.style.display='none';" />`
+    : '<div class="interaction-thumb empty"></div>';
+  const glyph = INTERACTION_GLYPH[ev.event_type] || "·";
+  const ago = formatRelativeTs(ev.ts);
+  const div = document.createElement("div");
+  div.className = `interaction-row interaction-${ev.event_type || "unknown"}`;
+  div.innerHTML = `
+    ${thumb}
+    <div class="interaction-body">
+      <div class="interaction-line">
+        <span class="interaction-glyph">${glyph}</span>
+        <span class="interaction-text">${sentence}</span>
+      </div>
+      <div class="interaction-meta">${room}<span class="interaction-ago">${ago}</span></div>
+    </div>
+  `;
+  return div;
+}
+
+async function loadInteractions() {
+  try {
+    const res = await fetch("/api/world_model/interactions?limit=30");
+    if (!res.ok) return;
+    const body = await res.json();
+    const list = document.getElementById("interactions-list");
+    if (!list) return;
+    if (!body.available) {
+      list.innerHTML =
+        '<div class="who-empty">World model unavailable.</div>';
+      return;
+    }
+    const events = Array.isArray(body.events) ? body.events : [];
+    if (events.length === 0) {
+      list.innerHTML =
+        '<div class="who-empty">No interactions in the last 24h.</div>';
+      return;
+    }
+    list.innerHTML = "";
+    events.forEach((ev) => list.appendChild(renderInteractionRow(ev)));
+  } catch (err) {
+    console.warn("[loadInteractions] failed:", err);
+  }
+}
+loadInteractions();
+// 10s cadence — interactions don't fire every second the way landmark
+// dwell does; cheaper than the 5s WORLD EVENTS poll.
+setInterval(loadInteractions, 10000);
+
 // ── Init ──────────────────────────────────────────────────────────────────
 
 connect();

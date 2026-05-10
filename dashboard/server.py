@@ -1404,6 +1404,58 @@ class DashboardServer:
                 logger.warning(f"[/api/world_model/pets] {e}")
                 raise HTTPException(status_code=500, detail=str(e)) from e
 
+        @app.get("/api/world_model/interactions")
+        async def world_model_interactions(
+            limit: int = 30, hours_ago: int = 24,
+        ):
+            """§24.6 — focused tail of interaction events
+            (INTERACTED_WITH / PICKED_UP / PLACED_DOWN / HANDED_OFF)
+            so the dashboard can render a narrative timeline. Same
+            shape as /api/world_model/events but pre-filtered + with
+            crop_path resolved into an absolute snapshot URL the
+            browser can load directly."""
+            orch = self._orchestrator
+            wq = getattr(orch, "world_query_tools", None) if orch else None
+            if wq is None:
+                return JSONResponse({"events": [], "available": False})
+            try:
+                limit = max(1, min(int(limit), 200))
+                hours_ago = max(1, min(int(hours_ago), 168))
+                rows = await wq.search_recent_events(
+                    hours_ago=hours_ago,
+                    limit=limit,
+                    event_types=[
+                        "interacted_with", "picked_up",
+                        "placed_down", "handed_off",
+                    ],
+                )
+                import json as _json
+                clean: list[dict] = []
+                for r in rows:
+                    d = dict(r)
+                    raw = d.get("metadata")
+                    if isinstance(raw, str) and raw:
+                        try:
+                            d["metadata"] = _json.loads(raw)
+                        except Exception:
+                            d["metadata"] = {}
+                    elif raw is None:
+                        d["metadata"] = {}
+                    # If a snapshot_path exists, expose its
+                    # cluster-event URL so the JS can lazy-load.
+                    if d.get("snapshot_path"):
+                        d["thumbnail_url"] = (
+                            "/api/world_model/cluster/event/"
+                            f"{d['id']}/image.jpg"
+                        )
+                    clean.append(d)
+                return JSONResponse({
+                    "events": clean, "available": True,
+                })
+            except Exception as e:
+                logger.warning(f"[/api/world_model/interactions] {e}")
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
         @app.get("/api/world_model/events")
         async def world_model_events(limit: int = 20, hours_ago: int = 12):
             """Recent world entity events — used for a live tail panel

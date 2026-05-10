@@ -324,11 +324,156 @@ async def test_pickup_dedup() -> None:
     print("PASS: pickup dedup — multiple interactions yield one PICKED_UP")
 
 
+async def test_handoff_event_emitted_for_different_persons() -> None:
+    """§24.4 — INTERACTED_WITH for the same object by person A then
+    person B within the handoff window emits HANDED_OFF(from=A, to=B,
+    object). entity_id is the object so search_events(entity_id=wallet)
+    returns the row; metadata captures both names + rooms."""
+    bus = StubBus()
+    world = StubWorld()
+    monitor = InteractionMonitor(
+        bus=bus, world=world,
+        config={
+            "pickup_settle_seconds": 0.05,
+            "place_window_seconds": 4.0,
+            "handoff_window_seconds": 5.0,
+        },
+    )
+    await monitor.start()
+
+    t0 = datetime.now(timezone.utc)
+    obj_id = "wallet-handoff"
+    # Cole touches it first.
+    await bus.publish(
+        "world.entity_event",
+        _interacted_with(
+            ts=t0, person_name="Cole", person_id=42, room="office",
+            object_id=obj_id, object_name="wallet",
+        ),
+    )
+    # Anna touches the same object 1s later → handoff.
+    await bus.publish(
+        "world.entity_event",
+        _interacted_with(
+            ts=t0 + timedelta(seconds=1.0),
+            person_name="Anna", person_id=43, room="office",
+            object_id=obj_id, object_name="wallet",
+        ),
+    )
+    await asyncio.sleep(0.15)
+    await monitor.stop()
+
+    handoffs = [
+        e for e in world.store.events
+        if e.get("event_type") == EventType.HANDED_OFF.value
+    ]
+    assert len(handoffs) == 1, (
+        f"expected 1 handoff, got {len(handoffs)}: {handoffs}"
+    )
+    h = handoffs[0]
+    assert h.get("entity_id") == obj_id, h
+    assert h["metadata"]["from_person_name"] == "Cole"
+    assert h["metadata"]["to_person_name"] == "Anna"
+    assert h["metadata"]["from_person_id"] == 42
+    assert h["metadata"]["to_person_id"] == 43
+    print("PASS: HANDED_OFF event emitted with from + to attribution")
+
+
+async def test_no_handoff_when_same_person_re_touches() -> None:
+    """If person A touches an object then touches it AGAIN (no other
+    person between), no HANDED_OFF fires — that's just a re-grasp,
+    not a transfer."""
+    bus = StubBus()
+    world = StubWorld()
+    monitor = InteractionMonitor(
+        bus=bus, world=world,
+        config={
+            "pickup_settle_seconds": 0.05,
+            "handoff_window_seconds": 5.0,
+        },
+    )
+    await monitor.start()
+
+    t0 = datetime.now(timezone.utc)
+    obj_id = "phone-self"
+    for i in range(3):
+        await bus.publish(
+            "world.entity_event",
+            _interacted_with(
+                ts=t0 + timedelta(seconds=i * 0.4),
+                person_name="Cole", person_id=42, room="office",
+                object_id=obj_id, object_name="phone",
+            ),
+        )
+    await asyncio.sleep(0.15)
+    await monitor.stop()
+
+    handoffs = [
+        e for e in world.store.events
+        if e.get("event_type") == EventType.HANDED_OFF.value
+    ]
+    assert handoffs == [], (
+        f"unexpected handoff event for same-person re-touch: {handoffs}"
+    )
+    print("PASS: no HANDED_OFF when same person re-touches")
+
+
+async def test_handoff_dedup() -> None:
+    """A flicker of multiple INTERACTED_WITH events from person B for
+    the same object after person A's grip should produce exactly ONE
+    HANDED_OFF (deduped on (object_id, from, to) within the window)."""
+    bus = StubBus()
+    world = StubWorld()
+    monitor = InteractionMonitor(
+        bus=bus, world=world,
+        config={
+            "pickup_settle_seconds": 0.05,
+            "handoff_window_seconds": 5.0,
+        },
+    )
+    await monitor.start()
+
+    t0 = datetime.now(timezone.utc)
+    obj_id = "wallet-flicker"
+    # Cole touch.
+    await bus.publish(
+        "world.entity_event",
+        _interacted_with(
+            ts=t0, person_name="Cole", person_id=42, room="office",
+            object_id=obj_id, object_name="wallet",
+        ),
+    )
+    # Anna touch repeatedly — three frames in quick succession.
+    for i in range(3):
+        await bus.publish(
+            "world.entity_event",
+            _interacted_with(
+                ts=t0 + timedelta(seconds=0.5 + i * 0.05),
+                person_name="Anna", person_id=43, room="office",
+                object_id=obj_id, object_name="wallet",
+            ),
+        )
+    await asyncio.sleep(0.15)
+    await monitor.stop()
+
+    handoffs = [
+        e for e in world.store.events
+        if e.get("event_type") == EventType.HANDED_OFF.value
+    ]
+    assert len(handoffs) == 1, (
+        f"expected 1 handoff after dedup, got {len(handoffs)}"
+    )
+    print("PASS: HANDED_OFF dedup — multi-frame flicker yields one event")
+
+
 async def main() -> None:
     await test_pickup_event_emitted_after_loss()
     await test_placedown_event_emitted_after_appearance()
     await test_no_pickup_when_object_loss_in_different_room()
     await test_pickup_dedup()
+    await test_handoff_event_emitted_for_different_persons()
+    await test_no_handoff_when_same_person_re_touches()
+    await test_handoff_dedup()
     print("\nAll §24 interaction tests passed.")
 
 

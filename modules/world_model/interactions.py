@@ -77,6 +77,12 @@ class InteractionMonitor:
         # emit a duplicate PICKED_UP.
         self._recent_pickup_obj_ids: dict[str, datetime] = {}
         self._recent_placedown_obj_ids: dict[str, datetime] = {}
+        # §24.4 handoff dedup: keyed on (object_id, from_person_id,
+        # to_person_id) so a one-second flicker of two interactions
+        # doesn't fire HANDED_OFF twice. Distinct from pickup dedup —
+        # the same wallet legitimately changes hands more than once
+        # over a session, so we don't want to lock the whole object_id.
+        self._recent_handoff_keys: dict[tuple, datetime] = {}
         self._tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
@@ -105,6 +111,9 @@ class InteractionMonitor:
             return
         entity_type = event.get("entity_type")
         if et == EventType.INTERACTED_WITH.value:
+            # §24.4 handoff: check BEFORE appending to recent_interactions
+            # so the lookback only sees prior interactions, not this one.
+            await self._check_for_handoff(event, ts)
             self.recent_interactions.append((ts, event))
             # Pickup detection runs as a deferred check so we have time
             # to see the LOST_VISIBILITY for this object.
@@ -128,6 +137,121 @@ class InteractionMonitor:
         task = asyncio.create_task(coro)
         self._tasks.append(task)
         task.add_done_callback(self._tasks.remove)
+
+    # ── Handoff correlator (§24.4) ────────────────────────────────────────
+
+    async def _check_for_handoff(
+        self, interaction_event: dict, ts: datetime,
+    ) -> None:
+        """If the same object had an INTERACTED_WITH from a DIFFERENT
+        person within `handoff_window_seconds`, emit HANDED_OFF. The
+        receiver of the handoff is whoever fires this current
+        interaction (`interaction_event`); the giver is whoever owned
+        the most recent prior interaction for the same object.
+
+        Edge cases the dedup key handles:
+          • Multiple fast frames of the new owner re-touching the object
+            in succession — only the first emits a handoff event.
+          • Same pair re-handing the object back and forth quickly —
+            (object_id, from, to) and (object_id, to, from) are
+            different keys, so both directions can fire.
+        """
+        meta = interaction_event.get("metadata") or {}
+        obj_id = meta.get("object_id")
+        to_person_id = interaction_event.get("person_id")
+        if not obj_id or to_person_id is None:
+            return
+        window_s = float(self.cfg.get("handoff_window_seconds", 5.0))
+        cutoff = ts - timedelta(seconds=window_s)
+
+        # Walk recent_interactions newest-first; first different-person
+        # match for the same object wins.
+        prev_event: Optional[dict] = None
+        for prev_ts, prev in reversed(list(self.recent_interactions)):
+            if prev_ts < cutoff:
+                break
+            prev_meta = prev.get("metadata") or {}
+            if prev_meta.get("object_id") != obj_id:
+                continue
+            prev_person_id = prev.get("person_id")
+            if prev_person_id is None:
+                continue
+            if prev_person_id == to_person_id:
+                # Same person re-touching their own object — not a handoff.
+                # Don't break: an earlier interaction by a DIFFERENT person
+                # could still be the giver. But practically the most
+                # recent same-object interaction dominates the meaning;
+                # keep walking only if the spec invariant holds.
+                return
+            prev_event = prev
+            break
+        if prev_event is None:
+            return
+
+        from_person_id = prev_event.get("person_id")
+        key = (obj_id, from_person_id, to_person_id)
+        # Dedup TTL — clear stale entries first so a legitimate later
+        # handoff of the same direction still fires.
+        dedup_cutoff = ts - timedelta(seconds=window_s + 1.0)
+        self._recent_handoff_keys = {
+            k: v for k, v in self._recent_handoff_keys.items()
+            if v >= dedup_cutoff
+        }
+        if key in self._recent_handoff_keys:
+            return
+        self._recent_handoff_keys[key] = ts
+
+        payload = self._build_handoff_payload(
+            current=interaction_event, previous=prev_event, ts=ts,
+        )
+        await self._emit(payload)
+
+    def _build_handoff_payload(
+        self,
+        current: dict,
+        previous: dict,
+        ts: datetime,
+    ) -> dict:
+        cur_meta = current.get("metadata") or {}
+        prev_meta = previous.get("metadata") or {}
+        return {
+            "id": str(uuid.uuid4()),
+            "ts": ts.isoformat(),
+            # The HANDED_OFF event is "about" the object being handed —
+            # entity_id points at the object so search_events(entity_id=
+            # wallet) returns this row. person_id is the receiver
+            # (the more useful side for "who has the wallet now").
+            "entity_id": cur_meta.get("object_id"),
+            "entity_name": (
+                cur_meta.get("object_name")
+                or prev_meta.get("object_name")
+                or "object"
+            ),
+            "entity_type": "object",
+            "person_id": current.get("person_id"),
+            "event_type": EventType.HANDED_OFF.value,
+            "room": current.get("room"),
+            "camera": current.get("camera"),
+            "bbox": current.get("bbox"),
+            "landmark": current.get("landmark"),
+            "state": current.get("state"),
+            "confidence": current.get("confidence", 0.0),
+            "snapshot_path": current.get("snapshot_path"),
+            "related_entity_id": previous.get("entity_id"),
+            "metadata": {
+                "object_id": cur_meta.get("object_id"),
+                "object_name": (
+                    cur_meta.get("object_name")
+                    or prev_meta.get("object_name")
+                ),
+                "from_person_id": previous.get("person_id"),
+                "from_person_name": previous.get("entity_name"),
+                "to_person_id": current.get("person_id"),
+                "to_person_name": current.get("entity_name"),
+                "from_room": previous.get("room"),
+                "to_room": current.get("room"),
+            },
+        }
 
     # ── Pickup correlator ─────────────────────────────────────────────────
 

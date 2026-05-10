@@ -38,6 +38,7 @@ class EventType(str, Enum):
     INTERACTED_WITH = "interacted_with"
     PICKED_UP = "picked_up"
     PLACED_DOWN = "placed_down"
+    HANDED_OFF = "handed_off"             # §24.4 — A held object → B held it
     STATIONARY_LONG = "stationary_long"
     CAMERA_DEGRADED = "camera_degraded"   # informational; affects state machine
     CAMERA_RESTORED = "camera_restored"

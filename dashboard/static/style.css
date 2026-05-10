@@ -2109,3 +2109,83 @@ main {
 .event-row.event-type-interacted_with .event-glyph {
   color: var(--green, #6ce6a6);
 }
+
+/* ── Interactions timeline (§24.6) ────────────────────────────────────── */
+
+.interactions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 340px;
+  overflow-y: auto;
+}
+.interaction-row {
+  display: flex;
+  gap: 8px;
+  padding: 4px 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  align-items: center;
+}
+.interaction-thumb {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  background: #0a0b10;
+  border-radius: 3px;
+  object-fit: cover;
+  border: 1px solid var(--border);
+}
+.interaction-thumb.empty {
+  background:
+    repeating-linear-gradient(
+      45deg, #14161e, #14161e 4px,
+      #1a1d28 4px, #1a1d28 8px
+    );
+}
+.interaction-body {
+  flex: 1;
+  min-width: 0;          /* lets long sentences ellipsize */
+}
+.interaction-line {
+  font-size: 12px;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.interaction-glyph {
+  font-family: var(--mono, "Space Mono", monospace);
+  color: var(--blue);
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.interaction-row.interaction-picked_up .interaction-glyph {
+  color: var(--blue);
+}
+.interaction-row.interaction-placed_down .interaction-glyph {
+  color: var(--green, #6ce6a6);
+}
+.interaction-row.interaction-handed_off .interaction-glyph {
+  color: var(--orange, #e8a445);
+}
+.interaction-row.interaction-interacted_with .interaction-glyph {
+  color: var(--text-dim);
+}
+.interaction-text {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.interaction-meta {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: var(--mono, "Space Mono", monospace);
+}
+.interaction-ago {
+  margin-left: auto;
+}
