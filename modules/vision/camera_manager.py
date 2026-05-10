@@ -314,6 +314,11 @@ class CameraManager:
     # ── HTTP snapshot path (ESP32-CAM) ───────────────────────────────────────
 
     async def _open_http(self, room_id: str, url: str) -> None:
+        # Register the kind upfront so the dashboard sees this room as a
+        # configured camera (and renders its reconnect button) even when
+        # the probe below fails. _caps / _http_urls only get populated on
+        # success, so available-rooms still reflects live feeds correctly.
+        self._video_kinds[room_id] = "http"
         logger.info(f"[CameraManager] Probing snapshot URL {url} for '{room_id}'...")
         frame = await self._fetch_http_frame(url)
         if frame is None:
@@ -374,6 +379,9 @@ class CameraManager:
         Jarvis restart.
         """
         assert cv2 is not None
+        # Register the kind upfront — same reasoning as the RTSP / HTTP
+        # paths: dashboard needs to see configured-but-failed cams.
+        self._video_kinds[room_id] = "usb"
         backends = [("CAP_DSHOW", cv2.CAP_DSHOW), ("CAP_MSMF", cv2.CAP_MSMF)]
         between_waits = [1.5, 3.0, 5.0]
         attempts = len(between_waits)
@@ -494,6 +502,11 @@ class CameraManager:
              that test_wyze.py doesn't appear to hang.
         """
         assert cv2 is not None
+        # Register the kind upfront so the dashboard sees this room as a
+        # configured camera (and renders its reconnect button) even when
+        # the open / probe below fails. _caps only gets populated on
+        # success, so get_available_rooms still reflects live streams.
+        self._video_kinds[room_id] = "rtsp"
         # OpenCV reads FFmpeg options from this env var at capture-open
         # time. There's no first-class API to pass them. Reset it after open
         # so the next room can use a different transport without surprise.

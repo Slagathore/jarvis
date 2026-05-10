@@ -1356,6 +1356,91 @@ class DashboardServer:
                 raise HTTPException(status_code=404, detail="polygon_viewer.html missing")
             return HTMLResponse(page.read_text(encoding="utf-8"))
 
+        @app.get("/api/world_model/pets")
+        async def world_model_pets():
+            """Resident pets — every cat + dog from §22 bootstrap, with
+            current state, last_seen_room, owner, and a per-pet care
+            summary (last food/litterbox/water/leash event timestamps).
+            Returns {} when world model is offline."""
+            orch = self._orchestrator
+            wq = getattr(orch, "world_query_tools", None) if orch else None
+            if wq is None:
+                return JSONResponse({"pets": [], "available": False})
+            try:
+                base = await wq.list_pets()
+                # Enrich each pet with where_is_pet (likely_room +
+                # unmonitored fallback) and care_summary (last 24h
+                # by interaction_kind). Both are cheap reads off the
+                # in-memory model + recent event index.
+                pets_out = []
+                for p in base:
+                    name = p.get("name")
+                    if not name:
+                        continue
+                    where = await wq.where_is_pet(name)
+                    care = await wq.pet_care_summary(name, hours_ago=24)
+                    pets_out.append({
+                        "name": name,
+                        "species": p.get("species"),
+                        "owner_person_id": p.get("owner_person_id"),
+                        "state": where.get("state"),
+                        "last_seen_room": where.get("last_seen_room"),
+                        "last_seen_landmark": where.get("last_seen_landmark"),
+                        "last_seen_ts": where.get("last_seen_ts"),
+                        "likely_room": where.get("likely_room"),
+                        "likely_room_inferred": where.get(
+                            "likely_room_inferred", False
+                        ),
+                        "unmonitored_home": where.get("unmonitored_home"),
+                        "duration_in_state_seconds": where.get(
+                            "duration_in_state_seconds"
+                        ),
+                        "care": care.get("by_kind", {}),
+                    })
+                return JSONResponse({
+                    "pets": pets_out, "available": True,
+                })
+            except Exception as e:
+                logger.warning(f"[/api/world_model/pets] {e}")
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
+        @app.get("/api/world_model/events")
+        async def world_model_events(limit: int = 20, hours_ago: int = 12):
+            """Recent world entity events — used for a live tail panel
+            in the dashboard so the user can watch §22.9 landmark
+            interactions and state transitions fire as they happen."""
+            orch = self._orchestrator
+            wq = getattr(orch, "world_query_tools", None) if orch else None
+            if wq is None:
+                return JSONResponse({"events": [], "available": False})
+            try:
+                limit = max(1, min(int(limit), 200))
+                hours_ago = max(1, min(int(hours_ago), 168))
+                rows = await wq.search_recent_events(
+                    hours_ago=hours_ago, limit=limit,
+                )
+                # search_events serializes metadata as a JSON string;
+                # decode here so the browser doesn't double-parse.
+                import json as _json
+                clean: list[dict] = []
+                for r in rows:
+                    d = dict(r)
+                    raw = d.get("metadata")
+                    if isinstance(raw, str) and raw:
+                        try:
+                            d["metadata"] = _json.loads(raw)
+                        except Exception:
+                            d["metadata"] = {}
+                    elif raw is None:
+                        d["metadata"] = {}
+                    clean.append(d)
+                return JSONResponse({
+                    "events": clean, "available": True,
+                })
+            except Exception as e:
+                logger.warning(f"[/api/world_model/events] {e}")
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
         @app.post("/api/camera/{room}/reconnect")
         async def camera_reconnect(room: str):
             """Force-reopen a room's RTSP capture. The orchestrator's

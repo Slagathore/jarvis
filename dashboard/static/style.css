@@ -540,7 +540,44 @@ main {
 }
 
 .room-feed.dead {
-  display: none;
+  /* Visible offline state instead of disappearing — the room needs to
+     keep its shape so the ⟳ reconnect button stays in reach. Diagonal
+     hatch + "OFFLINE" overlay (see ::after below). */
+  background: repeating-linear-gradient(
+    45deg,
+    #1a1a1a,
+    #1a1a1a 6px,
+    #222 6px,
+    #222 12px
+  );
+  position: relative;
+  color: transparent;
+  font-size: 0;
+}
+.room-feed.dead::after {
+  content: "OFFLINE";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--red, #e57373);
+  font-family: var(--mono, "Space Mono", monospace);
+  font-size: 13px;
+  letter-spacing: 0.15em;
+  font-weight: 700;
+  background: rgba(0, 0, 0, 0.45);
+}
+/* Room card flagged offline — make the ⟳ button pulse so it's
+   immediately actionable. */
+.room-card.offline .room-reconnect {
+  animation: room-offline-pulse 1.6s ease-in-out infinite;
+  border-color: var(--red, #e57373);
+  color: var(--red, #e57373);
+}
+@keyframes room-offline-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(229, 115, 115, 0); }
+  50%      { box-shadow: 0 0 0 4px rgba(229, 115, 115, 0.25); }
 }
 
 .room-light {
@@ -1911,3 +1948,164 @@ main {
   color: var(--text);
 }
 .persona-resume[hidden] { display: none; }
+
+/* ── Pets panel (World Model §22) ─────────────────────────────────────── */
+
+.pets-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pet-row {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.pet-row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.pet-glyph {
+  font-size: 16px;
+  color: var(--blue);
+  font-family: serif;
+}
+.pet-name {
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.05em;
+}
+.pet-state {
+  margin-left: auto;
+  font-family: var(--mono, "Space Mono", monospace);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  background: rgba(0, 0, 0, 0.3);
+}
+.pet-state.pet-state-present {
+  color: var(--green, #6ce6a6);
+  border-color: var(--green-dim, #2d7a52);
+}
+.pet-state.pet-state-in-house-unmonitored,
+.pet-state.pet-state-in-room-unseen {
+  color: var(--text-dim);
+}
+.pet-state.pet-state-departed {
+  color: var(--red, #e57373);
+  border-color: var(--red, #e57373);
+}
+.pet-row-where {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.pet-where-label {
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 9px;
+  margin-right: 4px;
+  opacity: 0.7;
+}
+.pet-where-room {
+  color: var(--text);
+}
+.pet-hedge {
+  color: var(--text-dim);
+  font-style: italic;
+  font-size: 11px;
+}
+.pet-care {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+.pet-care-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--mono, "Space Mono", monospace);
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.25);
+}
+.pet-care-chip.on {
+  border-color: var(--blue-dim);
+  color: var(--blue);
+}
+.pet-care-chip.off {
+  color: var(--text-dim);
+  opacity: 0.55;
+}
+.pet-care-icon {
+  font-size: 11px;
+}
+.pet-care-label {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.pet-care-ago {
+  opacity: 0.8;
+  margin-left: 2px;
+}
+
+/* ── World Events tail ────────────────────────────────────────────────── */
+
+.world-events-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--mono, "Space Mono", monospace);
+  font-size: 11px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.event-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 3px 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+.event-glyph {
+  color: var(--blue);
+  width: 12px;
+  flex-shrink: 0;
+  text-align: center;
+}
+.event-name {
+  font-weight: 700;
+  color: var(--text);
+}
+.event-label {
+  color: var(--text-dim);
+}
+.event-room {
+  color: var(--blue-dim);
+}
+.event-landmark {
+  color: var(--green, #6ce6a6);
+}
+.event-ago {
+  margin-left: auto;
+  opacity: 0.6;
+  font-size: 10px;
+}
+.event-row.event-type-departed .event-glyph,
+.event-row.event-type-camera_degraded .event-glyph {
+  color: var(--red, #e57373);
+}
+.event-row.event-type-interacted_with .event-glyph {
+  color: var(--green, #6ce6a6);
+}

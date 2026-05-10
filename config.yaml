@@ -128,6 +128,10 @@ rooms:
         polygon: [[200, 380], [450, 380], [450, 480], [200, 480]]
       - name: bookshelf
         polygon: [[0, 100], [150, 100], [150, 350], [0, 350]]
+      # §22.9 cat-care — office cats get fed here (Socks + Serval).
+      # REPLACE_ME polygon against a real office-cam frame.
+      - name: food_dish
+        polygon: [[0, 350], [120, 350], [120, 480], [0, 480]]
 - id: laundry_room
   display_name: Laundry Room
   video:
@@ -154,14 +158,10 @@ rooms:
         polygon: [[200, 300], [450, 300], [450, 550], [200, 550]]
       - name: dryer
         polygon: [[450, 300], [700, 300], [700, 550], [450, 550]]
-      # §22.9 cat-specific event landmarks — feed LITTERBOX_VISIT and
-      # FOOD_DISH_VISIT (INTERACTED_WITH events with metadata.landmark
-      # and metadata.interaction_kind). REPLACE_ME polygon coords
-      # against a real laundry_room frame in the polygon viewer.
-      - name: litterbox
-        polygon: [[100, 400], [300, 400], [300, 550], [100, 550]]
-      - name: food_dish
-        polygon: [[400, 450], [550, 450], [550, 550], [400, 550]]
+      # No cat / dog landmarks here — the laundry_room ESP32-CAM doesn't
+      # actually face the food dishes or litterboxes Cole has on the
+      # property. §22.9 events live on the kitchen / office / bedroom /
+      # living_room cams where the relevant landmarks are visible.
 - id: bedroom
   display_name: Bedroom
   video:
@@ -206,6 +206,10 @@ rooms:
         polygon: [[600, 500], [1400, 500], [1400, 950], [600, 950]]
       - name: closet
         polygon: [[1500, 700], [1920, 700], [1920, 1080], [1500, 1080]]
+      # §22.9 cat-care — bedroom cats get fed here (Spooky + Sparta).
+      # REPLACE_ME polygon against a real bedroom-cam frame.
+      - name: food_dish
+        polygon: [[200, 800], [400, 800], [400, 1000], [200, 1000]]
 - id: kitchen
   display_name: Kitchen
   video:
@@ -250,6 +254,16 @@ rooms:
         polygon: [[1400, 100], [1700, 100], [1700, 700], [1400, 700]]
       # Per §22.1, kitchen-fridge-top is a Velcro perch; that's a 3D
       # region that may need a separate polygon once we add multi-cam.
+      # §22.9 cat-care — automated litterbox is immediately to the right
+      # of the fridge. REPLACE_ME polygon against a real kitchen-cam
+      # frame; the placeholder sits in x>fridge.right, above the
+      # back_door exterior_exit polygon.
+      - name: litterbox
+        polygon: [[1700, 300], [1900, 300], [1900, 750], [1700, 750]]
+      # §22.9 dog-care — Cole refills dog water bowl in the kitchen.
+      # REPLACE_ME polygon (the sink-area is a reasonable placeholder).
+      - name: dog_water_bowl
+        polygon: [[400, 700], [600, 700], [600, 900], [400, 900]]
 - id: living_room
   display_name: Living Room
   video:
@@ -302,12 +316,13 @@ rooms:
         polygon: [[600, 600], [1400, 600], [1400, 950], [600, 950]]
       - name: tv
         polygon: [[700, 100], [1300, 100], [1300, 450], [700, 450]]
-      # §22.9 dog-specific landmarks — DOG_FOOD_VISIT, DOG_WATER_VISIT,
-      # LEASH_INTERACTION events. REPLACE_ME polygon coords.
+      # §22.9 dog-care — dogs are fed in the living_room. Leash_hook is
+      # also here. dog_water_bowl is NOT here — the bowl in the
+      # living_room sits directly under the camera and isn't reliably
+      # visible; the kitchen cam owns that signal (Cole refills there).
+      # REPLACE_ME polygon coords against a real living_room frame.
       - name: dog_food_dish
         polygon: [[450, 700], [580, 700], [580, 800], [450, 800]]
-      - name: dog_water_bowl
-        polygon: [[600, 700], [720, 700], [720, 800], [600, 800]]
       - name: leash_hook
         polygon: [[50, 100], [150, 100], [150, 200], [50, 200]]
 # Auxiliary ESP32 nodes — boxes physically present in rooms whose primary

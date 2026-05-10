@@ -453,8 +453,17 @@ function refreshRoomFeeds() {
   imgs.forEach((img) => {
     const room = img.dataset.room;
     if (!room) return;
-    img.onerror = () => img.classList.add("dead");
-    img.onload = () => img.classList.remove("dead");
+    const card = document.getElementById(`room-${room}`);
+    img.onerror = () => {
+      img.classList.add("dead");
+      // Mark the whole card so the ⟳ button can pulse via CSS — the
+      // user needs to spot it without thinking when a feed dies.
+      if (card) card.classList.add("offline");
+    };
+    img.onload = () => {
+      img.classList.remove("dead");
+      if (card) card.classList.remove("offline");
+    };
     img.src = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?t=${stamp}`;
   });
 }
@@ -2651,6 +2660,201 @@ if (personaResumeNo) {
 // (auto-revert, dashboard tabs) stay in sync.
 loadPersonas();
 setInterval(loadPersonas, 10000);
+
+// ── Pets (World Model §22) ────────────────────────────────────────────────
+// Render every resident cat + dog with current state, likely-room
+// (with unmonitored_home fallback), and a per-pet care summary
+// (last food / litterbox / water / leash event timestamps).
+//
+// Care-summary kinds we render. Order matters — left-to-right in the UI.
+// Cats only see litterbox + food; dogs only see food + water + leash.
+// Anything else the system fires (future kinds) is ignored here.
+const CARE_KIND_LABELS = {
+  litterbox_visit: { label: "litter", icon: "▣" },
+  food_dish_visit: { label: "food", icon: "◆" },
+  dog_food_visit: { label: "food", icon: "◆" },
+  dog_water_visit: { label: "water", icon: "≈" },
+  leash_interaction: { label: "leash", icon: "⌒" },
+};
+const CARE_KINDS_BY_SPECIES = {
+  cat: ["litterbox_visit", "food_dish_visit"],
+  dog: ["dog_food_visit", "dog_water_visit", "leash_interaction"],
+};
+
+function formatRelativeTs(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "—";
+  const ageS = (Date.now() - d.getTime()) / 1000;
+  if (ageS < 60) return `${Math.round(ageS)}s ago`;
+  if (ageS < 3600) return `${Math.round(ageS / 60)}m ago`;
+  if (ageS < 86400) return `${Math.round(ageS / 3600)}h ago`;
+  return `${Math.round(ageS / 86400)}d ago`;
+}
+
+function renderPetCard(pet) {
+  const div = document.createElement("div");
+  div.className = `pet-row pet-${pet.species || "unknown"}`;
+
+  // Where the pet "is". When we haven't seen them recently and the
+  // pet has an unmonitored_home, render with a hedge — matches the
+  // way where_is_pet's likely_room_inferred flag wants to be phrased.
+  let location = pet.last_seen_room || pet.likely_room || "?";
+  let hedge = "";
+  if (pet.likely_room_inferred && pet.likely_room) {
+    location = pet.likely_room;
+    hedge = ' <span class="pet-hedge">(probably)</span>';
+  }
+  if (pet.last_seen_landmark) {
+    location += ` · ${pet.last_seen_landmark}`;
+  }
+
+  // Care chips — per-species subset only. Each chip shows "last seen N
+  // ago" or "—" if we have no event of that kind in the window.
+  const kinds = CARE_KINDS_BY_SPECIES[pet.species] || [];
+  const chips = kinds
+    .map((k) => {
+      const meta = CARE_KIND_LABELS[k];
+      if (!meta) return "";
+      const slot = (pet.care || {})[k];
+      const lastTs = slot ? slot.last_ts : null;
+      const cls = lastTs ? "pet-care-chip on" : "pet-care-chip off";
+      return `
+        <span class="${cls}" title="last ${meta.label}: ${
+          lastTs ? new Date(lastTs).toLocaleString() : "no record in 24h"
+        }">
+          <span class="pet-care-icon">${meta.icon}</span>
+          <span class="pet-care-label">${meta.label}</span>
+          <span class="pet-care-ago">${formatRelativeTs(lastTs)}</span>
+        </span>`;
+    })
+    .join("");
+
+  const speciesGlyph = pet.species === "dog" ? "𓃡" : "𓃠";
+  const stateClass = `pet-state-${(pet.state || "unknown").replace(/_/g, "-")}`;
+
+  div.innerHTML = `
+    <div class="pet-row-head">
+      <span class="pet-glyph">${speciesGlyph}</span>
+      <span class="pet-name">${escapeHtml(pet.name || "?")}</span>
+      <span class="pet-state ${stateClass}">${escapeHtml(pet.state || "?")}</span>
+    </div>
+    <div class="pet-row-where">
+      <span class="pet-where-label">in</span>
+      <span class="pet-where-room">${escapeHtml(location)}</span>${hedge}
+    </div>
+    <div class="pet-care">${chips}</div>
+  `;
+  return div;
+}
+
+async function loadPets() {
+  try {
+    const res = await fetch("/api/world_model/pets");
+    if (!res.ok) return;
+    const body = await res.json();
+    const list = document.getElementById("pets-list");
+    if (!list) return;
+    if (!body.available) {
+      list.innerHTML =
+        '<div class="who-empty">World model unavailable.</div>';
+      return;
+    }
+    const pets = Array.isArray(body.pets) ? body.pets : [];
+    if (pets.length === 0) {
+      list.innerHTML =
+        '<div class="who-empty">No resident pets configured.</div>';
+      return;
+    }
+    list.innerHTML = "";
+    // Group by species; cats first then dogs, alphabetical inside.
+    const order = (a, b) => {
+      const sa = a.species || "z", sb = b.species || "z";
+      if (sa !== sb) return sa.localeCompare(sb);
+      return (a.name || "").localeCompare(b.name || "");
+    };
+    pets.sort(order).forEach((p) => list.appendChild(renderPetCard(p)));
+  } catch (err) {
+    console.warn("[loadPets] failed:", err);
+  }
+}
+loadPets();
+// 30s cadence — care-summary chips don't need real-time updates
+// (food/litterbox events fire on the order of hours), state changes
+// flow in via the WebSocket world.entity_event handler below.
+setInterval(loadPets, 30000);
+
+// ── World Events tail (live tail of world_entity_events) ──────────────────
+
+const EVENT_TYPE_GLYPH = {
+  first_seen: "+",
+  reappeared: "↺",
+  moved_to: "→",
+  moved_within_room: "·",
+  lost_visibility: "?",
+  departed: "✕",
+  entered_unmonitored: "▢",
+  interacted_with: "◇",
+  posture_changed: "⌇",
+  stationary_long: "⏚",
+  camera_degraded: "!",
+  camera_restored: "✓",
+  name_linked: "@",
+};
+
+function renderEventRow(ev) {
+  const glyph = EVENT_TYPE_GLYPH[ev.event_type] || "·";
+  const meta = ev.metadata || {};
+  // §22.9 events ride as `interacted_with` with metadata.interaction_kind;
+  // surface that directly so the user sees "litterbox_visit" not just
+  // "interacted_with".
+  let label = ev.event_type || "?";
+  if (meta.interaction_kind) {
+    label = meta.interaction_kind;
+  }
+  const room = ev.room ? ` <span class="event-room">${escapeHtml(ev.room)}</span>` : "";
+  const lm = meta.landmark ? ` <span class="event-landmark">@${escapeHtml(meta.landmark)}</span>` : "";
+  const name = ev.entity_name || `?_${ev.entity_type || "ent"}`;
+  const ago = formatRelativeTs(ev.ts);
+  const div = document.createElement("div");
+  div.className = `event-row event-type-${ev.event_type || "unknown"}`;
+  div.innerHTML = `
+    <span class="event-glyph">${glyph}</span>
+    <span class="event-name">${escapeHtml(name)}</span>
+    <span class="event-label">${escapeHtml(label)}</span>${room}${lm}
+    <span class="event-ago">${ago}</span>
+  `;
+  return div;
+}
+
+async function loadWorldEvents() {
+  try {
+    const res = await fetch("/api/world_model/events?limit=20");
+    if (!res.ok) return;
+    const body = await res.json();
+    const list = document.getElementById("world-events-list");
+    if (!list) return;
+    if (!body.available) {
+      list.innerHTML =
+        '<div class="who-empty">World model unavailable.</div>';
+      return;
+    }
+    const events = Array.isArray(body.events) ? body.events : [];
+    if (events.length === 0) {
+      list.innerHTML =
+        '<div class="who-empty">No events yet (last 12h).</div>';
+      return;
+    }
+    list.innerHTML = "";
+    events.forEach((ev) => list.appendChild(renderEventRow(ev)));
+  } catch (err) {
+    console.warn("[loadWorldEvents] failed:", err);
+  }
+}
+loadWorldEvents();
+// 5s cadence so landmark dwell events appear quickly during dev. Cheap:
+// the endpoint reads the indexed event log + decodes JSON, no I/O fanout.
+setInterval(loadWorldEvents, 5000);
 
 // ── Init ──────────────────────────────────────────────────────────────────
 
