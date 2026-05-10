@@ -35,7 +35,7 @@ from typing import AsyncIterator, Optional
 import numpy as np
 from loguru import logger
 
-from modules.voice.sources.base import MicSource
+from modules.voice.sources.base import MicCallback, MicSource
 
 # OWW's required frame size; chunks shorter than this get padded by the
 # WakeRunner with a logged warning. Chunks longer get split.
@@ -70,6 +70,16 @@ class MicSourceWakeAdapter:
         # mic emits 1280-sample chunks today, but USB mic blocksize can
         # drift slightly under load.
         self._partial = bytearray()
+        # Optional recording tap: when set, every raw mic chunk is also
+        # forwarded here. Used by the orchestrator's _on_wake_detected /
+        # _listen_followup paths so they can capture audio from the SAME
+        # room the wake fired in, instead of always recording from the
+        # office PC mic. The tap receives raw `(pcm_bytes, sample_rate)`
+        # straight from the MicSource — no resampling, no chunk-size
+        # alignment. The recording path applies its own RMS / silence
+        # detection on top.
+        self._recording_tap: Optional[MicCallback] = None
+        self._recording_sample_rate: int = 16000
 
     @property
     def room(self) -> str:
@@ -101,6 +111,25 @@ class MicSourceWakeAdapter:
                     f"[WakeAdapter:{self.room}] MicSource start failed: {e}"
                 )
 
+    def attach_recording_tap(self, callback: MicCallback) -> None:
+        """Install a recording tap. Every chunk this adapter receives from
+        its MicSource is also forwarded to `callback`. Used by the
+        orchestrator's wake-recording path to capture audio from the room
+        the wake actually fired in. Replaces any existing tap silently."""
+        self._recording_tap = callback
+
+    def detach_recording_tap(self) -> None:
+        """Remove the recording tap. No-op if none was attached."""
+        self._recording_tap = None
+
+    @property
+    def recording_sample_rate(self) -> int:
+        """Best-known sample rate for chunks delivered to the recording tap.
+        Defaults to 16000 until the first chunk is observed; updated on
+        every callback so consumers can read it after a few chunks have
+        flowed."""
+        return self._recording_sample_rate
+
     async def _mic_callback(self, pcm: bytes, sample_rate: int) -> None:
         """Called by MicSource per chunk. Slice into OWW-sized chunks and
         push to the queue. sample_rate is captured for logging only — OWW
@@ -109,6 +138,21 @@ class MicSourceWakeAdapter:
         """
         if not pcm:
             return
+        # Forward to the recording tap FIRST. The tap gets raw chunks at
+        # the source's native rate (typically 16kHz from WyzeRtspMicSource);
+        # the recording layer handles its own framing. We do this before
+        # the OWW slicing so the tap sees whole chunks even if OWW's queue
+        # is full and would have dropped them.
+        self._recording_sample_rate = sample_rate
+        tap = self._recording_tap
+        if tap is not None:
+            try:
+                await tap(pcm, sample_rate)
+            except Exception as e:
+                # Tap failures must NOT break wake detection. Log and move on.
+                logger.warning(
+                    f"[WakeAdapter:{self.room}] recording tap raised: {e}"
+                )
         target_bytes = _OWW_CHUNK_SIZE * 2  # int16 = 2 bytes per sample
         self._partial.extend(pcm)
         while len(self._partial) >= target_bytes:

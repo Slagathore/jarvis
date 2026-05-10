@@ -75,6 +75,7 @@ Variables:
 """
 
 import asyncio
+import base64
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -274,6 +275,15 @@ class Orchestrator:
         # so Jarvis follows Cole around instead of always speaking from the
         # office PC. Defaults to "office" because that's where startup happens.
         self._active_user_room: str = "office"
+        # Monotonic timestamp of the last _active_user_room update.
+        # Used by the wake coalescer as a vision-disambiguation tiebreaker
+        # when multiple mics fire on the same utterance — a recent face
+        # detection or wake event in a specific room is a stronger signal
+        # of "Cole is THERE" than raw mic confidence (a studio mic in the
+        # office can outscore a Wyze mic in the living room even when
+        # Cole is clearly in the living room). Stale priors decay: if the
+        # room was set >30s ago, the bonus doesn't apply.
+        self._active_user_room_ts: float = 0.0
         self._wake_lock = asyncio.Lock()
         self._audio_io_active: bool = False
         # Per-room echo suppression. After Jarvis speaks into a room,
@@ -631,6 +641,13 @@ class Orchestrator:
         await self.mqtt.connect()
         self.nodes = NodeManager(config=self.config, mqtt_client=self.mqtt)
         await self.nodes.load()
+        # Late-bind MQTT into voice managers so esp32_* mic/speaker sources
+        # can subscribe/publish. Mic/speaker managers were constructed in
+        # _init_voice before MQTT existed.
+        if self.mic_manager is not None:
+            self.mic_manager.attach_mqtt(self.mqtt)
+        if self.speaker_manager is not None:
+            self.speaker_manager.attach_mqtt(self.mqtt)
         logger.info("[Init] Network (MQTT + nodes) ready")
 
     # ── Event Handler Registration ─────────────────────────────────────────
@@ -711,10 +728,18 @@ class Orchestrator:
         own voice.wake_detected — without coalescing the orchestrator
         would start the capture pipeline once per mic and have to serialize
         them behind _wake_lock. Instead, batch all events for a short
-        window after the first one arrives and dispatch ONE capture for
-        the loudest (highest-confidence) room.
+        window after the first one arrives and dispatch ONE capture.
 
-        The window is set in config.voice.wake_word.coalesce_window_ms
+        Winner selection (see _fire_pending_wake_after):
+          - Default: highest OWW confidence wins.
+          - Vision-disambiguation tiebreaker: if `_active_user_room` was
+            updated within the last 30s AND is one of the candidates,
+            that room wins regardless of OWW confidence (the studio-mic
+            in the office can outscore Wyze mics elsewhere even when
+            Cole is clearly elsewhere — vision presence is a stronger
+            localizer than raw mic confidence in that case).
+
+        The coalesce window is set in config.voice.wake_word.coalesce_window_ms
         (default 250 ms). 250 is enough for ~3 OWW prediction cycles per
         mic — long enough that a quiet mic in another room reliably gets
         a vote in, short enough that the user doesn't perceive a delay
@@ -744,7 +769,14 @@ class Orchestrator:
             )
 
     async def _fire_pending_wake_after(self, delay_s: float) -> None:
-        """Sleeps the coalesce window, then fires the loudest pending wake.
+        """Sleeps the coalesce window, then fires the winning pending wake.
+
+        Winner = max(score) where score = OWW confidence + vision-prior
+        bonus. The vision-prior bonus applies when `_active_user_room`
+        was updated recently (within VISION_PRIOR_FRESHNESS_S) and the
+        candidate room matches it. Otherwise scoring is pure OWW
+        confidence. See _on_wake_event_raw docstring for rationale.
+
         On cancellation (orchestrator shutting down) drops the pending
         list silently — the capture pipeline isn't safe to start mid-shutdown.
         """
@@ -761,20 +793,53 @@ class Orchestrator:
         if not pending:
             return
 
-        winner = max(
-            pending, key=lambda e: float(e.get("confidence", 0.0))
-        )
+        # Vision-disambiguation tiebreaker: a recent face / wake / chat
+        # signal in a specific room is a stronger localizer than raw OWW
+        # confidence when mic quality varies wildly between rooms (the
+        # office's studio mic regularly outscores Wyze mics on speech
+        # that's actually happening elsewhere). If `_active_user_room`
+        # was set within the freshness window AND it's one of the
+        # candidates, that room wins. Otherwise fall back to plain
+        # confidence.
+        import time as _time
+        VISION_PRIOR_FRESHNESS_S = 30.0
+        VISION_PRIOR_BONUS = 0.5  # > typical mic-quality gap (~0.35)
+        now = _time.monotonic()
+        prior_room: Optional[str] = None
+        if (
+            self._active_user_room
+            and (now - self._active_user_room_ts) < VISION_PRIOR_FRESHNESS_S
+        ):
+            prior_room = self._active_user_room
+
+        def _score(e: dict) -> float:
+            base = float(e.get("confidence", 0.0))
+            if prior_room is not None and e.get("room") == prior_room:
+                return base + VISION_PRIOR_BONUS
+            return base
+
+        winner = max(pending, key=_score)
         if len(pending) > 1:
-            # Per-room rundown so the log makes the choice obvious. Useful
-            # when tuning per-room sensitivity — if the bedroom always wins
-            # but Cole's standing in the kitchen, the kitchen mic needs gain.
-            rundown = ", ".join(
-                f"{e.get('room', '?')}@{float(e.get('confidence', 0.0)):.3f}"
-                for e in pending
+            # Per-room rundown so the log makes the choice obvious. Show
+            # base confidence + (bonus) when the prior applied, so it's
+            # visible WHY a lower-confidence room won.
+            parts = []
+            for e in pending:
+                room_id = e.get("room", "?")
+                conf = float(e.get("confidence", 0.0))
+                bonus_tag = (
+                    "+vision" if prior_room is not None and room_id == prior_room
+                    else ""
+                )
+                parts.append(f"{room_id}@{conf:.3f}{bonus_tag}")
+            rundown = ", ".join(parts)
+            prior_age = (
+                f", prior={prior_room}@{now - self._active_user_room_ts:.1f}s"
+                if prior_room else ""
             )
             logger.info(
                 f"[Wake] Coalesced {len(pending)} simultaneous wakes "
-                f"[{rundown}] → winner '{winner.get('room')}'"
+                f"[{rundown}{prior_age}] → winner '{winner.get('room')}'"
             )
         await self._on_wake_detected(winner)
 
@@ -797,7 +862,7 @@ class Orchestrator:
         logger.info(f"[Wake] Detected in {room}")
         # Wake event = strong presence signal. Update the active room so
         # downstream proactive speech follows Cole.
-        self._active_user_room = room
+        self._set_active_user_room(room)
         # Wake = whoever spoke is awake. We don't yet know who (voice ID
         # happens after STT), so for now clear everyone in this room.
         # The post-identify path below will be more surgical.
@@ -820,54 +885,174 @@ class Orchestrator:
         # turn's LLM is still doing.
         from modules.voice.audio_utils import (
             SAMPLE_RATE,
+            chime_bytes,
             db_from_rms,
             play_chime_async,
             record_until_silence,
+            record_until_silence_from_chunks,
         )
         audio_data = None
         async with self._wake_lock:
             was_audio_active = self._audio_io_active
             self._audio_io_active = True
-            if self.wake:
+            # Decide which mic owns this capture:
+            #   - If the room has a wake adapter registered (Wyze RTSP /
+            #     ESP MQTT mics), tap THAT adapter for chunks. Suspending
+            #     the office PC's wake stream is unnecessary and just
+            #     blinds office wake detection while we capture elsewhere.
+            #   - If the room has no wake adapter, it's the office (the
+            #     only room whose mic the PC WakeWordDetector owns).
+            #     Existing sounddevice-based path with self.wake.suspend().
+            room_adapter = (
+                self.wake_sources.get_source(room)
+                if self.wake_sources is not None else None
+            )
+            use_room_tap = room_adapter is not None and hasattr(
+                room_adapter, "attach_recording_tap"
+            )
+            if self.wake and not use_room_tap:
                 self.wake.suspend()
             try:
-                await play_chime_async()
+                # Chime routing: if this is a non-office wake AND the room
+                # has a working speaker sink, push the chime to THAT room
+                # so Cole hears it where he is, not faintly from the office.
+                # Fall back to PC sounddevice when (a) the wake is in the
+                # office, or (b) the room has no speaker configured (sink
+                # type "none"), or (c) the in-room playback raises. Cases
+                # (b) and (c) are surfaced as dashboard notifications —
+                # the user explicitly wants to know when this happens
+                # because the chime ends up in the wrong room.
+                chimed_in_room = False
+                if use_room_tap and self.speaker_manager is not None:
+                    spk_type = self.speaker_manager.get_speaker_type(room)
+                    if spk_type == "none":
+                        await self._emit_issue(
+                            level="warning",
+                            source="chime_fallback",
+                            room=room,
+                            message=(
+                                f"Wake fired in '{room}' but the room has "
+                                "no speaker configured — chiming on the "
+                                "PC speakers instead."
+                            ),
+                        )
+                    else:
+                        try:
+                            pcm, rate = chime_bytes()
+                            played = await self.speaker_manager.play(
+                                room, pcm, rate
+                            )
+                            chimed_in_room = bool(played)
+                            if not chimed_in_room:
+                                await self._emit_issue(
+                                    level="warning",
+                                    source="chime_fallback",
+                                    room=room,
+                                    message=(
+                                        f"In-room chime to '{room}' was "
+                                        "rejected by the speaker driver — "
+                                        "chiming on the PC speakers instead."
+                                    ),
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                f"[Wake] in-room chime to '{room}' failed: {e}"
+                                " — falling back to PC chime"
+                            )
+                            await self._emit_issue(
+                                level="error",
+                                source="chime_fallback",
+                                room=room,
+                                message=(
+                                    f"In-room chime to '{room}' raised: "
+                                    f"{e}. Chiming on PC speakers instead."
+                                ),
+                            )
+                if not chimed_in_room:
+                    await play_chime_async()
                 await asyncio.sleep(0.3)
 
                 recording_cfg = self.config["voice"]["recording"]
-                record_device = (
-                    self.wake.device if self.wake else recording_cfg.get("device")
-                )
-                # Use the pre-wake noise floor measured by wake_word's
-                # always-on stream — far more reliable than calibrating
-                # during the first 400ms of recording (which clips the
-                # user mid-sentence if they start talking immediately).
-                pre_floor = (
-                    self.wake.get_noise_floor_db(
-                        fallback_db=recording_cfg["silence_threshold_db"]
+                if not use_room_tap:
+                    # Existing path: PC sounddevice mic with the wake
+                    # detector's pre-calibrated noise floor.
+                    record_device = (
+                        self.wake.device if self.wake
+                        else recording_cfg.get("device")
                     )
-                    if self.wake else recording_cfg["silence_threshold_db"]
-                )
-                logger.debug(f"[Wake] using pre-calibrated floor: {pre_floor:.1f} dBFS")
-                audio_data = await asyncio.to_thread(
-                    record_until_silence,
-                    silence_threshold_db=pre_floor,
-                    silence_duration_ms=recording_cfg["silence_duration_ms"],
-                    max_duration_seconds=recording_cfg["max_duration_seconds"],
-                    speech_start_timeout_seconds=recording_cfg.get(
-                        "speech_start_timeout_seconds",
-                        5.0,
-                    ),
-                    device=record_device,
-                    mode=recording_cfg.get("mode", "silence"),
-                    fixed_duration_seconds=float(
-                        recording_cfg.get("fixed_duration_seconds", 7.0)
-                    ),
-                    # Adaptive disabled — pre-wake floor is what we use now.
-                    adaptive_noise_floor=False,
-                )
+                    pre_floor = (
+                        self.wake.get_noise_floor_db(
+                            fallback_db=recording_cfg["silence_threshold_db"]
+                        )
+                        if self.wake
+                        else recording_cfg["silence_threshold_db"]
+                    )
+                    logger.debug(
+                        f"[Wake] using pre-calibrated floor: {pre_floor:.1f} dBFS"
+                    )
+                    audio_data = await asyncio.to_thread(
+                        record_until_silence,
+                        silence_threshold_db=pre_floor,
+                        silence_duration_ms=recording_cfg["silence_duration_ms"],
+                        max_duration_seconds=recording_cfg["max_duration_seconds"],
+                        speech_start_timeout_seconds=recording_cfg.get(
+                            "speech_start_timeout_seconds",
+                            5.0,
+                        ),
+                        device=record_device,
+                        mode=recording_cfg.get("mode", "silence"),
+                        fixed_duration_seconds=float(
+                            recording_cfg.get("fixed_duration_seconds", 7.0)
+                        ),
+                        # Adaptive disabled — pre-wake floor is what we use now.
+                        adaptive_noise_floor=False,
+                    )
+                else:
+                    # Wyze room: wake fired from a MicSourceWakeAdapter. Tap
+                    # its chunk stream so we capture from the SAME mic that
+                    # heard the wake, not the office PC mic. Without this,
+                    # bedroom wake → office mic recording → STT picks up
+                    # silence/distant noise, and Cole's actual followup is
+                    # never transcribed (real bug observed 2026-05-09).
+                    # No pre-wake floor available for non-office rooms
+                    # (the wake detector isn't tracking ambient there like
+                    # wake_word does in the office). Use the configured
+                    # static threshold; works fine for Wyze RTSP audio
+                    # which is consistently moderate.
+                    threshold_db = float(
+                        recording_cfg["silence_threshold_db"]
+                    )
+                    logger.debug(
+                        f"[Wake] room='{room}' using static floor: "
+                        f"{threshold_db:.1f} dBFS"
+                    )
+                    try:
+                        audio_data = await record_until_silence_from_chunks(
+                            attach_tap=room_adapter.attach_recording_tap,
+                            detach_tap=room_adapter.detach_recording_tap,
+                            silence_threshold_db=threshold_db,
+                            silence_duration_ms=recording_cfg[
+                                "silence_duration_ms"
+                            ],
+                            max_duration_seconds=recording_cfg[
+                                "max_duration_seconds"
+                            ],
+                            speech_start_timeout_seconds=recording_cfg.get(
+                                "speech_start_timeout_seconds",
+                                5.0,
+                            ),
+                            chunk_sample_rate=getattr(
+                                room_adapter, "recording_sample_rate", 16000
+                            ),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[Wake] Tap capture for room '{room}' "
+                            f"failed: {e}"
+                        )
+                        audio_data = None
             finally:
-                if self.wake:
+                if self.wake and not use_room_tap:
                     self.wake.wakeup()
                 # Restore prior audio-io state. _speak will re-set it during
                 # any TTS playback that follows; the gap between here and
@@ -1100,6 +1285,15 @@ class Orchestrator:
             db=self.db,
             extras=extras or None,
         )
+
+        # Attach a FRESH snapshot from the wake room to the latest user
+        # message. The LLM is multimodal (Gemini 3 / vision-capable
+        # Ollama); giving it the actual scene at the moment of the
+        # utterance is dramatically more useful than only the periodic
+        # vision-loop description from up to a minute ago. We only attach
+        # to the LATEST user message — historical turns stay text-only so
+        # context doesn't bloat with stale images.
+        await self._attach_room_snapshot(prompt_context, room)
 
         # Tool calling: collect every tool currently available — calendar (if
         # authenticated), ask_claude (always available with API key), memory
@@ -1810,7 +2004,141 @@ class Orchestrator:
                     k: v for k, v in self._selfedit_handlers().items()
                     if k in {"write_file", "edit_file", "restart_self"}
                 })
+        # Live vision tool — fresh snapshot of any camera-equipped room.
+        # The wake-room frame is auto-attached to the user message in
+        # _process_user_text already; this tool lets the LLM pull a frame
+        # from a DIFFERENT room mid-conversation (e.g. "is the dog still
+        # in the living room?" while Cole is in the office).
+        if self.cameras is not None:
+            tools.append(self._GET_SNAPSHOT_TOOL)
+            handlers["get_room_snapshot"] = self._tool_get_room_snapshot
         return tools, handlers
+
+    _GET_SNAPSHOT_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "get_room_snapshot",
+            "description": (
+                "Capture a FRESH snapshot from a specific room's camera and "
+                "return a description of what is currently visible there. "
+                "Use this when you need up-to-the-second info about a room "
+                "OTHER than the one the user is in (the user's own room "
+                "frame is already attached to their message). Examples: "
+                "checking on a pet in another room, verifying whether a "
+                "person is still where you last saw them, looking for an "
+                "object the user mentioned. Don't call this for the user's "
+                "current room — that frame is already in the prompt."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "room": {
+                        "type": "string",
+                        "description": (
+                            "Room ID to snapshot. Must be one of the "
+                            "configured camera-equipped rooms (e.g. "
+                            "'office', 'bedroom', 'kitchen', "
+                            "'living_room', 'laundry_room')."
+                        ),
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "Optional specific question to ask about the "
+                            "image (e.g. 'is the cat on the couch?'). "
+                            "Defaults to a general scene description."
+                        ),
+                    },
+                },
+                "required": ["room"],
+            },
+        },
+    }
+
+    async def _attach_room_snapshot(
+        self, messages: list[dict], room: str
+    ) -> None:
+        """Mutate `messages` in place: capture a fresh JPEG from `room`'s
+        camera and attach it to the LAST user message via the `images`
+        field (Ollama-style multimodal). No-op if the room has no live
+        camera, or if capture fails — voice still works without vision.
+
+        Why per-turn rather than from the periodic vision loop: the loop
+        runs on a 60s cadence and its output is a TEXT description. When
+        the user actually speaks, we want the LLM to see the SCENE AT
+        THAT MOMENT — pose, objects in hand, where the gaze is — none of
+        which the periodic description can capture in time.
+        """
+        if self.cameras is None:
+            return
+        if room not in self.cameras.get_available_rooms():
+            return
+        try:
+            frame = await self.cameras.capture_frame_async(room)
+        except Exception as e:
+            logger.debug(f"[Vision/prompt] capture for '{room}' raised: {e}")
+            return
+        if frame is None:
+            return
+        try:
+            import cv2
+            ok, buf = cv2.imencode(
+                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
+            )
+            if not ok:
+                return
+            img_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+        except Exception as e:
+            logger.debug(f"[Vision/prompt] encode for '{room}' raised: {e}")
+            return
+        # Find the last user message and attach. Walking from the tail
+        # because the prompt builder may have added trailing context
+        # messages with other roles.
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                existing = msg.get("images") or []
+                msg["images"] = list(existing) + [img_b64]
+                logger.debug(
+                    f"[Vision/prompt] attached fresh '{room}' frame "
+                    f"({len(buf)} bytes) to user msg"
+                )
+                return
+
+    async def _tool_get_room_snapshot(
+        self, room: str, question: Optional[str] = None
+    ) -> dict:
+        """Tool handler for get_room_snapshot. Captures a fresh frame from
+        the given room and runs a vision query against it. Returns a dict
+        the LLM tool-loop will JSON-serialize for its next turn.
+        """
+        if self.cameras is None:
+            return {"error": "camera manager unavailable"}
+        if self.llm is None:
+            return {"error": "LLM unavailable for vision query"}
+        if room not in self.cameras.get_available_rooms():
+            return {
+                "error": f"room '{room}' has no live camera",
+                "available_rooms": self.cameras.get_available_rooms(),
+            }
+        try:
+            frame = await self.cameras.capture_frame_async(room)
+        except Exception as e:
+            return {"error": f"frame capture failed: {e}"}
+        if frame is None:
+            return {"error": f"camera in '{room}' returned no frame"}
+        prompt = question or (
+            "Describe what is currently visible in this scene. Be concise "
+            "but include people, pets, notable objects, and activity."
+        )
+        try:
+            description = await self.llm.vision_query(frame, prompt)
+        except Exception as e:
+            return {"error": f"vision query failed: {e}"}
+        return {
+            "room": room,
+            "description": description,
+            "question": prompt,
+        }
 
     async def _try_dnd(self, text: str, room: str) -> bool:
         """
@@ -1892,7 +2220,7 @@ class Orchestrator:
 
     async def _on_text_chat(self, text: str, room: str = "office") -> None:
         # Dashboard chat = presence signal too — update active room.
-        self._active_user_room = room
+        self._set_active_user_room(room)
         """Handle typed messages sent from the dashboard chat input."""
         text = text.strip()
         if not text:
@@ -2182,7 +2510,7 @@ class Orchestrator:
                                             f"{self._active_user_room} → {room_id} "
                                             f"(face: {match.name})"
                                         )
-                                        self._active_user_room = room_id
+                                        self._set_active_user_room(room_id)
                             except Exception as e:
                                 logger.debug(f"[Identity/face] identify failed: {e}")
 
@@ -3066,6 +3394,7 @@ class Orchestrator:
         from modules.voice.audio_utils import (
             SAMPLE_RATE,
             record_until_silence,
+            record_until_silence_from_chunks,
             db_from_rms,
         )
         audio_data = None
@@ -3073,7 +3402,17 @@ class Orchestrator:
             self._followup_depth += 1
             was_audio_active = self._audio_io_active
             self._audio_io_active = True
-            if self.wake:
+            # Mirror the routing logic from _on_wake_detected: tap the
+            # room's wake adapter when one exists, fall back to the office
+            # PC mic only when there isn't one (i.e. office room).
+            room_adapter = (
+                self.wake_sources.get_source(room)
+                if self.wake_sources is not None else None
+            )
+            use_room_tap = room_adapter is not None and hasattr(
+                room_adapter, "attach_recording_tap"
+            )
+            if self.wake and not use_room_tap:
                 self.wake.suspend()
                 # Same dance the wake handler does: give wake's InputStream
                 # time to actually close before we open ours. Without this
@@ -3081,31 +3420,70 @@ class Orchestrator:
                 # return zero-filled buffers for the first ~second.
                 await asyncio.sleep(0.3)
             try:
-                record_device = (
-                    self.wake.device if self.wake else recording_cfg.get("device")
-                )
-                pre_floor = (
-                    self.wake.get_noise_floor_db(
-                        fallback_db=recording_cfg.get("silence_threshold_db", -45.0)
+                if not use_room_tap:
+                    record_device = (
+                        self.wake.device if self.wake
+                        else recording_cfg.get("device")
                     )
-                    if self.wake
-                    else recording_cfg.get("silence_threshold_db", -45.0)
-                )
-                logger.debug(
-                    f"[Followup] record_device={record_device}, pre-floor={pre_floor:.1f} dBFS"
-                )
-                audio_data = await asyncio.to_thread(
-                    record_until_silence,
-                    silence_threshold_db=pre_floor,
-                    silence_duration_ms=recording_cfg.get("silence_duration_ms", 600),
-                    max_duration_seconds=recording_cfg.get("max_duration_seconds", 60.0),
-                    speech_start_timeout_seconds=listen_seconds,
-                    device=record_device,
-                    mode="silence",
-                    adaptive_noise_floor=False,
-                )
+                    pre_floor = (
+                        self.wake.get_noise_floor_db(
+                            fallback_db=recording_cfg.get(
+                                "silence_threshold_db", -45.0
+                            )
+                        )
+                        if self.wake
+                        else recording_cfg.get("silence_threshold_db", -45.0)
+                    )
+                    logger.debug(
+                        f"[Followup] record_device={record_device}, "
+                        f"pre-floor={pre_floor:.1f} dBFS"
+                    )
+                    audio_data = await asyncio.to_thread(
+                        record_until_silence,
+                        silence_threshold_db=pre_floor,
+                        silence_duration_ms=recording_cfg.get(
+                            "silence_duration_ms", 600
+                        ),
+                        max_duration_seconds=recording_cfg.get(
+                            "max_duration_seconds", 60.0
+                        ),
+                        speech_start_timeout_seconds=listen_seconds,
+                        device=record_device,
+                        mode="silence",
+                        adaptive_noise_floor=False,
+                    )
+                else:
+                    threshold_db = float(
+                        recording_cfg.get("silence_threshold_db", -45.0)
+                    )
+                    logger.debug(
+                        f"[Followup] room='{room}' tap, static floor: "
+                        f"{threshold_db:.1f} dBFS"
+                    )
+                    try:
+                        audio_data = await record_until_silence_from_chunks(
+                            attach_tap=room_adapter.attach_recording_tap,
+                            detach_tap=room_adapter.detach_recording_tap,
+                            silence_threshold_db=threshold_db,
+                            silence_duration_ms=recording_cfg.get(
+                                "silence_duration_ms", 600
+                            ),
+                            max_duration_seconds=recording_cfg.get(
+                                "max_duration_seconds", 60.0
+                            ),
+                            speech_start_timeout_seconds=listen_seconds,
+                            chunk_sample_rate=getattr(
+                                room_adapter, "recording_sample_rate", 16000
+                            ),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[Followup] Tap capture for room '{room}' "
+                            f"failed: {e}"
+                        )
+                        audio_data = None
             finally:
-                if self.wake:
+                if self.wake and not use_room_tap:
                     self.wake.wakeup()
                 self._audio_io_active = was_audio_active
         # ── LOCK RELEASED ───────────────────────────────────────────────────
@@ -3447,6 +3825,19 @@ class Orchestrator:
 
     # ── Dashboard Broadcast ────────────────────────────────────────────────
 
+    def _set_active_user_room(self, room: str) -> None:
+        """Update the active-user-room tracker AND its timestamp atomically.
+
+        Keep both fields in lockstep so the wake coalescer's freshness
+        check (`now - ts < window`) is meaningful. Call this from any
+        path that has a strong "Cole is in <room>" signal — wake events,
+        face recognition, dashboard chat. Don't touch `_active_user_room`
+        directly.
+        """
+        import time as _time
+        self._active_user_room = room
+        self._active_user_room_ts = _time.monotonic()
+
     async def _broadcast(self, event: dict) -> None:
         """Send event to dashboard if enabled. Never blocks or raises."""
         if self.dashboard:
@@ -3454,6 +3845,56 @@ class Orchestrator:
                 await self.dashboard.broadcast(event)
             except Exception as e:
                 logger.debug(f"[Dashboard] Broadcast error: {e}")
+
+    async def _emit_issue(
+        self,
+        level: str,
+        source: str,
+        message: str,
+        room: Optional[str] = None,
+    ) -> None:
+        """User-facing issue notification.
+
+        Thin wrapper around the existing NotificationManager so callers
+        don't need to know whether the inbox is wired in. Logs at the
+        matching level (so the issue lands in the file log unconditionally),
+        then persists + broadcasts via `self.notifications.notify()` —
+        which feeds the bell-icon dropdown the dashboard already renders.
+
+        Use for things Cole should know about as they happen — chime
+        fallback when a room speaker is missing or rejects audio,
+        recurring RTSP drops, etc. Don't use for routine status.
+
+        level:   "info" | "warning" | "error" — passed through as
+                 NotificationManager severity and used to pick log level
+        source:  short kind identifier (e.g. "chime_fallback",
+                 "rtsp_drop") — recorded as the notification kind
+        message: human-readable explanation
+        room:    optional room ID, surfaced in the title for context
+        """
+        log_line = f"[Issue/{source}]" + (f" ({room})" if room else "") + f" {message}"
+        if level == "error":
+            logger.error(log_line)
+        elif level == "warning":
+            logger.warning(log_line)
+        else:
+            logger.info(log_line)
+        if self.notifications is None:
+            # Inbox not wired (test harness, partial init). The log line
+            # above is the only surface we can guarantee — that's fine.
+            return
+        title = source.replace("_", " ").title()
+        if room:
+            title = f"{title} — {room}"
+        try:
+            await self.notifications.notify(
+                kind=source,
+                title=title,
+                message=message,
+                severity=level,
+            )
+        except Exception as e:
+            logger.debug(f"[Issue] notify dispatch failed: {e}")
 
     async def _self_thought_loop(self) -> None:
         """
@@ -3766,12 +4207,14 @@ class Orchestrator:
         if self.dashboard:
             tasks.append(self.dashboard.run())
 
-        # Announce startup — let the LLM riff something in character
+        # Greet on startup — kept open-ended on purpose so the LLM doesn't
+        # fall into a "I'm back, Cole..." rut. No mention of "online" or
+        # "ready" in the prompt; just give it a beat to react however it
+        # wants. Fallback is plain in case Ollama is down.
         startup_line = await self._compose_in_character(
             prompt=(
-                "You just finished booting up after a restart. Greet Cole "
-                "with a single short in-character line announcing you're "
-                "online and ready. No preamble, no quotes."
+                "You just came back. Say one short line to Cole — whatever "
+                "feels right. No preamble, no quotes."
             ),
             fallback="Jarvis online.",
         )

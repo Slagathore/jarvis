@@ -1289,6 +1289,52 @@ class DashboardServer:
                 headers={"Cache-Control": "no-store"},
             )
 
+        @app.get("/api/cameras")
+        async def cameras_list():
+            """List of every camera-configured room, regardless of whether
+            the capture is currently open. The dashboard uses this to
+            decide where to render the reconnect button — gating on
+            "currently streaming" is wrong because a stuck cam disappears
+            from that list at exactly the moment the user needs the button.
+            """
+            cm = self._camera_manager
+            if cm is None:
+                return JSONResponse({"cameras": []})
+            return JSONResponse({"cameras": cm.get_configured_rooms()})
+
+        @app.post("/api/camera/{room}/reconnect")
+        async def camera_reconnect(room: str):
+            """Force-reopen a room's RTSP capture. The orchestrator's
+            CameraManager auto-reconnects on read failures with throttled
+            backoff, but a long-dropped stream (cam reboot, WiFi drop) can
+            leave the throttle window open with no live cap to retry on.
+            This endpoint bypasses the throttle and tries a fresh open
+            immediately, on demand from the dashboard's per-cam button.
+            """
+            cm = self._camera_manager
+            if cm is None:
+                raise HTTPException(status_code=503, detail="Camera manager not registered")
+            # All cameras live in _video_kinds; available_rooms only contains
+            # ones that opened successfully at boot, so we can't filter on it
+            # here — that would refuse exactly the case this endpoint is for.
+            kind = getattr(cm, "_video_kinds", {}).get(room)
+            if kind is None:
+                raise HTTPException(status_code=404, detail=f"No camera configured for '{room}'")
+            if kind != "rtsp":
+                # USB / HTTP cams have their own reopen paths the orchestrator
+                # already drives; only RTSP exposes the manual force-reopen
+                # because that's where the throttle-stuck failure mode lives.
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Reconnect only supported for RTSP cameras, '{room}' is {kind}",
+                )
+            try:
+                await asyncio.to_thread(cm._try_reopen_rtsp_throttled, room, True)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Reconnect failed: {e}") from e
+            now_open = room in cm.get_available_rooms()
+            return JSONResponse({"room": room, "reconnected": now_open})
+
         @app.get("/stream/{room}")
         async def camera_mjpeg_stream(room: str):
             """Multipart MJPEG stream — efficient live view that the browser

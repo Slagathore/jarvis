@@ -284,19 +284,17 @@ class MQTTClient:
                             f"[MQTT] Handler error for '{topic}': {e}"
                         )
 
-            # Forward node status messages to the event bus
+            # Forward node status messages to the event bus. Audio chunks
+            # are NOT forwarded — the dedicated Esp32MqttMicSource subscribes
+            # to its own audio/in topic via the direct handler dispatch above
+            # and consumes the bytes there. Re-publishing on the event bus
+            # would just spam "no subscribers" warnings ~50 times/sec since
+            # nothing else listens for raw PCM frames.
             if "/status" in topic:
                 room = self._extract_room(topic)
                 await self._event_bus.publish(
                     "node.status",
                     {"room": room, "topic": topic, "data": data},
-                )
-
-            elif "/audio/in" in topic:
-                room = self._extract_room(topic)
-                await self._event_bus.publish(
-                    "node.audio_received",
-                    {"room": room, "audio": data},
                 )
 
         except Exception as e:

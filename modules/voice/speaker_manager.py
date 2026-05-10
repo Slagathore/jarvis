@@ -106,6 +106,15 @@ class SpeakerManager:
             if not isinstance(s, NullSpeakerSink)
         ]
 
+    def attach_mqtt(self, mqtt_client) -> None:
+        """Late-bind MQTT into sinks that need it (esp32_i2s_spk today).
+        SpeakerManager is built during voice init; this is called from the
+        orchestrator after MQTT connects."""
+        for sink in self._sinks.values():
+            attach = getattr(sink, "attach_mqtt", None)
+            if callable(attach):
+                attach(mqtt_client)
+
     def get_speaker_type(self, room: str) -> str:
         """Return the driver type for a room — used by the orchestrator's
         legacy "is this a node-routed speaker?" check during the migration

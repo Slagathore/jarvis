@@ -140,8 +140,10 @@ class WyzeRtspAudioCfg(BaseModel):
 
 
 class Esp32MqttMicCfg(BaseModel):
-    """ESP32 INMP441 mic publishing PCM frames to MQTT. Stub for now — needs
-    the firmware audio-publish path to land before we can read it.
+    """ESP32 INMP441 mic publishing PCM frames to MQTT. Host subscriber is
+    fully wired (see Esp32MqttMicSource) — what's still pending is the
+    firmware lambda on the ESPHome side that publishes captured I2S samples
+    to this topic. Until that lands the subscription sits idle.
     """
     type: Literal["esp32_i2s_mic"]
     mqtt_topic: str
@@ -197,7 +199,11 @@ class WyzeSshSpeakerCfg(BaseModel):
 
 
 class Esp32MqttSpeakerCfg(BaseModel):
-    """ESP32 MAX98357A I2S speaker over MQTT. Stub for now."""
+    """ESP32 MAX98357A I2S speaker over MQTT. Host publisher is fully wired
+    (Esp32MqttSpeakerSink); the firmware-side MQTT-on_message → speaker.play
+    path needs to be added to node_base.yaml for audio to actually reach
+    the amp. Topic carries raw int16 LE PCM @ 16 kHz mono.
+    """
     type: Literal["esp32_i2s_spk"]
     mqtt_topic: str
 

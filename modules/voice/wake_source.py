@@ -224,3 +224,17 @@ class WakeSourceManager:
 
     def registered_rooms(self) -> list[str]:
         return list(self._runners.keys())
+
+    def get_source(self, room: str) -> Optional[Any]:
+        """Return the WakeSource registered for a room, or None.
+
+        Used by the orchestrator's wake-recording path to reach the adapter
+        and install a recording tap when wake fires in a non-office room.
+        Returns the underlying source object (typically a
+        MicSourceWakeAdapter), so the caller can `isinstance`-check or
+        getattr the tap-management methods on it.
+        """
+        runner = self._runners.get(room)
+        if runner is None:
+            return None
+        return runner._source

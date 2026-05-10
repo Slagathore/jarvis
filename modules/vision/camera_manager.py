@@ -55,11 +55,96 @@ Variables:
 """
 
 import asyncio
+import threading
 from typing import Any, Optional
 
 import httpx
 import numpy as np
 from loguru import logger
+
+
+class _RTSPFrameDrainer:
+    """Background-thread RTSP frame drainer.
+
+    Why this exists: cv2.VideoCapture against an RTSP source on the FFmpeg
+    backend buffers frames internally. CAP_PROP_BUFFERSIZE=1 is a hint
+    the FFmpeg backend on Windows often ignores in practice. When we read
+    at 5 fps from a 15 fps source, the cv2/FFmpeg pipeline silently
+    accumulates frames between our reads — a small backlog at first, then
+    seconds of lag, then tens of seconds. Result: the dashboard shows
+    Cole in the bedroom 30 s after he physically left.
+
+    This class drains as fast as the source delivers. Each successful
+    read is stored in a thread-safe slot, overwriting whatever was there.
+    `latest()` returns whatever is currently in the slot — always the most
+    recent frame the cv2 cap has produced. Anything in the FFmpeg backlog
+    is consumed (and discarded) by the drainer thread, so it never piles
+    up.
+
+    Owned 1:1 with a cv2.VideoCapture. CameraManager creates a drainer
+    when it opens an RTSP cap and stops the drainer before releasing the
+    cap (drainer-then-cap teardown order matters: a cap.release() while
+    the drainer thread is mid-read causes a crash inside FFmpeg).
+    """
+
+    def __init__(self, cap: Any, room: str) -> None:
+        self._cap = cap
+        self._room = room
+        self._latest: Optional[np.ndarray] = None
+        self._latest_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"rtsp-drainer-{room}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        # Tight read loop. cv2.read() blocks until the next frame arrives,
+        # so we naturally pace at the source's frame rate. On read failure
+        # we briefly back off to avoid pegging the CPU when the cam has
+        # disconnected — the manager's reopen path will replace the cap
+        # entirely so this thread will be told to stop.
+        consecutive_fails = 0
+        while not self._stop_event.is_set():
+            try:
+                ret, frame = self._cap.read()
+            except Exception:
+                ret, frame = False, None
+            if ret and frame is not None:
+                consecutive_fails = 0
+                with self._latest_lock:
+                    self._latest = frame
+            else:
+                consecutive_fails += 1
+                # 50 ms backoff on failure; if the manager is going to
+                # replace the cap it'll signal stop quickly so we won't
+                # idle here for long.
+                self._stop_event.wait(0.05)
+                if consecutive_fails >= 200:
+                    # 10s of solid failures — the cap is dead. Stop;
+                    # CameraManager's read path will see no frame and
+                    # trigger a reopen via the existing throttled path.
+                    logger.debug(
+                        f"[RTSPDrainer:{self._room}] 10s of read failures, "
+                        "exiting thread"
+                    )
+                    return
+
+    def latest(self) -> Optional[np.ndarray]:
+        """Return the most recent frame (or None if no frame has arrived
+        yet). Returned array is a SHALLOW reference to the drainer's slot —
+        callers shouldn't mutate it; if they need to keep it past the next
+        write, they should copy.
+        """
+        with self._latest_lock:
+            return self._latest
+
+    def stop(self, timeout_s: float = 1.0) -> None:
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=timeout_s)
 
 try:
     import cv2
@@ -117,6 +202,13 @@ class CameraManager:
         # is None (cam rebooted, transient drop), don't hammer the cam
         # — wait at least _wyze_reconnect_delay between attempts.
         self._next_reopen_attempt: dict[str, float] = {}
+        # Per-room background drainer threads for RTSP caps. cv2's FFmpeg
+        # backend buffers frames internally; without a drainer constantly
+        # reading, our 5 fps reads against a 15 fps source accumulate
+        # multi-second lag. The drainer keeps the cap drained at source
+        # rate and exposes only the latest frame. Owned 1:1 with a
+        # cv2.VideoCapture in self._caps[room]; lifetime tied to the cap.
+        self._drainers: dict[str, _RTSPFrameDrainer] = {}
         # Pull tunables from config.drivers; fall back to sensible defaults.
         # The drain count is the magic Wyze touch — the camera sends a
         # buffered backlog when you connect, and we want the freshest frame.
@@ -464,6 +556,10 @@ class CameraManager:
         self._fail_counts[room_id] = 0
         self._last_frames[room_id] = frame
         self._read_locks[room_id] = asyncio.Lock()
+        # Stop any previous drainer for this room (reopen path) before
+        # spawning a new one — same teardown invariant as caps.
+        self._stop_drainer(room_id)
+        self._drainers[room_id] = _RTSPFrameDrainer(cap, room_id)
         logger.info(f"[CameraManager] RTSP connected for '{room_id}' ({url})")
 
     # ── Public read API ──────────────────────────────────────────────────────
@@ -471,6 +567,21 @@ class CameraManager:
     def get_available_rooms(self) -> list[str]:
         """Return list of room IDs that have an open camera (any kind)."""
         return list(self._caps.keys()) + list(self._http_urls.keys())
+
+    def get_configured_rooms(self) -> list[dict]:
+        """Return every room that has a camera *configured* (regardless of
+        whether the underlying capture is currently open).
+
+        Used by the dashboard to decide which rooms get a reconnect button:
+        get_available_rooms() reflects only currently-streaming cams, which
+        is the wrong signal because a stuck/dropped cam disappears from
+        that list precisely when we want the button to appear. Each item
+        is `{"room": <id>, "kind": "usb"|"http"|"rtsp"}`.
+        """
+        return [
+            {"room": room, "kind": kind}
+            for room, kind in self._video_kinds.items()
+        ]
 
     def capture_frame(self, room: str) -> Optional[np.ndarray]:
         """
@@ -636,15 +747,32 @@ class CameraManager:
             # came up. Returns None for THIS read either way.
             self._try_reopen_rtsp_throttled(room)
             return None
-        try:
-            for _ in range(self._wyze_drain):
-                cap.grab()
-            ret, frame = cap.read()
-            if ret and frame is not None:
+        # Read from the drainer's latest-frame slot rather than calling
+        # cap.read() directly. The drainer has been pulling at source
+        # rate in its own thread, so its slot always holds the freshest
+        # frame the cv2/FFmpeg pipeline has produced — no buffered
+        # backlog, no multi-second lag. Falls back to direct read if no
+        # drainer is registered (shouldn't happen for RTSP rooms but
+        # better than crashing).
+        drainer = self._drainers.get(room)
+        if drainer is not None:
+            frame = drainer.latest()
+            if frame is not None:
                 self._fail_counts[room] = 0
                 return frame
-        except Exception as e:
-            logger.warning(f"[CameraManager] RTSP read error for '{room}': {e}")
+            # Drainer hasn't captured anything yet OR the thread died.
+            # Fall through to fail-count tracking below so the existing
+            # reopen path triggers when a stream genuinely stalls.
+        else:
+            try:
+                for _ in range(self._wyze_drain):
+                    cap.grab()
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    self._fail_counts[room] = 0
+                    return frame
+            except Exception as e:
+                logger.warning(f"[CameraManager] RTSP read error for '{room}': {e}")
 
         self._fail_counts[room] = self._fail_counts.get(room, 0) + 1
         logger.warning(
@@ -689,6 +817,10 @@ class CameraManager:
         old cap explicitly because the FFmpeg context is in a bad state
         and reusing it just produces more bad frames.
         """
+        # Stop drainer FIRST so its thread isn't reading the cap while
+        # we release it. _safe_release on a cap mid-read crashes inside
+        # FFmpeg.
+        self._stop_drainer(room)
         old = self._caps.pop(room, None)
         if old is not None:
             self._safe_release(old)
@@ -741,6 +873,12 @@ class CameraManager:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, self._wyze_buffer_size)
                 self._caps[room] = cap
                 self._fail_counts[room] = 0
+                # Spin up a fresh drainer for the new cap. The previous
+                # drainer (if any) was already stopped by the path that
+                # got us here (_reopen_rtsp via _stop_drainer, or the
+                # initial-open path which calls _stop_drainer before
+                # registering a new one).
+                self._drainers[room] = _RTSPFrameDrainer(cap, room)
                 logger.info(f"[CameraManager] RTSP reconnected '{room}'")
             else:
                 self._safe_release(cap)
@@ -763,8 +901,25 @@ class CameraManager:
         except Exception:
             pass
 
+    def _stop_drainer(self, room: str) -> None:
+        """Stop and remove the drainer for `room` if one exists. Safe to
+        call even when no drainer is registered. MUST be called BEFORE
+        the underlying cv2.VideoCapture is released — the drainer thread
+        is mid-read into the cap, and releasing the cap from another
+        thread while it's reading crashes inside FFmpeg.
+        """
+        drainer = self._drainers.pop(room, None)
+        if drainer is not None:
+            try:
+                drainer.stop(timeout_s=1.0)
+            except Exception as e:
+                logger.debug(f"[CameraManager] drainer stop for '{room}' raised: {e}")
+
     async def close(self) -> None:
         """Release every cv2.VideoCapture and the shared httpx client."""
+        # Drainers first, then caps — see _stop_drainer for why.
+        for room in list(self._drainers.keys()):
+            self._stop_drainer(room)
         for room, cap in self._caps.items():
             self._safe_release(cap)
             logger.debug(f"[CameraManager] Released camera for '{room}'")

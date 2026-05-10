@@ -1,4 +1,5 @@
 packages:
+  audio: !include audio_bridge.yaml   # MUST be first — phantom i2s_audio claims I2S0
   base: !include node_base.yaml
 
 substitutions:

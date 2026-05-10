@@ -1,4 +1,7 @@
 {
+  "bedroom": {
+    "volume": 100
+  },
   "living_room": {
     "flip_h": false,
     "flip_v": false

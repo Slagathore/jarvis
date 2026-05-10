@@ -306,6 +306,43 @@ function updateHealth(system) {
   setText("h-whisper-detail", system.whisper?.model || "—");
 }
 
+// Set of room IDs that have a camera CONFIGURED (not necessarily currently
+// streaming). Populated from /api/cameras at startup so the reconnect
+// button appears on dropped feeds — gating on `data.has_camera` was wrong
+// because that flag only flips true when vision events arrive, which
+// stops happening precisely when the feed dies. RTSP rooms can manually
+// reconnect; USB / HTTP cameras get the cog (settings) only.
+const configuredCameraRooms = new Set();
+const reconnectableCameraRooms = new Set();
+
+async function loadConfiguredCameras() {
+  try {
+    const res = await fetch("/api/cameras");
+    if (!res.ok) return;
+    const body = await res.json();
+    const list = Array.isArray(body.cameras) ? body.cameras : [];
+    configuredCameraRooms.clear();
+    reconnectableCameraRooms.clear();
+    for (const entry of list) {
+      if (!entry || !entry.room) continue;
+      configuredCameraRooms.add(entry.room);
+      // Only RTSP cams have the manual force-reopen path on the backend;
+      // /api/camera/{room}/reconnect 400s for USB / HTTP. Don't render
+      // a button that's guaranteed to fail.
+      if (entry.kind === "rtsp") {
+        reconnectableCameraRooms.add(entry.room);
+      }
+    }
+    // Re-render rooms now that we know which ones have cameras configured.
+    if (typeof roomsCache === "object" && roomsCache) {
+      updateRooms(roomsCache);
+    }
+  } catch (err) {
+    console.warn("[loadConfiguredCameras] failed:", err);
+  }
+}
+loadConfiguredCameras();
+
 function updateRooms(rooms) {
   const grid = document.getElementById("rooms-grid");
   if (!grid) return;
@@ -326,14 +363,35 @@ function updateRooms(rooms) {
         ? ""
         : `<span class="room-light ${lightsOn ? "on" : "off"}">${lightsOn ? "LIGHTS ON" : "LIGHTS OFF"}</span>`;
 
-    const feedTag = data.has_camera
+    // Camera presence is now driven by the configured-cameras set, not by
+    // `data.has_camera` (which only flips true when vision events arrive
+    // — i.e. never when the feed is broken, which is exactly when the
+    // reconnect button is needed).  Falls back to the old `has_camera`
+    // signal until /api/cameras has answered, so first paint isn't blank.
+    const hasCam =
+      configuredCameraRooms.has(roomId) || Boolean(data.has_camera);
+    const feedTag = hasCam
       ? `<img class="room-feed" data-room="${roomId}" alt="${roomId} feed" />`
+      : "";
+
+    // Reconnect only meaningful for RTSP cams (the backend endpoint 400s
+    // for USB / HTTP). When /api/cameras hasn't loaded yet we default to
+    // showing the button on any has_camera room — better to flash a
+    // reconnect that 400s than to hide it on the room that needs it.
+    const showReconnect =
+      reconnectableCameraRooms.has(roomId) ||
+      (configuredCameraRooms.size === 0 && Boolean(data.has_camera));
+    const reconnectBtn = showReconnect
+      ? `<button class="room-reconnect" data-room="${roomId}" title="Force-reconnect this camera's RTSP stream">⟳</button>`
       : "";
 
     card.innerHTML = `
       <div class="room-card-header">
         <div class="room-name">${roomId.replace(/_/g, " ").toUpperCase()}</div>
-        <button class="room-cog" data-room="${roomId}" title="Camera + audio settings for this room">⚙</button>
+        <div class="room-card-actions">
+          ${reconnectBtn}
+          <button class="room-cog" data-room="${roomId}" title="Camera + audio settings for this room">⚙</button>
+        </div>
       </div>
       ${feedTag}
       <div class="room-status">${data.person_present ? "● Person detected" : "○ Empty"}</div>
@@ -345,6 +403,39 @@ function updateRooms(rooms) {
       cogBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         openRoomSettingsModal(roomId);
+      });
+    }
+    const reconnectBtnEl = card.querySelector(".room-reconnect");
+    if (reconnectBtnEl) {
+      reconnectBtnEl.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        // Disable + spin while reconnecting; backend can take 5-30s for
+        // RTSP open against a slow / dropped cam. The UI shouldn't let
+        // double-clicks queue more attempts.
+        reconnectBtnEl.disabled = true;
+        reconnectBtnEl.classList.add("spinning");
+        try {
+          const res = await fetch(`/api/camera/${encodeURIComponent(roomId)}/reconnect`, {
+            method: "POST",
+          });
+          if (!res.ok) {
+            const txt = await res.text().catch(() => "");
+            console.warn(`[reconnect] ${roomId} ->`, res.status, txt);
+            reconnectBtnEl.classList.add("failed");
+            setTimeout(() => reconnectBtnEl.classList.remove("failed"), 2000);
+          } else {
+            // Force a snapshot refresh so the user sees the new feed
+            // immediately without waiting for the 250ms poll cycle.
+            refreshRoomFeeds();
+          }
+        } catch (err) {
+          console.warn(`[reconnect] ${roomId} threw:`, err);
+          reconnectBtnEl.classList.add("failed");
+          setTimeout(() => reconnectBtnEl.classList.remove("failed"), 2000);
+        } finally {
+          reconnectBtnEl.disabled = false;
+          reconnectBtnEl.classList.remove("spinning");
+        }
       });
     }
     grid.appendChild(card);

@@ -1,0 +1,93 @@
+# hardware/esphome/audio_bridge.yaml
+#
+# IMPORTANT: list this package BEFORE node_base.yaml in the node's
+# `packages:` block so the phantom i2s_audio below claims I2S port 0
+# before node_base's real bus gets there.
+#
+# Opt-in audio over MQTT bridge for Jarvis ESP32 nodes.
+# Wires:
+#   I2S microphone → MQTT publish to jarvis/nodes/${room_id}/audio/in
+#   MQTT subscribe to jarvis/nodes/${room_id}/audio/out → I2S speaker play
+#
+# Pairs with the host-side Esp32MqttMicSource / Esp32MqttSpeakerSink in
+# modules/voice/sources/esp32_mqtt.py. Wire format on both topics is raw
+# int16 little-endian PCM @ 16 kHz mono — same shape the wake-word path,
+# Whisper STT, and Piper TTS all expect.
+#
+# This file is an INCLUDE — list it in a node's `packages:` block alongside
+# node_base.yaml. node_base must come first so its microphone / speaker /
+# mqtt blocks are defined before we extend them here. Keep this file out
+# of unmodified node_base on purpose: bandwidth (~32 KB/s per node), CPU
+# load on the camera-running ESP32, and untested speaker.play behaviour
+# all warrant deliberate per-node opt-in.
+#
+# To flash:
+#   1. Add this package to a node's YAML (laundry_room is the obvious first):
+#        packages:
+#          base: !include node_base.yaml
+#          audio: !include audio_bridge.yaml
+#   2. ./.venv/Scripts/esphome.exe run hardware/esphome/node_laundry_room.yaml
+#   3. From Jarvis dashboard, send a TTS prompt to laundry_room and watch
+#      mosquitto_sub -t 'jarvis/nodes/laundry_room/audio/#' -v on the host.
+#      Mic side: publishes should appear once you talk near the cam.
+#      Speaker side: payloads received should produce audio.
+
+# ── Phantom I2S0 claim ────────────────────────────────────────────────────
+# ESPHome's i2s_audio component auto-assigns ports starting at I2S_NUM_0,
+# but on the ESP32-CAM that port shares DMA channels with the camera
+# capture peripheral. Result: real i2s_bus init fails with
+# "No free interrupt inputs for I2S0". Workaround: declare a no-op
+# i2s_audio block here that claims port 0, so the real i2s_bus from
+# node_base.yaml falls through to I2S_NUM_1 which has its own DMA. This
+# package MUST be listed BEFORE node_base.yaml so this entry is first
+# in the merged i2s_audio list (assignment iterates in declaration order).
+# GPIO13 is unused on the AI-Thinker ESP32-CAM pinout — safe to dangle.
+i2s_audio:
+  - id: i2s_phantom_port0
+    i2s_lrclk_pin: GPIO13
+
+# ── Microphone → MQTT publish ─────────────────────────────────────────────
+# The on_data automation fires once per i2s capture buffer. ESPHome 2024+
+# delivers the buffer as `x` (std::vector<uint8_t>). We construct a binary
+# std::string and publish — Mosquitto passes it through as bytes; the host
+# Esp32MqttMicSource hands the bytes straight to openWakeWord which expects
+# int16 LE PCM, so the wire format is identity.
+#
+# Topic uses ${room_id} from node_base substitutions, matching the
+# config.yaml mic.mqtt_topic value (jarvis/nodes/laundry_room/audio/in).
+microphone:
+  - id: !extend node_mic
+    on_data:
+      then:
+        - mqtt.publish:
+            topic: jarvis/nodes/${room_id}/audio/in
+            payload: !lambda |-
+              return std::string(x.begin(), x.end());
+            qos: 0
+            retain: false
+
+# In ESPHome 2024+ the i2s_audio microphone is paused until something
+# explicitly starts capture. Without this, on_data above never fires and
+# the audio/in topic stays silent. Capture once on boot, then leave it
+# running for the life of the device.
+esphome:
+  on_boot:
+    priority: -100  # after WiFi + MQTT come up
+    then:
+      - microphone.capture: node_mic
+
+# ── MQTT subscribe → speaker play ─────────────────────────────────────────
+# Subscribe to the audio/out topic and feed payloads to speaker.play. The
+# speaker component accepts raw bytes (interpreted as int16 LE PCM at the
+# I2S clock rate, which our i2s_bus drives). For longer utterances the
+# host should chunk the publish into sub-buffer segments so the ESP audio
+# pipeline doesn't have to allocate megabyte-scale buffers; the host's
+# SpeakerManager already handles sane chunk sizes.
+mqtt:
+  on_message:
+    - topic: jarvis/nodes/${room_id}/audio/out
+      then:
+        - speaker.play:
+            id: node_speaker
+            data: !lambda |-
+              return std::vector<uint8_t>(x.begin(), x.end());

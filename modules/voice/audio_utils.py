@@ -331,6 +331,182 @@ async def record_until_silence_async(
     )
 
 
+async def record_until_silence_from_chunks(
+    attach_tap,
+    detach_tap,
+    silence_threshold_db: float = -40.0,
+    silence_duration_ms: int = 800,
+    max_duration_seconds: float = 30.0,
+    speech_start_timeout_seconds: Optional[float] = None,
+    chunk_sample_rate: int = SAMPLE_RATE,
+) -> np.ndarray:
+    """Capture audio from a callback-driven mic source until silence, mirroring
+    `record_until_silence`'s semantics but consuming chunks via a tap instead
+    of opening a sounddevice InputStream.
+
+    Used by the orchestrator when wake fires in a non-office room — the
+    Wyze RTSP mics deliver audio via callback (no sounddevice device index),
+    so we install a tap on the room's wake adapter, buffer chunks here,
+    apply the same RMS / silence detection logic, and return the captured
+    float32 array at SAMPLE_RATE Hz.
+
+    Args:
+        attach_tap:   `def(callback) -> None`. The orchestrator passes
+                      `adapter.attach_recording_tap`. Wires `callback` to
+                      receive every PCM chunk the underlying mic emits.
+        detach_tap:   `def() -> None`. The orchestrator passes
+                      `adapter.detach_recording_tap`. Always called from a
+                      `finally` so a stuck recording can't poison wake
+                      detection forever.
+        chunk_sample_rate: The rate the source emits at. WyzeRtspMicSource
+                      resamples to 16 kHz which matches SAMPLE_RATE; if the
+                      first chunk's reported rate disagrees we resample to
+                      SAMPLE_RATE so downstream STT stays consistent.
+
+    Returns:
+        Float32 numpy array, shape (N,), at SAMPLE_RATE Hz.
+
+    Raises:
+        AudioError: If no audio could be captured.
+    """
+    queue: "asyncio.Queue[tuple[bytes, int]]" = asyncio.Queue(maxsize=256)
+
+    async def _tap(pcm: bytes, sr: int) -> None:
+        try:
+            queue.put_nowait((pcm, sr))
+        except asyncio.QueueFull:
+            # Drop oldest. Audio capture is a real-time process; backing
+            # up the queue means we're falling behind anyway, and the
+            # newest packets matter more than the oldest for silence
+            # detection at the tail of an utterance.
+            try:
+                _ = queue.get_nowait()
+                queue.put_nowait((pcm, sr))
+            except Exception:
+                pass
+
+    silence_blocks_needed = int(
+        (silence_duration_ms / 1000.0) * SAMPLE_RATE / CHUNK_FRAMES
+    )
+    max_blocks = int(max_duration_seconds * SAMPLE_RATE / CHUNK_FRAMES)
+    speech_start_timeout_blocks: Optional[int] = None
+    if speech_start_timeout_seconds is not None:
+        speech_start_timeout_blocks = max(
+            1,
+            int(speech_start_timeout_seconds * SAMPLE_RATE / CHUNK_FRAMES),
+        )
+
+    frames_collected: list[np.ndarray] = []
+    silence_block_count = 0
+    speech_started = False
+    first_speech_frame = 0
+    block_count = 0
+
+    # Re-chunker: source chunks may not align with CHUNK_FRAMES, so we
+    # buffer and slice. WyzeRtspMicSource emits 1280-sample chunks today
+    # but we don't want to depend on that.
+    pending = bytearray()
+    bytes_per_block = CHUNK_FRAMES * 2  # int16 mono
+    observed_rate = chunk_sample_rate
+
+    attach_tap(_tap)
+    try:
+        deadline_per_chunk = max(0.5, max_duration_seconds + 1.0)
+        while block_count < max_blocks:
+            try:
+                pcm, sr = await asyncio.wait_for(
+                    queue.get(), timeout=deadline_per_chunk
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[Audio] Tap-based recording timed out waiting for "
+                    f"chunk after {deadline_per_chunk:.1f}s — bailing"
+                )
+                break
+            if sr != observed_rate:
+                observed_rate = sr
+            pending.extend(pcm)
+            while len(pending) >= bytes_per_block:
+                block_int16 = np.frombuffer(
+                    bytes(pending[:bytes_per_block]), dtype=np.int16
+                )
+                del pending[:bytes_per_block]
+                if observed_rate != SAMPLE_RATE:
+                    # Cheap linear resample to canonical rate. Sources
+                    # SHOULD already deliver at SAMPLE_RATE; this is a
+                    # safety net so a mis-configured source doesn't
+                    # silently produce mis-sampled audio for STT.
+                    factor = SAMPLE_RATE / float(observed_rate)
+                    out_len = max(1, int(round(block_int16.size * factor)))
+                    block_int16 = np.interp(
+                        np.linspace(0.0, 1.0, num=out_len, endpoint=False),
+                        np.linspace(
+                            0.0, 1.0, num=block_int16.size, endpoint=False
+                        ),
+                        block_int16.astype(np.float64),
+                    ).astype(np.int16)
+                block = block_int16.astype(np.float32) * INT16_TO_FLOAT
+                frames_collected.append(block)
+                block_count += 1
+                rms = float(np.sqrt(np.mean(block ** 2)))
+                level_db = db_from_rms(rms)
+
+                if level_db > silence_threshold_db:
+                    if not speech_started:
+                        first_speech_frame = max(
+                            0, (block_count - 4) * CHUNK_FRAMES
+                        )
+                    speech_started = True
+                    silence_block_count = 0
+                elif speech_started:
+                    silence_block_count += 1
+                    if silence_block_count >= silence_blocks_needed:
+                        logger.debug(
+                            "[Audio] Silence detected — stopping (tap)"
+                        )
+                        break
+                elif (
+                    speech_start_timeout_blocks is not None
+                    and block_count >= speech_start_timeout_blocks
+                ):
+                    logger.debug(
+                        "[Audio] No speech detected before timeout — "
+                        "stopping (tap)"
+                    )
+                    break
+            else:
+                continue
+            # Inner break propagates out — breaks the outer while too.
+            if speech_started and silence_block_count >= silence_blocks_needed:
+                break
+            if (
+                not speech_started
+                and speech_start_timeout_blocks is not None
+                and block_count >= speech_start_timeout_blocks
+            ):
+                break
+    finally:
+        try:
+            detach_tap()
+        except Exception as e:
+            logger.warning(f"[Audio] detach_tap raised: {e}")
+
+    if not frames_collected:
+        raise AudioError(
+            "No audio frames were captured from chunk stream — tap may "
+            "have detached before any chunk arrived"
+        )
+    audio = np.concatenate(frames_collected, axis=0).flatten()
+    if speech_started and first_speech_frame > 0:
+        audio = audio[first_speech_frame:]
+    duration = len(audio) / SAMPLE_RATE
+    logger.debug(
+        f"[Audio] Tap-based capture: {duration:.2f}s "
+        f"({len(frames_collected)} blocks)"
+    )
+    return audio
+
+
 # ── Playback ─────────────────────────────────────────────────────────────────
 
 def play_audio_array(
@@ -451,3 +627,25 @@ async def play_chime_async(
 ) -> None:
     """Non-blocking wrapper for play_chime."""
     await asyncio.to_thread(play_chime, frequency, duration_ms, device)
+
+
+def chime_bytes(
+    frequency: float = 880.0,
+    duration_ms: int = 150,
+) -> tuple[bytes, int]:
+    """Return the wake-confirmation chime as raw int16 LE PCM bytes plus
+    its sample rate. Used by the orchestrator to route the chime through
+    SpeakerManager (and thus to the room where wake fired) instead of
+    always playing via PC sounddevice. Same waveform as `play_chime` —
+    same fade envelope, same amplitude — just emitted as bytes the
+    SpeakerSink interface accepts.
+    """
+    n_samples = int(SAMPLE_RATE * duration_ms / 1000.0)
+    t = np.linspace(0.0, duration_ms / 1000.0, n_samples, dtype=np.float32)
+    fade_n = int(0.01 * SAMPLE_RATE)
+    envelope = np.ones(n_samples, dtype=np.float32)
+    envelope[:fade_n] = np.linspace(0.0, 1.0, fade_n)
+    envelope[-fade_n:] = np.linspace(1.0, 0.0, fade_n)
+    tone = np.sin(2.0 * np.pi * frequency * t) * 0.3 * envelope
+    pcm_int16 = np.clip(tone * 32767.0, -32768, 32767).astype(np.int16)
+    return pcm_int16.tobytes(), SAMPLE_RATE

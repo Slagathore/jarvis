@@ -20,10 +20,35 @@ Functions:
 
 import argparse
 import asyncio
+import faulthandler
 import os
 import signal
 import sys
 from pathlib import Path
+
+# Dump a Python + native traceback to stderr on SIGSEGV / 0xC0000005 etc.
+# Costs nothing at runtime; pays for itself the first time something native
+# (PyAV/libav, cv2, CUDA, pycaw) crashes the interpreter.
+faulthandler.enable()
+
+# ── Native library noise suppression ──────────────────────────────────────
+# Both cv2 and PyAV bundle their own copy of libav; both write H.264 decoder
+# warnings (`non-existing PPS X referenced`, `decode_slice_header error`,
+# `no frame!`) directly to stderr while a stream is mid-GOP after a cold
+# open or reconnect. Tens of lines per second can drown the actual log.
+# These env vars MUST be set before the respective libraries import — they
+# tap into libav's static log-level config at first use.
+#
+#   OPENCV_FFMPEG_LOGLEVEL   — cv2's bundled libav. Values: "panic" (silent),
+#                              "fatal" (catastrophic only), "error", "warning",
+#                              "info", "debug". "fatal" silences PPS noise but
+#                              keeps real failures.
+#   AV_LOG_FORCE_NOCOLOR=1   — drop ANSI colour codes from any leaked stderr
+#                              so the file log stays readable.
+# (PyAV is configured via av.logging.set_level() in core/orchestrator.py
+# right after `import av`, since we don't import av here.)
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "fatal")
+os.environ.setdefault("AV_LOG_FORCE_NOCOLOR", "1")
 
 import yaml
 from dotenv import load_dotenv

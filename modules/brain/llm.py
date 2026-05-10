@@ -80,20 +80,38 @@ class OllamaLLM:
         self._gemini_direct: Optional[Any] = None
 
         # Set of model names that need think=False forced for tool-call
-        # round-trips. Populated when chat_with_tools observes the
-        # Gemini-3-via-Ollama-cloud "missing thought_signature" 400 — once
-        # we've hit that for a model, future tool turns skip the bad
-        # request entirely and go straight to think=False. Plain chat()
-        # calls (no tools, single round-trip) are unaffected — those work
-        # fine with thinking on.
-        # In-memory only. A restart re-learns; that's fine because the set
-        # is tiny and the cost of one re-discovery is one extra round-trip.
+        # round-trips. Pre-populated for Gemini-3 Ollama-cloud variants
+        # because Ollama-cloud strips the thought_signature field on
+        # round-trip — Gemini's API then 400s the next call complaining
+        # the prior assistant tool_call lacks a signature, and there's no
+        # way to recover *that conversation* once a tool call with thinking
+        # has happened. Forcing think=False from the very first request
+        # avoids ever poisoning the history. Plain chat() calls (no tools)
+        # are unaffected — those work fine with thinking on. We also still
+        # learn additional model names dynamically if a new Gemini-3 cloud
+        # variant ships and trips the same 400.
         self._tools_force_no_think: set[str] = set()
+        for candidate in {self._model, self._vision_model, self._action_model}:
+            if candidate and self._needs_no_think_for_tools(candidate):
+                self._tools_force_no_think.add(candidate)
 
     @staticmethod
     def _is_gemini_direct(model_name: str) -> bool:
         """True for models routed through Google's direct API (not via Ollama)."""
         return ":gapi" in (model_name or "")
+
+    @staticmethod
+    def _needs_no_think_for_tools(model_name: str) -> bool:
+        """True for models known to break tool-call round-trips when thinking
+        is enabled. Currently: Gemini-3 variants routed through Ollama-cloud
+        — Ollama-cloud strips Gemini's thought_signature field on response
+        deserialization, then Gemini 400s the next request claiming the
+        prior assistant tool_call is missing its signature. There's no way
+        to repair the offending message after the fact, so we force
+        think=False from the first request to keep the history clean.
+        """
+        n = (model_name or "").lower()
+        return n.startswith("gemini-3") and ":cloud" in n
 
     def _get_gemini_direct(self) -> Any:
         if self._gemini_direct is None:
@@ -349,6 +367,21 @@ class OllamaLLM:
                         )
                         self._tools_force_no_think.add(active_model)
                         chat_kwargs["think"] = False
+                        # Setting think=False on the NEXT request isn't enough
+                        # if the conversation already contains a prior
+                        # assistant tool_call from a think=True turn —
+                        # Gemini will 400 again complaining about the
+                        # historical message lacking a thought_signature.
+                        # Strip any trailing assistant + tool messages so
+                        # the retry starts from the user turn intact and
+                        # the model regenerates the tool call cleanly.
+                        trimmed = list(working_messages)
+                        while trimmed and trimmed[-1].get("role") in (
+                            "assistant", "tool"
+                        ):
+                            trimmed.pop()
+                        chat_kwargs["messages"] = trimmed
+                        working_messages = trimmed
                         try:
                             response = await asyncio.wait_for(
                                 self._client.chat(**chat_kwargs),

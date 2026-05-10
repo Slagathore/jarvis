@@ -100,6 +100,16 @@ class MicManager:
             if not isinstance(s, NullMicSource)
         ]
 
+    def attach_mqtt(self, mqtt_client) -> None:
+        """Late-bind the MQTT client into any sources that need it (only
+        the ESP32 MQTT mic today). MicManager is constructed during voice
+        init before MQTTClient connects; the orchestrator calls this once
+        the broker is up."""
+        for src in self._sources.values():
+            attach = getattr(src, "attach_mqtt", None)
+            if callable(attach):
+                attach(mqtt_client)
+
     async def start_capture(self, room: str, callback: MicCallback) -> bool:
         """Begin streaming for `room`. Returns False if no source is
         configured (caller can decide whether to log/raise).

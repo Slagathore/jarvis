@@ -522,7 +522,10 @@ main {
 
 .room-meta {
   font-size: 11px;
-  color: var(--text-muted);
+  /* Was var(--text-muted) — too low contrast on the dark room cards.
+     The scene description is the densest information per card, so it
+     gets the same brightness as primary text. */
+  color: var(--text);
 }
 
 .room-feed {
@@ -1778,6 +1781,50 @@ main {
 .room-cog:hover {
   opacity: 1;
   background: var(--blue-dim);
+}
+
+/* Container so the cog + reconnect button sit together cleanly. */
+.room-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Same shape as .room-cog so they read as a paired control. */
+.room-reconnect {
+  background: transparent;
+  border: 1px solid var(--blue-dim);
+  border-radius: var(--radius);
+  color: var(--blue);
+  font-size: 14px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.75;
+  transition: background-color 0.2s, opacity 0.2s, color 0.2s;
+}
+.room-reconnect:hover:not(:disabled) {
+  opacity: 1;
+  background: var(--blue-dim);
+}
+.room-reconnect:disabled {
+  cursor: wait;
+  opacity: 0.4;
+}
+.room-reconnect.spinning {
+  animation: room-reconnect-spin 0.8s linear infinite;
+}
+.room-reconnect.failed {
+  border-color: var(--red, #e57373);
+  color: var(--red, #e57373);
+}
+@keyframes room-reconnect-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
 }
 
 /* ── Room settings modal sections ───────────────────────────────────── */

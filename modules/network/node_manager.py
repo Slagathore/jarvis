@@ -97,6 +97,23 @@ class NodeManager:
             if isinstance(fps_idle, (int, float)) and fps_idle > 0:
                 self._room_fps_idle[room_id] = int(fps_idle)
 
+        # Auxiliary nodes — ESP32 boxes physically present in rooms whose
+        # primary mic/cam comes from a non-ESP source (USB, Wyze RTSP, etc.).
+        # Without this section the NodeManager would auto-register them on
+        # first MQTT heartbeat with a WARNING; declaring them here lets us
+        # acknowledge the hardware exists without changing the room's primary
+        # driver. Each entry: {room_id: <str>, fps_idle: <int> (optional)}.
+        for node_cfg in config.get("nodes", []):
+            if not isinstance(node_cfg, dict):
+                continue
+            aux_id = node_cfg.get("room_id")
+            if not aux_id or aux_id in self._nodes:
+                continue
+            self._nodes[aux_id] = NodeInfo(room=aux_id)
+            aux_fps = node_cfg.get("fps_idle")
+            if isinstance(aux_fps, (int, float)) and aux_fps > 0:
+                self._room_fps_idle[aux_id] = int(aux_fps)
+
     @staticmethod
     def _room_has_esp32(room_cfg: dict) -> bool:
         """True if any of the room's three channels uses an esp32_* driver."""

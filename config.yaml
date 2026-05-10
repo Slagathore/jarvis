@@ -119,17 +119,17 @@ rooms:
   display_name: Bedroom
   video:
     type: wyze_rtsp
-    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.135:8554/video6_unicast
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.137:8554/1080p
     transport: tcp
   mic:
     type: wyze_rtsp_audio
-    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.135:8554/video6_unicast
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.137:8554/audio_only
     transport: tcp
     sample_rate_hz: 16000
     channels: 1
   speaker:
     type: wyze_ssh_aplay
-    host: 192.168.1.135
+    host: 192.168.1.137
     ssh_user: ${WYZE_SSH_USER}
     ssh_password: ${WYZE_SSH_PASSWORD}
     ssh_key_path: ${WYZE_SSH_KEY_PATH}
@@ -142,11 +142,11 @@ rooms:
   display_name: Kitchen
   video:
     type: wyze_rtsp
-    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.136:8554/video6_unicast
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.136:8554/1080p
     transport: tcp
   mic:
     type: wyze_rtsp_audio
-    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.136:8554/video6_unicast
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.136:8554/audio_only
     transport: tcp
     sample_rate_hz: 16000
     channels: 1
@@ -165,11 +165,11 @@ rooms:
   display_name: Living Room
   video:
     type: wyze_rtsp
-    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.134:8554/video6_unicast
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.134:8554/1080p
     transport: tcp
   mic:
     type: wyze_rtsp_audio
-    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.134:8554/video6_unicast
+    url: rtsp://${WYZE_RTSP_USER}:${WYZE_RTSP_PASSWORD}@192.168.1.134:8554/audio_only
     transport: tcp
     sample_rate_hz: 16000
     channels: 1
@@ -184,6 +184,17 @@ rooms:
     sample_rate_hz: 8000
   fps_active: 5
   fps_idle: 1
+# Auxiliary ESP32 nodes — boxes physically present in rooms whose primary
+# mic/cam is *not* an esp32_* driver. NodeManager would auto-register these
+# on first MQTT heartbeat with a warning; listing them here acknowledges the
+# hardware so the heartbeat is treated as expected. Add a node here when you
+# flash an ESP for a room (e.g. for sensors, status LEDs, future audio).
+nodes:
+- room_id: office
+  fps_idle: 30
+- room_id: living_room
+  fps_idle: 1
+
 drivers:
   wyze_rtsp_video:
     buffer_size: 1
