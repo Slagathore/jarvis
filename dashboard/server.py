@@ -1552,6 +1552,137 @@ class DashboardServer:
                 logger.warning(f"[/api/world_model/pets] {e}")
                 raise HTTPException(status_code=500, detail=str(e)) from e
 
+        @app.get("/api/world_model/recent_animal_detections")
+        async def world_model_recent_animal_detections(
+            room: str, seconds: int = 30, species: Optional[str] = None,
+        ):
+            """Recent cat/dog detections in a room — used by the live
+            tag-pet modal on camera tiles. Returns rows with bbox
+            already JSON-parsed so the frontend can draw clickable
+            overlays straight on the snapshot."""
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            if ws is None:
+                return JSONResponse({"detections": [], "available": False})
+            try:
+                seconds = max(1, min(int(seconds), 600))
+                from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                cutoff = (_dt.now(_tz.utc) - _td(seconds=seconds)).isoformat()
+                species_filter = ""
+                args: list = [room, cutoff]
+                if species in ("cat", "dog"):
+                    species_filter = "AND entity_type = ? "
+                    args.append(species)
+                else:
+                    species_filter = "AND entity_type IN ('cat','dog') "
+                rows = await ws.db.fetchall(
+                    "SELECT id, ts, entity_id, entity_name, entity_type, "
+                    "room, bbox, snapshot_path, event_type "
+                    "FROM world_entity_events "
+                    f"WHERE room = ? AND ts >= ? {species_filter} "
+                    "ORDER BY ts DESC LIMIT 60",
+                    args,
+                )
+                import json as _json
+                out: list[dict] = []
+                for r in rows:
+                    d = dict(r)
+                    raw = d.get("bbox")
+                    if isinstance(raw, str) and raw:
+                        try:
+                            d["bbox"] = _json.loads(raw)
+                        except Exception:
+                            d["bbox"] = None
+                    out.append(d)
+                return JSONResponse({
+                    "detections": out, "available": True,
+                    "room": room, "seconds": seconds,
+                })
+            except Exception as e:
+                logger.warning(
+                    f"[/api/world_model/recent_animal_detections] {e}"
+                )
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
+        @app.post("/api/world_model/tag_in_frame")
+        async def world_model_tag_in_frame(request: Request):
+            """Bulk-relabel recent cat/dog events for the given (room,
+            species) whose bbox overlaps the user's clicked bbox.
+            Body: {room, pet_name, bbox: [x1,y1,x2,y2], seconds=30}.
+            Uses IoU > 0.3 as the match criterion — generous enough to
+            survive small frame-to-frame motion but tight enough to
+            avoid relabeling unrelated detections.
+            """
+            orch = self._orchestrator
+            wq = getattr(orch, "world_query_tools", None) if orch else None
+            ws = getattr(orch, "world_store", None) if orch else None
+            if wq is None or ws is None:
+                raise HTTPException(status_code=503, detail="World model offline")
+            body = await request.json()
+            room = (body.get("room") or "").strip()
+            pet_name = (body.get("pet_name") or "").strip()
+            seconds = int(body.get("seconds") or 30)
+            click_bbox = body.get("bbox") or []
+            if not room or not pet_name or len(click_bbox) != 4:
+                raise HTTPException(
+                    status_code=400,
+                    detail="room, pet_name, and bbox=[x1,y1,x2,y2] required",
+                )
+            target = wq.world.find_entity_by_name(pet_name)
+            if target is None or target.entity_type not in ("cat", "dog"):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"no resident pet named '{pet_name}'",
+                )
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            cutoff = (_dt.now(_tz.utc) - _td(seconds=seconds)).isoformat()
+            rows = await ws.db.fetchall(
+                "SELECT id, bbox FROM world_entity_events "
+                "WHERE room = ? AND ts >= ? AND entity_type = ? "
+                "AND bbox IS NOT NULL",
+                (room, cutoff, target.entity_type),
+            )
+            import json as _json
+            cx1, cy1, cx2, cy2 = (float(c) for c in click_bbox)
+            click_w = max(0.0, cx2 - cx1)
+            click_h = max(0.0, cy2 - cy1)
+            click_area = click_w * click_h
+            relabeled: list[str] = []
+            for r in rows:
+                try:
+                    rb = _json.loads(r["bbox"])
+                    if len(rb) != 4:
+                        continue
+                    rx1, ry1, rx2, ry2 = (float(c) for c in rb)
+                except Exception:
+                    continue
+                # IoU
+                ix1, iy1 = max(rx1, cx1), max(ry1, cy1)
+                ix2, iy2 = min(rx2, cx2), min(ry2, cy2)
+                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                ra = max(0.0, rx2 - rx1) * max(0.0, ry2 - ry1)
+                union = click_area + ra - inter
+                iou = inter / union if union > 0 else 0.0
+                if iou >= 0.3:
+                    relabeled.append(r["id"])
+            for evt_id in relabeled:
+                await ws.db.execute(
+                    "UPDATE world_entity_events SET entity_id = ?, "
+                    "entity_name = ? WHERE id = ?",
+                    (target.id, target.display_name, evt_id),
+                )
+            await self.broadcast({
+                "type": "world_pet_tagged_in_frame",
+                "room": room,
+                "pet_name": target.display_name,
+                "count": len(relabeled),
+            })
+            return JSONResponse({
+                "ok": True,
+                "relabeled": len(relabeled),
+                "pet_name": target.display_name,
+            })
+
         @app.post("/api/world_model/events/{event_id}/relabel")
         async def world_model_event_relabel(
             event_id: str, request: Request,

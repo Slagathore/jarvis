@@ -385,10 +385,14 @@ function updateRooms(rooms) {
       ? `<button class="room-reconnect" data-room="${roomId}" title="Force-reconnect this camera's RTSP stream">⟳</button>`
       : "";
 
+    const tagPetBtn = hasCam
+      ? `<button class="room-tag-pet" data-room="${roomId}" title="Point at a cat or dog in this room and tell me which pet it is">🐾</button>`
+      : "";
     card.innerHTML = `
       <div class="room-card-header">
         <div class="room-name">${roomId.replace(/_/g, " ").toUpperCase()}</div>
         <div class="room-card-actions">
+          ${tagPetBtn}
           ${reconnectBtn}
           <button class="room-cog" data-room="${roomId}" title="Camera + audio settings for this room">⚙</button>
         </div>
@@ -403,6 +407,13 @@ function updateRooms(rooms) {
       cogBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         openRoomSettingsModal(roomId);
+      });
+    }
+    const tagBtn = card.querySelector(".room-tag-pet");
+    if (tagBtn) {
+      tagBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openLivePetTagModal(roomId);
       });
     }
     const reconnectBtnEl = card.querySelector(".room-reconnect");
@@ -3209,6 +3220,225 @@ function closePetTagModal() {
 }
 function _petTagKeydown(e) {
   if (e.key === "Escape") closePetTagModal();
+}
+
+// ── Live "Tag pet in frame" modal ─────────────────────────────────────────
+// Triggered by the 🐾 button on a camera tile. Fetches a fresh snapshot
+// + recent cat/dog detections in that room, draws clickable bboxes on
+// top of the snapshot. Click a box → pick pet → POST tag_in_frame so
+// the world model relabels all overlapping recent events.
+
+function closeLivePetTagModal() {
+  const m = document.getElementById("live-pet-tag-modal");
+  if (m) m.remove();
+  document.removeEventListener("keydown", _livePetKeydown);
+}
+function _livePetKeydown(e) {
+  if (e.key === "Escape") closeLivePetTagModal();
+}
+
+async function openLivePetTagModal(room) {
+  closeLivePetTagModal();
+  const pets = await _ensurePetsCacheForTagging();
+  if (pets.length === 0) {
+    alert("No resident pets configured in config.yaml.");
+    return;
+  }
+  // Fetch detections + snapshot in parallel.
+  const stamp = Date.now();
+  const snapUrl = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?lb=${stamp}`;
+  let detections = [];
+  try {
+    const res = await fetch(
+      `/api/world_model/recent_animal_detections?room=${encodeURIComponent(room)}&seconds=30`,
+    );
+    if (res.ok) {
+      const body = await res.json();
+      detections = Array.isArray(body.detections) ? body.detections : [];
+    }
+  } catch {}
+
+  // Deduplicate by entity_id (we only need the most recent bbox per pet
+  // candidate visible in the room) so the user doesn't see 50 overlapping
+  // boxes from a single cat over a few seconds.
+  const seen = new Set();
+  const unique = [];
+  for (const d of detections) {
+    const key = d.entity_id || d.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (!d.bbox || d.bbox.length !== 4) continue;
+    unique.push(d);
+    if (unique.length >= 10) break;
+  }
+
+  const overlay = document.createElement("div");
+  overlay.id = "live-pet-tag-modal";
+  overlay.className = "modal-overlay";
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) closeLivePetTagModal();
+  });
+
+  const opts = pets.map((p) =>
+    `<option value="${escapeHtml(p.name)}" data-species="${escapeHtml(p.species)}">${escapeHtml(p.name)} (${escapeHtml(p.species)})</option>`,
+  ).join("");
+
+  overlay.innerHTML = `
+    <div class="modal-card live-pet-card">
+      <div class="modal-head">
+        <span class="modal-title">Tag a pet in ${escapeHtml(room.replace(/_/g, " "))}</span>
+        <button class="modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="live-pet-hint">
+          Click a highlighted detection below, pick which pet it is,
+          then Save. Updates the last 30s of events whose bboxes
+          overlap (IoU &gt; 0.3).
+        </div>
+        <div class="live-pet-canvas-wrap">
+          <img id="live-pet-snapshot" src="${snapUrl}" alt="snapshot" />
+          <div id="live-pet-overlays"></div>
+        </div>
+        ${unique.length === 0
+          ? `<div class="who-empty">No cat/dog detections in the last 30s. The frame is shown but there's nothing to relabel — try again when a pet is visible.</div>`
+          : `<div class="live-pet-detections">
+              <div class="live-pet-section-label">Recent detections (click one):</div>
+              <div class="live-pet-det-list" id="live-pet-det-list"></div>
+            </div>`}
+        <div class="live-pet-form" id="live-pet-form" hidden>
+          <label>
+            This is actually:
+            <select class="dev-select" id="live-pet-select">${opts}</select>
+          </label>
+          <button class="dev-btn" id="live-pet-save">Save</button>
+          <button class="dev-btn live-pet-cancel" id="live-pet-cancel">Cancel</button>
+          <span class="live-pet-status" id="live-pet-status"></span>
+        </div>
+      </div>
+    </div>`;
+  overlay.querySelector(".modal-close").addEventListener("click", closeLivePetTagModal);
+  document.body.appendChild(overlay);
+  document.addEventListener("keydown", _livePetKeydown);
+
+  // Once the snapshot loads, render bbox overlays positioned in the
+  // displayed coordinate space. Bboxes from the DB are in source-pixel
+  // coords, so scale via natural-vs-rendered ratio.
+  const img = overlay.querySelector("#live-pet-snapshot");
+  const overlaysSlot = overlay.querySelector("#live-pet-overlays");
+  const detListSlot = overlay.querySelector("#live-pet-det-list");
+
+  let selectedDet = null;
+
+  function renderOverlays() {
+    overlaysSlot.innerHTML = "";
+    if (!img.naturalWidth || !img.naturalHeight) return;
+    const rect = img.getBoundingClientRect();
+    const wrapRect = overlaysSlot.parentElement.getBoundingClientRect();
+    const scale = Math.min(rect.width / img.naturalWidth, rect.height / img.naturalHeight);
+    const renderW = img.naturalWidth * scale, renderH = img.naturalHeight * scale;
+    const offsetX = (rect.width - renderW) / 2 + (rect.left - wrapRect.left);
+    const offsetY = (rect.height - renderH) / 2 + (rect.top - wrapRect.top);
+
+    unique.forEach((d, idx) => {
+      const [x1, y1, x2, y2] = d.bbox;
+      const box = document.createElement("div");
+      box.className = `live-pet-box live-pet-box-${d.entity_type}`;
+      box.dataset.idx = idx;
+      box.style.left = `${offsetX + x1 * scale}px`;
+      box.style.top = `${offsetY + y1 * scale}px`;
+      box.style.width = `${(x2 - x1) * scale}px`;
+      box.style.height = `${(y2 - y1) * scale}px`;
+      box.innerHTML = `<span class="live-pet-box-label">${escapeHtml(d.entity_name || d.entity_type)}</span>`;
+      box.addEventListener("click", () => _selectDet(idx));
+      overlaysSlot.appendChild(box);
+    });
+  }
+
+  function _selectDet(idx) {
+    selectedDet = unique[idx];
+    overlay.querySelectorAll(".live-pet-box").forEach((b) => {
+      b.classList.toggle("active", Number(b.dataset.idx) === idx);
+    });
+    overlay.querySelectorAll(".live-pet-det-row").forEach((r) => {
+      r.classList.toggle("active", Number(r.dataset.idx) === idx);
+    });
+    const form = overlay.querySelector("#live-pet-form");
+    if (form) {
+      form.hidden = false;
+      // Filter the dropdown to matching species.
+      const sel = overlay.querySelector("#live-pet-select");
+      Array.from(sel.options).forEach((o) => {
+        o.hidden = o.dataset.species !== selectedDet.entity_type;
+      });
+      const first = Array.from(sel.options).find((o) => !o.hidden);
+      if (first) sel.value = first.value;
+    }
+  }
+
+  if (img.complete && img.naturalWidth) renderOverlays();
+  else img.addEventListener("load", renderOverlays);
+  window.addEventListener("resize", renderOverlays);
+
+  // Side list of detections too, in case the bbox is too small to click.
+  if (detListSlot) {
+    detListSlot.innerHTML = unique
+      .map((d, i) => `
+        <div class="live-pet-det-row" data-idx="${i}">
+          <span class="live-pet-det-name">${escapeHtml(d.entity_name || `?_${d.entity_type}`)}</span>
+          <span class="live-pet-det-species">${escapeHtml(d.entity_type)}</span>
+          <span class="live-pet-det-ago">${formatRelativeTs(d.ts)}</span>
+        </div>`)
+      .join("");
+    detListSlot.querySelectorAll(".live-pet-det-row").forEach((row) => {
+      row.addEventListener("click", () => _selectDet(Number(row.dataset.idx)));
+    });
+  }
+
+  // Save handler.
+  const saveBtn = overlay.querySelector("#live-pet-save");
+  const cancelBtn = overlay.querySelector("#live-pet-cancel");
+  const statusEl = overlay.querySelector("#live-pet-status");
+  if (saveBtn) {
+    saveBtn.addEventListener("click", async () => {
+      if (!selectedDet) return;
+      const target = overlay.querySelector("#live-pet-select").value;
+      if (!target) return;
+      statusEl.textContent = "saving…";
+      statusEl.className = "live-pet-status";
+      try {
+        const res = await fetch("/api/world_model/tag_in_frame", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            room,
+            pet_name: target,
+            bbox: selectedDet.bbox,
+            seconds: 30,
+          }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        const body = await res.json();
+        statusEl.textContent = `relabeled ${body.relabeled} event(s) as ${body.pet_name} ✓`;
+        statusEl.classList.add("ok");
+        setTimeout(() => { closeLivePetTagModal(); loadWorldEvents(); }, 900);
+      } catch (e) {
+        statusEl.textContent = `failed: ${e.message || e}`;
+        statusEl.classList.add("err");
+      }
+    });
+  }
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", () => {
+      selectedDet = null;
+      overlay.querySelector("#live-pet-form").hidden = true;
+      overlay.querySelectorAll(".live-pet-box, .live-pet-det-row").forEach((el) => {
+        el.classList.remove("active");
+      });
+    });
+  }
 }
 
 async function openPetTagModal(ev) {

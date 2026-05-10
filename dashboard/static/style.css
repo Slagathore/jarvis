@@ -2219,6 +2219,113 @@ main {
   cursor: pointer;
   letter-spacing: 0.04em;
 }
+.room-tag-pet {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim, #888);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 0.9rem;
+  cursor: pointer;
+  line-height: 1;
+}
+.room-tag-pet:hover {
+  color: var(--accent, #6cf);
+  border-color: var(--accent, #6cf);
+}
+
+/* Live pet tag modal */
+.live-pet-card { max-width: 900px; width: 95vw; }
+.live-pet-hint {
+  font-size: 0.8rem;
+  color: var(--text-dim, #888);
+  margin-bottom: 10px;
+}
+.live-pet-canvas-wrap {
+  position: relative;
+  width: 100%;
+  background: #06080b;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.live-pet-canvas-wrap img {
+  display: block;
+  width: 100%;
+  max-height: 60vh;
+  object-fit: contain;
+}
+#live-pet-overlays {
+  position: absolute; inset: 0;
+  pointer-events: none;
+}
+.live-pet-box {
+  position: absolute;
+  border: 2px solid #ffcd5c;
+  border-radius: 2px;
+  pointer-events: auto;
+  cursor: pointer;
+  background: rgba(255,205,92,0.08);
+  transition: border-color 0.15s, background 0.15s;
+}
+.live-pet-box.live-pet-box-dog { border-color: #b88cff; background: rgba(184,140,255,0.08); }
+.live-pet-box.live-pet-box-cat { border-color: #ffcd5c; background: rgba(255,205,92,0.08); }
+.live-pet-box:hover { background: rgba(255,255,255,0.12); }
+.live-pet-box.active {
+  border-color: #5d9; border-width: 3px;
+  background: rgba(93,217,153,0.18);
+  box-shadow: 0 0 0 1px #5d9, 0 0 12px rgba(93,217,153,0.5);
+}
+.live-pet-box-label {
+  position: absolute; top: -16px; left: 0;
+  background: rgba(0,0,0,0.75); padding: 1px 5px;
+  font-size: 0.7rem; color: var(--text);
+  border-radius: 2px;
+  white-space: nowrap;
+}
+.live-pet-detections { margin-bottom: 10px; }
+.live-pet-section-label {
+  font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--text-dim, #888); margin-bottom: 4px;
+}
+.live-pet-det-list {
+  display: flex; flex-direction: column; gap: 3px;
+  max-height: 120px; overflow-y: auto;
+}
+.live-pet-det-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  padding: 4px 8px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+.live-pet-det-row:hover { background: rgba(255,255,255,0.05); }
+.live-pet-det-row.active {
+  border-color: #5d9;
+  background: rgba(93,217,153,0.1);
+}
+.live-pet-det-species { color: var(--text-dim, #888); font-family: var(--mono, monospace); }
+.live-pet-det-ago { color: var(--text-dim, #888); font-size: 0.72rem; }
+.live-pet-form {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px;
+  background: rgba(93,217,153,0.06);
+  border: 1px solid rgba(93,217,153,0.3);
+  border-radius: 4px;
+}
+.live-pet-form label {
+  display: flex; align-items: center; gap: 8px;
+  flex: 1; font-size: 0.85rem;
+}
+.live-pet-form select { flex: 1; }
+.live-pet-status { font-size: 0.8rem; color: var(--text-dim, #888); }
+.live-pet-status.ok { color: #5d9; }
+.live-pet-status.err { color: #e57; }
 .event-tag-btn:hover {
   background: rgba(108,207,255,0.15);
   color: var(--accent, #6cf);
