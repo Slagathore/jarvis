@@ -1450,14 +1450,33 @@ class DashboardServer:
             """Return the configured exits + landmarks for a room — JSON
             payload the polygon viewer overlays on the live snapshot.
 
-            Empty `polygons` block when the room has no `world_model:`
-            section. Includes `frame_width` / `frame_height` so the
-            viewer can rescale polygons to the actual rendered image
-            size in the browser.
+            Returns the LIVE topology from the running WorldModel, which
+            already merges runtime overrides (from
+            data/polygon_overrides.json) over config.yaml. So the editor
+            sees its own saved edits on reload, not the YAML stubs.
             """
             orch = self._orchestrator
             if orch is None:
                 raise HTTPException(status_code=503, detail="Orchestrator not registered")
+            wm_inst = getattr(orch, "world_model", None)
+            if wm_inst is not None and room in wm_inst.cameras:
+                cam = wm_inst.cameras[room]
+                room_cfg = None
+                for r in (getattr(orch, "config", {}) or {}).get("rooms", []):
+                    if r.get("id") == room:
+                        room_cfg = r
+                        break
+                return JSONResponse({
+                    "room": room,
+                    "display_name": (room_cfg or {}).get("display_name"),
+                    "enabled": True,
+                    "frame_width": int(cam.get("frame_width", 640)),
+                    "frame_height": int(cam.get("frame_height", 480)),
+                    "exits": list(cam.get("exits", [])),
+                    "landmarks": list(cam.get("landmarks", [])),
+                })
+            # Fall back to config.yaml read when the world model isn't
+            # initialized yet (boot timing).
             for r in (getattr(orch, "config", {}) or {}).get("rooms", []):
                 if r.get("id") != room:
                     continue
@@ -1472,6 +1491,83 @@ class DashboardServer:
                     "landmarks": list(wm.get("landmarks", [])),
                 })
             raise HTTPException(status_code=404, detail=f"No room '{room}' in config")
+
+        @app.post("/api/world_model/rooms/{room}/polygons")
+        async def world_model_polygons_save(room: str, request: Request):
+            """Persist the polygon editor's edits for one room. Body:
+              {frame_width, frame_height, exits, landmarks}
+            Writes data/polygon_overrides.json (atomically) and asks
+            the live WorldModel to reload its camera topology so the
+            edits take effect without a restart."""
+            from modules.world_model.world_model import (
+                _load_polygon_overrides, save_polygon_overrides,
+            )
+            orch = self._orchestrator
+            if orch is None:
+                raise HTTPException(status_code=503, detail="Orchestrator not registered")
+            body = await request.json()
+            fw = int(body.get("frame_width") or 0)
+            fh = int(body.get("frame_height") or 0)
+            exits_raw = body.get("exits") or []
+            landmarks_raw = body.get("landmarks") or []
+            if fw <= 0 or fh <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="frame_width and frame_height required",
+                )
+            # Light validation — each polygon should be a list of >=3
+            # [x,y] pairs. Reject malformed entries so we never persist
+            # garbage that could crash _classify_exit downstream.
+            def _validate(plist):
+                out = []
+                for p in plist:
+                    poly = p.get("polygon") if isinstance(p, dict) else None
+                    if not isinstance(poly, list) or len(poly) < 3:
+                        continue
+                    cleaned = []
+                    ok = True
+                    for pt in poly:
+                        if (isinstance(pt, (list, tuple))
+                                and len(pt) == 2
+                                and all(isinstance(c, (int, float)) for c in pt)):
+                            cleaned.append([int(pt[0]), int(pt[1])])
+                        else:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                    new_entry = dict(p)
+                    new_entry["polygon"] = cleaned
+                    out.append(new_entry)
+                return out
+            exits = _validate(exits_raw)
+            landmarks = _validate(landmarks_raw)
+            overrides = _load_polygon_overrides()
+            overrides[room] = {
+                "frame_width": fw,
+                "frame_height": fh,
+                "exits": exits,
+                "landmarks": landmarks,
+            }
+            save_polygon_overrides(overrides)
+            # Live-reload so the world model picks up the edits without
+            # a restart. Failures here are non-fatal (file is on disk).
+            wm_inst = getattr(orch, "world_model", None)
+            if wm_inst is not None:
+                try:
+                    wm_inst.reload_polygons()
+                except Exception as e:
+                    logger.warning(f"[polygons] reload failed: {e}")
+            await self.broadcast({
+                "type": "world_model_polygons_saved",
+                "room": room,
+                "exits": len(exits),
+                "landmarks": len(landmarks),
+            })
+            return JSONResponse({
+                "ok": True, "room": room,
+                "exits": len(exits), "landmarks": len(landmarks),
+            })
 
         @app.get("/polygons", response_class=HTMLResponse)
         async def polygon_viewer_page():
@@ -1551,6 +1647,62 @@ class DashboardServer:
             except Exception as e:
                 logger.warning(f"[/api/world_model/pets] {e}")
                 raise HTTPException(status_code=500, detail=str(e)) from e
+
+        @app.post("/api/world_model/yolo_now")
+        async def world_model_yolo_now(request: Request):
+            """Run YOLO on a fresh snapshot from `room`, filter to
+            cat/dog (or whatever species[] the body asks for), and
+            return bboxes for the live pet-tagging modal. Distinct
+            from /recent_animal_detections — that one reads the
+            event log; this one fires YOLO on demand, so a sitting
+            cat that hasn't moved enough to log a recent event still
+            shows up.
+
+            Body: {room: str, species: ["cat","dog"]}
+            """
+            orch = self._orchestrator
+            if orch is None:
+                raise HTTPException(status_code=503, detail="No orchestrator")
+            body = await request.json()
+            room = (body.get("room") or "").strip()
+            species = body.get("species") or ["cat", "dog"]
+            if not room:
+                raise HTTPException(status_code=400, detail="room required")
+            cm = getattr(orch, "cameras", None)
+            detector = getattr(orch, "object_detector", None)
+            if cm is None or detector is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Camera manager or YOLO not initialized",
+                )
+            frame = await cm.capture_frame_async(room)
+            if frame is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"No frame from camera '{room}'",
+                )
+            detections = await detector.detect_async(frame)
+            wanted = set(species)
+            out: list[dict] = []
+            for d in detections:
+                cls = d.get("class")
+                if cls not in wanted:
+                    continue
+                box = d.get("box") or []
+                if len(box) != 4:
+                    continue
+                out.append({
+                    "species": cls,
+                    "bbox": box,
+                    "confidence": d.get("confidence", 0.0),
+                    "label": d.get("label"),
+                })
+            return JSONResponse({
+                "detections": out,
+                "frame_width": int(frame.shape[1]),
+                "frame_height": int(frame.shape[0]),
+                "room": room,
+            })
 
         @app.get("/api/world_model/recent_animal_detections")
         async def world_model_recent_animal_detections(

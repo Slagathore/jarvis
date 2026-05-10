@@ -2,30 +2,37 @@
 <!--
 JARVIS — World Model
 ====================
-Polygon viewer (Phase 3.4). A small standalone page that overlays the
-configured `world_model:` exit + landmark polygons on top of a live
-camera frame. Lets Cole eyeball whether the placeholders in config.yaml
-line up with reality, then tune coordinates manually until they do.
+Polygon editor (Phase 3.4 — interactive). Renders the configured
+`world_model:` exit + landmark polygons on top of a live camera frame
+and lets Cole drag vertices, insert new ones, add/delete polygons, and
+save. Edits write to data/polygon_overrides.json via POST so the
+git-tracked config.yaml stays clean. The live WorldModel reloads its
+camera topology after each save so the new polygons take effect
+without a restart.
 
-Spec: new 2.md §26 Phase 3.4. The verify gate is "pull up office page,
-see `under_desk` and `door_to_hallway` polygons drawn on a recent
-frame."
+Spec: new 2.md §26 Phase 3.4.
 
-This is render-only for now — editing/dragging polygons can come
-later as a separate POST endpoint. For Cole's first pass: see what's
-configured, snap a screenshot, edit config.yaml by hand against the
-visible numbers, reload.
+Workflow:
+  - Click a polygon in the list (left) -> selects it; vertices are
+    drawn as draggable handles.
+  - Drag a handle to move that vertex.
+  - Click an edge midpoint (small + marker) to insert a new vertex.
+  - Right-click a handle to delete that vertex.
+  - "Add exit" / "Add landmark" buttons spawn a unit-square in the
+    middle of the frame ready to be reshaped.
+  - "Save" pushes the edits to the server.
 
 Routes used:
-  GET /polygons                                       — this page
-  GET /api/world_model/rooms                          — populate dropdown
-  GET /api/world_model/rooms/{room}/polygons          — fetch overlays
-  GET /api/camera/{room}/snapshot.jpg                 — background frame
+  GET  /polygons                                       — this page
+  GET  /api/world_model/rooms                          — populate dropdown
+  GET  /api/world_model/rooms/{room}/polygons          — fetch overlays
+  POST /api/world_model/rooms/{room}/polygons          — persist edits
+  GET  /api/camera/{room}/snapshot.jpg                 — background frame
 -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Jarvis — Polygon Viewer</title>
+  <title>Jarvis — Polygon Editor</title>
   <style>
     body {
       font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -37,103 +44,211 @@ Routes used:
     header {
       display: flex;
       align-items: center;
+      flex-wrap: wrap;
       gap: 12px;
       padding: 10px 16px;
       background: #161821;
       border-bottom: 1px solid #232633;
     }
     header h1 {
-      font-size: 14px;
-      margin: 0;
-      font-weight: 500;
-      letter-spacing: 0.5px;
-      color: #9ba3b4;
+      font-size: 14px; margin: 0; font-weight: 500;
+      letter-spacing: 0.5px; color: #9ba3b4;
     }
-    select, button {
-      background: #1d212b;
-      color: #d8dce3;
-      border: 1px solid #2a2f3d;
-      padding: 4px 10px;
-      font-family: inherit;
-      font-size: 13px;
-      border-radius: 3px;
+    select, button, input {
+      background: #1a1d28; color: #d8dce3;
+      border: 1px solid #2d3140;
+      border-radius: 4px;
+      padding: 5px 9px;
+      font-family: inherit; font-size: 12px;
     }
-    button { cursor: pointer; }
-    button:hover { background: #252a36; }
+    button:hover { background: #232634; cursor: pointer; }
+    button.primary {
+      background: #2a5b8d; border-color: #3a7bb8;
+    }
+    button.primary:hover { background: #3471aa; }
+    button.danger {
+      border-color: #843a3a; color: #ff9090;
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .info { color: #6a7689; font-size: 12px; }
+    .ok { color: #80e090; font-size: 12px; }
+    .err { color: #e88080; font-size: 12px; }
+
+    main {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 12px;
+      padding: 12px 16px;
+    }
+    .sidebar {
+      background: #161821;
+      border: 1px solid #232633;
+      border-radius: 6px;
+      padding: 10px;
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+    .sidebar-title {
+      font-size: 10px; letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #6a7689;
+      margin: 8px 0 4px;
+    }
+    .poly-list {
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    .poly-item {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 8px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid #232633;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .poly-item:hover { background: rgba(255,255,255,0.05); }
+    .poly-item.active {
+      border-color: #6cf;
+      background: rgba(108,207,255,0.08);
+    }
+    .poly-swatch {
+      display: inline-block; width: 10px; height: 10px;
+      border-radius: 2px; margin-right: 6px;
+      vertical-align: middle;
+    }
+    .poly-meta {
+      font-size: 10px; color: #6a7689; margin-top: 2px;
+    }
+    .poly-actions {
+      display: flex; gap: 4px;
+    }
+    .poly-actions button {
+      font-size: 10px; padding: 2px 5px;
+    }
+    .add-buttons {
+      display: flex; gap: 6px; margin: 8px 0;
+    }
+    .add-buttons button { flex: 1; }
+
+    .stage-wrap {
+      background: #161821;
+      border: 1px solid #232633;
+      border-radius: 6px;
+      padding: 8px;
+    }
     .stage {
       position: relative;
-      margin: 16px;
-      display: inline-block;
-      max-width: calc(100vw - 32px);
+      background: #06080b;
+      border-radius: 4px;
+      overflow: hidden;
+      cursor: crosshair;
     }
     .stage img {
       display: block;
-      max-width: 100%;
+      width: 100%;
       height: auto;
-      background: #000;
     }
     .stage svg {
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      pointer-events: none;
+      position: absolute; inset: 0;
+      width: 100%; height: 100%;
+    }
+    .stage svg .handle {
+      cursor: grab;
+    }
+    .stage svg .handle:active { cursor: grabbing; }
+    .stage svg .insert-marker { cursor: copy; }
+
+    .form-row {
+      display: grid;
+      grid-template-columns: 80px 1fr;
+      gap: 6px;
+      margin-top: 6px;
+      align-items: center;
+      font-size: 12px;
+    }
+    .form-row label {
+      color: #9ba3b4;
+    }
+    .form-row input,
+    .form-row select {
+      width: 100%; box-sizing: border-box;
     }
     .legend {
-      margin: 8px 16px 16px;
-      font-size: 12px;
-      color: #9ba3b4;
-      line-height: 1.6;
+      display: flex; flex-wrap: wrap; gap: 12px;
+      padding: 6px 16px;
+      font-size: 11px; color: #9ba3b4;
+      border-top: 1px solid #232633;
     }
     .legend .swatch {
-      display: inline-block;
-      width: 12px; height: 12px;
+      display: inline-block; width: 10px; height: 10px;
+      border-radius: 2px; margin-right: 4px;
       vertical-align: middle;
-      margin-right: 5px;
-      border-radius: 2px;
     }
-    .info {
-      font-size: 12px;
-      color: #6f7787;
-    }
-    .err {
-      color: #e88080;
-      font-size: 12px;
+    .help-line {
+      font-size: 10px;
+      color: #6a7689;
+      margin-top: 6px;
+      line-height: 1.5;
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>POLYGON VIEWER</h1>
+    <h1>POLYGON EDITOR</h1>
     <select id="room-select"></select>
     <button id="refresh">Refresh frame</button>
+    <button id="reload" class="">Reload from server</button>
+    <button id="save" class="primary" disabled>Save</button>
     <span id="status" class="info"></span>
   </header>
 
-  <div class="stage" id="stage">
-    <img id="frame" alt="camera snapshot">
-    <svg id="overlay" preserveAspectRatio="none"></svg>
-  </div>
+  <main>
+    <div class="sidebar">
+      <div class="sidebar-title">Exits</div>
+      <div class="poly-list" id="exits-list"></div>
+      <div class="add-buttons">
+        <button id="add-exit-room">+ to_room</button>
+        <button id="add-exit-unmonitored">+ unmonitored</button>
+        <button id="add-exit-exterior">+ exterior</button>
+      </div>
 
-  <div class="legend">
-    <span><span class="swatch" style="background:#3aa0ff"></span>to_room exit</span>
-    &nbsp;&nbsp;
-    <span><span class="swatch" style="background:#ff8a3a"></span>to_unmonitored_zone exit</span>
-    &nbsp;&nbsp;
-    <span><span class="swatch" style="background:#ff4d4d"></span>exterior_exit</span>
-    &nbsp;&nbsp;
-    <span><span class="swatch" style="background:#7dd87d"></span>landmark</span>
-  </div>
+      <div class="sidebar-title">Landmarks</div>
+      <div class="poly-list" id="landmarks-list"></div>
+      <div class="add-buttons">
+        <button id="add-landmark">+ landmark</button>
+      </div>
+
+      <div class="sidebar-title">Selected polygon</div>
+      <div id="selected-form">
+        <div class="info">Click a polygon to edit.</div>
+      </div>
+
+      <div class="help-line">
+        Drag a vertex to move it. Click a + marker on an edge to add a
+        vertex. Right-click a vertex to delete it (min 3). Save persists
+        to data/polygon_overrides.json — never touches config.yaml.
+      </div>
+    </div>
+
+    <div class="stage-wrap">
+      <div class="stage" id="stage">
+        <img id="frame" alt="camera snapshot">
+        <svg id="overlay" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="legend">
+        <span><span class="swatch" style="background:#3aa0ff"></span>to_room</span>
+        <span><span class="swatch" style="background:#ff8a3a"></span>to_unmonitored_zone</span>
+        <span><span class="swatch" style="background:#ff4d4d"></span>exterior_exit</span>
+        <span><span class="swatch" style="background:#7dd87d"></span>landmark</span>
+      </div>
+    </div>
+  </main>
 
   <script>
-    const roomSelect = document.getElementById("room-select");
-    const refreshBtn = document.getElementById("refresh");
-    const status = document.getElementById("status");
-    const frame = document.getElementById("frame");
-    const overlay = document.getElementById("overlay");
-
-    // Color per kind. Matches the legend.
+    const SVGNS = "http://www.w3.org/2000/svg";
     const KIND_COLOR = {
       "to_room":              "#3aa0ff",
       "to_unmonitored_zone":  "#ff8a3a",
@@ -141,119 +256,437 @@ Routes used:
     };
     const LANDMARK_COLOR = "#7dd87d";
 
-    async function fetchJson(url) {
-      const r = await fetch(url, { cache: "no-store" });
+    // Editor state.
+    let currentRoom = null;
+    let frameWidth = 640;
+    let frameHeight = 480;
+    let exits = [];
+    let landmarks = [];
+    let selected = null;   // {type: 'exit'|'landmark', index: int}
+    let dirty = false;
+    let knownRooms = [];
+
+    const roomSelect = document.getElementById("room-select");
+    const refreshBtn = document.getElementById("refresh");
+    const reloadBtn = document.getElementById("reload");
+    const saveBtn = document.getElementById("save");
+    const status = document.getElementById("status");
+    const frame = document.getElementById("frame");
+    const overlay = document.getElementById("overlay");
+    const stage = document.getElementById("stage");
+
+    function setStatus(msg, cls = "info") {
+      status.textContent = msg;
+      status.className = cls;
+    }
+    function setDirty(v) {
+      dirty = v;
+      saveBtn.disabled = !v;
+    }
+
+    async function fetchJson(url, opts) {
+      const r = await fetch(url, { cache: "no-store", ...opts });
       if (!r.ok) throw new Error(`${url} → ${r.status}`);
       return r.json();
     }
 
     async function loadRoomList() {
-      try {
-        const data = await fetchJson("/api/world_model/rooms");
-        const rooms = data.rooms || [];
-        roomSelect.innerHTML = "";
-        if (rooms.length === 0) {
-          const opt = document.createElement("option");
-          opt.textContent = "(no world_model: rooms configured)";
-          roomSelect.appendChild(opt);
-          status.textContent = "Add a world_model: block to a room in config.yaml.";
-          return null;
-        }
-        for (const r of rooms) {
-          const opt = document.createElement("option");
-          opt.value = r.id;
-          opt.textContent = r.display_name || r.id;
-          roomSelect.appendChild(opt);
-        }
-        return rooms[0].id;
-      } catch (e) {
-        status.textContent = "Failed to load room list: " + e.message;
-        status.className = "err";
+      const data = await fetchJson("/api/world_model/rooms");
+      knownRooms = data.rooms || [];
+      roomSelect.innerHTML = "";
+      if (knownRooms.length === 0) {
+        const opt = document.createElement("option");
+        opt.textContent = "(no world_model: rooms configured)";
+        roomSelect.appendChild(opt);
+        setStatus("Add a world_model: block to a room in config.yaml.", "err");
         return null;
       }
+      for (const r of knownRooms) {
+        const opt = document.createElement("option");
+        opt.value = r.id;
+        opt.textContent = r.display_name || r.id;
+        roomSelect.appendChild(opt);
+      }
+      return knownRooms[0].id;
     }
 
-    async function loadRoom(roomId) {
+    async function loadRoom(roomId, { keepEdits = false } = {}) {
       if (!roomId) return;
-      status.textContent = `Loading ${roomId}…`;
-      status.className = "info";
-
-      // Background frame: bypass cache via timestamp query param.
+      if (dirty && !keepEdits) {
+        if (!confirm("Discard unsaved edits?")) return;
+      }
+      currentRoom = roomId;
+      setStatus(`Loading ${roomId}…`, "info");
       frame.src = `/api/camera/${encodeURIComponent(roomId)}/snapshot.jpg?t=${Date.now()}`;
-
-      // Polygons.
-      let data;
       try {
-        data = await fetchJson(`/api/world_model/rooms/${encodeURIComponent(roomId)}/polygons`);
+        const data = await fetchJson(
+          `/api/world_model/rooms/${encodeURIComponent(roomId)}/polygons`,
+        );
+        frameWidth = data.frame_width || 640;
+        frameHeight = data.frame_height || 480;
+        exits = (data.exits || []).map(deepClone);
+        landmarks = (data.landmarks || []).map(deepClone);
+        selected = null;
+        setDirty(false);
+        overlay.setAttribute("viewBox", `0 0 ${frameWidth} ${frameHeight}`);
+        renderAll();
+        setStatus(
+          `${roomId}: ${exits.length} exits, ${landmarks.length} landmarks (${frameWidth}×${frameHeight})`,
+        );
       } catch (e) {
-        status.textContent = `No polygon data for ${roomId}: ${e.message}`;
-        status.className = "err";
-        clearOverlay();
+        setStatus(`Load failed: ${e.message}`, "err");
+      }
+    }
+
+    function deepClone(o) { return JSON.parse(JSON.stringify(o)); }
+
+    function renderAll() {
+      renderSidebar();
+      renderOverlay();
+      renderSelectedForm();
+    }
+
+    function renderSidebar() {
+      const exitsList = document.getElementById("exits-list");
+      const lmList = document.getElementById("landmarks-list");
+      exitsList.innerHTML = "";
+      lmList.innerHTML = "";
+      exits.forEach((ex, i) => {
+        exitsList.appendChild(_polyItem("exit", i, ex));
+      });
+      landmarks.forEach((lm, i) => {
+        lmList.appendChild(_polyItem("landmark", i, lm));
+      });
+    }
+
+    function _polyItem(type, i, obj) {
+      const div = document.createElement("div");
+      const isSelected = selected && selected.type === type && selected.index === i;
+      div.className = "poly-item" + (isSelected ? " active" : "");
+      const color = type === "exit"
+        ? (KIND_COLOR[obj.kind] || "#888")
+        : LANDMARK_COLOR;
+      const label = type === "exit"
+        ? `${obj.kind || "?"}: ${obj.name || obj.to || "?"}`
+        : (obj.name || "?");
+      div.innerHTML = `
+        <div>
+          <span class="poly-swatch" style="background:${color}"></span>
+          <span>${escapeHtml(label)}</span>
+          <div class="poly-meta">${(obj.polygon || []).length} vertices</div>
+        </div>
+        <div class="poly-actions">
+          <button class="danger" data-act="delete">×</button>
+        </div>`;
+      div.addEventListener("click", (e) => {
+        if (e.target.closest("button")) return;
+        selected = { type, index: i };
+        renderAll();
+      });
+      div.querySelector('[data-act="delete"]').addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (!confirm(`Delete ${label}?`)) return;
+        if (type === "exit") exits.splice(i, 1);
+        else landmarks.splice(i, 1);
+        if (selected && selected.type === type && selected.index === i) {
+          selected = null;
+        }
+        setDirty(true);
+        renderAll();
+      });
+      return div;
+    }
+
+    function renderOverlay() {
+      overlay.innerHTML = "";
+      const all = [
+        ...exits.map((ex, i) => ({ type: "exit", index: i, obj: ex })),
+        ...landmarks.map((lm, i) => ({ type: "landmark", index: i, obj: lm })),
+      ];
+      for (const it of all) {
+        const isSelected =
+          selected && selected.type === it.type && selected.index === it.index;
+        const color = it.type === "exit"
+          ? (KIND_COLOR[it.obj.kind] || "#888")
+          : LANDMARK_COLOR;
+        const points = it.obj.polygon || [];
+        if (points.length < 3) continue;
+        const poly = document.createElementNS(SVGNS, "polygon");
+        poly.setAttribute("points", points.map(p => `${p[0]},${p[1]}`).join(" "));
+        poly.setAttribute("fill", color);
+        poly.setAttribute("fill-opacity", isSelected ? "0.35" : "0.18");
+        poly.setAttribute("stroke", color);
+        poly.setAttribute("stroke-width", isSelected ? "4" : "2");
+        poly.setAttribute("vector-effect", "non-scaling-stroke");
+        poly.style.cursor = "pointer";
+        poly.addEventListener("click", () => {
+          selected = { type: it.type, index: it.index };
+          renderAll();
+        });
+        overlay.appendChild(poly);
+
+        // Label.
+        const labelText = it.type === "exit"
+          ? `${it.obj.kind || "?"}: ${it.obj.name || it.obj.to || "?"}`
+          : (it.obj.name || "?");
+        const [tx, ty] = points[0];
+        const t = document.createElementNS(SVGNS, "text");
+        t.setAttribute("x", tx + 6);
+        t.setAttribute("y", ty + 18);
+        t.setAttribute("fill", "#fff");
+        t.setAttribute("stroke", "#000");
+        t.setAttribute("stroke-width", "0.5");
+        t.setAttribute("font-size", "14");
+        t.setAttribute("vector-effect", "non-scaling-stroke");
+        t.textContent = labelText;
+        overlay.appendChild(t);
+
+        if (isSelected) {
+          _drawVertexHandles(it);
+        }
+      }
+    }
+
+    function _drawVertexHandles(it) {
+      const pts = it.obj.polygon || [];
+      // Edge midpoint "+" markers (insert here) — drawn first so vertex
+      // handles render on top.
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i];
+        const b = pts[(i + 1) % pts.length];
+        const mx = (a[0] + b[0]) / 2;
+        const my = (a[1] + b[1]) / 2;
+        const mark = document.createElementNS(SVGNS, "circle");
+        mark.setAttribute("cx", mx);
+        mark.setAttribute("cy", my);
+        mark.setAttribute("r", "6");
+        mark.setAttribute("fill", "#ffeb70");
+        mark.setAttribute("fill-opacity", "0.8");
+        mark.setAttribute("stroke", "#000");
+        mark.setAttribute("stroke-width", "1");
+        mark.setAttribute("vector-effect", "non-scaling-stroke");
+        mark.classList.add("insert-marker");
+        mark.addEventListener("click", (e) => {
+          e.stopPropagation();
+          pts.splice(i + 1, 0, [Math.round(mx), Math.round(my)]);
+          setDirty(true);
+          renderAll();
+        });
+        overlay.appendChild(mark);
+      }
+
+      // Vertex handles — draggable.
+      pts.forEach((p, idx) => {
+        const h = document.createElementNS(SVGNS, "circle");
+        h.setAttribute("cx", p[0]);
+        h.setAttribute("cy", p[1]);
+        h.setAttribute("r", "10");
+        h.setAttribute("fill", "#fff");
+        h.setAttribute("stroke", "#000");
+        h.setAttribute("stroke-width", "1.5");
+        h.setAttribute("vector-effect", "non-scaling-stroke");
+        h.classList.add("handle");
+        h.addEventListener("pointerdown", (e) => _onHandleDown(e, it, idx, h));
+        h.addEventListener("contextmenu", (e) => {
+          e.preventDefault();
+          if (pts.length <= 3) {
+            setStatus("Min 3 vertices per polygon.", "err");
+            return;
+          }
+          pts.splice(idx, 1);
+          setDirty(true);
+          renderAll();
+        });
+        overlay.appendChild(h);
+      });
+    }
+
+    function _onHandleDown(ev, it, vIdx, handleEl) {
+      ev.preventDefault();
+      handleEl.setPointerCapture(ev.pointerId);
+      const onMove = (mv) => {
+        const pt = _eventToFrameXY(mv);
+        if (!pt) return;
+        const pts = it.obj.polygon;
+        pts[vIdx] = [pt.x, pt.y];
+        handleEl.setAttribute("cx", pt.x);
+        handleEl.setAttribute("cy", pt.y);
+        // Re-stringify the polygon path on the fly.
+        const polyEls = overlay.querySelectorAll("polygon");
+        // Cheap approach: just re-render. Stage isn't busy enough for this
+        // to feel laggy.
+        renderOverlay();
+        setDirty(true);
+      };
+      const onUp = () => {
+        handleEl.removeEventListener("pointermove", onMove);
+        handleEl.removeEventListener("pointerup", onUp);
+        try { handleEl.releasePointerCapture(ev.pointerId); } catch {}
+      };
+      handleEl.addEventListener("pointermove", onMove);
+      handleEl.addEventListener("pointerup", onUp);
+    }
+
+    function _eventToFrameXY(ev) {
+      const rect = stage.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      // Stage scales to fit width; img is letterboxed inside.
+      const imgRect = frame.getBoundingClientRect();
+      const renderW = imgRect.width, renderH = imgRect.height;
+      const scaleX = frameWidth / renderW;
+      const scaleY = frameHeight / renderH;
+      return {
+        x: Math.max(0, Math.min(frameWidth, Math.round((ev.clientX - imgRect.left) * scaleX))),
+        y: Math.max(0, Math.min(frameHeight, Math.round((ev.clientY - imgRect.top) * scaleY))),
+      };
+    }
+
+    function renderSelectedForm() {
+      const el = document.getElementById("selected-form");
+      if (!selected) {
+        el.innerHTML = '<div class="info">Click a polygon to edit.</div>';
         return;
       }
-
-      const fw = data.frame_width || 640;
-      const fh = data.frame_height || 480;
-      // SVG viewBox uses the camera's pixel space so polygon coords
-      // match config.yaml directly. preserveAspectRatio="none" lets the
-      // SVG stretch with the rendered image (which scales to fit the
-      // page width).
-      overlay.setAttribute("viewBox", `0 0 ${fw} ${fh}`);
-      overlay.innerHTML = "";
-
-      const exits = data.exits || [];
-      const landmarks = data.landmarks || [];
-
-      for (const ex of exits) {
-        const color = KIND_COLOR[ex.kind] || "#888";
-        const label = ex.name || ex.to || ex.kind;
-        drawPolygon(ex.polygon || [], color, `${ex.kind}: ${label}`);
+      const obj = selected.type === "exit"
+        ? exits[selected.index]
+        : landmarks[selected.index];
+      if (!obj) {
+        el.innerHTML = '<div class="info">Selection lost.</div>';
+        return;
       }
-      for (const lm of landmarks) {
-        drawPolygon(lm.polygon || [], LANDMARK_COLOR, `landmark: ${lm.name}`);
+      let html = "";
+      if (selected.type === "exit") {
+        const kindOpts = ["to_room", "to_unmonitored_zone", "exterior_exit"]
+          .map(k => `<option value="${k}"${obj.kind === k ? " selected" : ""}>${k}</option>`)
+          .join("");
+        html += `
+          <div class="form-row">
+            <label>kind</label>
+            <select data-key="kind">${kindOpts}</select>
+          </div>`;
+        if (obj.kind === "to_room" || obj.kind === "to_unmonitored_zone") {
+          const roomOpts = knownRooms.map(r =>
+            `<option value="${r.id}"${obj.to === r.id ? " selected" : ""}>${r.id}</option>`
+          ).join("");
+          html += `
+          <div class="form-row">
+            <label>to</label>
+            <select data-key="to">
+              <option value="">— pick —</option>
+              ${roomOpts}
+              <option value="__custom__">— custom —</option>
+            </select>
+          </div>`;
+          if (obj.to && !knownRooms.find(r => r.id === obj.to)) {
+            html += `
+          <div class="form-row">
+            <label>to (custom)</label>
+            <input type="text" data-key="to" value="${escapeHtml(obj.to)}" />
+          </div>`;
+          }
+        } else if (obj.kind === "exterior_exit") {
+          html += `
+          <div class="form-row">
+            <label>name</label>
+            <input type="text" data-key="name" value="${escapeHtml(obj.name || '')}" placeholder="front_door / back_door" />
+          </div>`;
+        }
+      } else {
+        html += `
+          <div class="form-row">
+            <label>name</label>
+            <input type="text" data-key="name" value="${escapeHtml(obj.name || '')}" />
+          </div>`;
       }
-
-      status.textContent =
-        `${roomId}: ${exits.length} exits, ${landmarks.length} landmarks (${fw}×${fh})`;
-      status.className = "info";
+      el.innerHTML = html;
+      el.querySelectorAll("[data-key]").forEach(inp => {
+        inp.addEventListener("change", () => {
+          const k = inp.dataset.key;
+          const v = inp.value;
+          obj[k] = v;
+          setDirty(true);
+          renderAll();
+        });
+      });
     }
 
-    function drawPolygon(points, color, label) {
-      if (!Array.isArray(points) || points.length < 3) return;
-      const svgns = "http://www.w3.org/2000/svg";
-      const poly = document.createElementNS(svgns, "polygon");
-      poly.setAttribute(
-        "points",
-        points.map(p => `${p[0]},${p[1]}`).join(" ")
-      );
-      poly.setAttribute("fill", color);
-      poly.setAttribute("fill-opacity", "0.22");
-      poly.setAttribute("stroke", color);
-      poly.setAttribute("stroke-width", "3");
-      poly.setAttribute("vector-effect", "non-scaling-stroke");
-      overlay.appendChild(poly);
-
-      // Label at the polygon's first point. Use a darker shadow rect
-      // so the text is readable over light frame regions.
-      const [tx, ty] = points[0];
-      const text = document.createElementNS(svgns, "text");
-      text.setAttribute("x", tx + 6);
-      text.setAttribute("y", ty + 18);
-      text.setAttribute("fill", "#fff");
-      text.setAttribute("stroke", "#000");
-      text.setAttribute("stroke-width", "0.5");
-      text.setAttribute("font-size", "16");
-      text.setAttribute("font-family", "ui-monospace, Menlo, Consolas, monospace");
-      text.textContent = label;
-      overlay.appendChild(text);
+    function _addPolygon(type, defaults) {
+      const cx = Math.round(frameWidth / 2);
+      const cy = Math.round(frameHeight / 2);
+      const w = Math.round(frameWidth * 0.15);
+      const h = Math.round(frameHeight * 0.15);
+      const poly = [
+        [cx - w, cy - h], [cx + w, cy - h],
+        [cx + w, cy + h], [cx - w, cy + h],
+      ];
+      const obj = { ...defaults, polygon: poly };
+      if (type === "exit") {
+        exits.push(obj);
+        selected = { type, index: exits.length - 1 };
+      } else {
+        landmarks.push(obj);
+        selected = { type, index: landmarks.length - 1 };
+      }
+      setDirty(true);
+      renderAll();
     }
 
-    function clearOverlay() {
-      overlay.innerHTML = "";
-    }
+    document.getElementById("add-exit-room").addEventListener("click", () =>
+      _addPolygon("exit", { kind: "to_room", to: "" }));
+    document.getElementById("add-exit-unmonitored").addEventListener("click", () =>
+      _addPolygon("exit", { kind: "to_unmonitored_zone", to: "" }));
+    document.getElementById("add-exit-exterior").addEventListener("click", () =>
+      _addPolygon("exit", { kind: "exterior_exit", name: "new_door" }));
+    document.getElementById("add-landmark").addEventListener("click", () =>
+      _addPolygon("landmark", { name: "new_landmark" }));
 
     roomSelect.addEventListener("change", () => loadRoom(roomSelect.value));
-    refreshBtn.addEventListener("click", () => loadRoom(roomSelect.value));
+    refreshBtn.addEventListener("click", () => {
+      frame.src = `/api/camera/${encodeURIComponent(currentRoom)}/snapshot.jpg?t=${Date.now()}`;
+    });
+    reloadBtn.addEventListener("click", () => loadRoom(currentRoom));
+    saveBtn.addEventListener("click", async () => {
+      if (!currentRoom) return;
+      saveBtn.disabled = true;
+      setStatus("Saving…", "info");
+      try {
+        const body = {
+          frame_width: frameWidth,
+          frame_height: frameHeight,
+          exits,
+          landmarks,
+        };
+        const r = await fetch(
+          `/api/world_model/rooms/${encodeURIComponent(currentRoom)}/polygons`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          },
+        );
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${r.status}`);
+        }
+        const result = await r.json();
+        setDirty(false);
+        setStatus(
+          `Saved: ${result.exits} exits, ${result.landmarks} landmarks.`,
+          "ok",
+        );
+      } catch (e) {
+        setStatus(`Save failed: ${e.message}`, "err");
+      } finally {
+        saveBtn.disabled = !dirty;
+      }
+    });
+
+    function escapeHtml(s) {
+      return String(s || "").replace(/[&<>"]/g, c => (
+        { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]
+      ));
+    }
 
     (async () => {
       const initial = await loadRoomList();

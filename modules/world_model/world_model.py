@@ -60,6 +60,47 @@ def _as_utc(ts: datetime) -> datetime:
 _VIS_HISTORY_MAX = 40
 
 
+# Runtime polygon overrides written by the dashboard polygon editor.
+# Lives next to data/jarvis.db so the editor doesn't need to touch
+# config.yaml (which is git-tracked and has REPLACE_ME placeholder
+# comments we don't want to clobber). Map shape:
+#   { camera_id: {frame_width, frame_height, exits, landmarks} }
+import json as _wm_json
+from pathlib import Path as _wm_Path
+
+_POLYGON_OVERRIDES_PATH = _wm_Path("data/polygon_overrides.json")
+
+
+def _load_polygon_overrides() -> dict:
+    """Return the polygon overrides dict, or {} if the file doesn't
+    exist or is malformed. Never raises — overrides are best-effort
+    and the config.yaml values are always a safe fallback."""
+    p = _POLYGON_OVERRIDES_PATH
+    if not p.exists():
+        return {}
+    try:
+        with p.open("r", encoding="utf-8") as fh:
+            data = _wm_json.load(fh)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception as e:
+        logger.warning(f"[WorldModel] polygon overrides load failed: {e}")
+        return {}
+
+
+def save_polygon_overrides(overrides: dict) -> None:
+    """Atomically write polygon overrides to disk. Caller owns
+    validation — we just persist what's given. The dashboard endpoint
+    should validate shape before calling this."""
+    p = _POLYGON_OVERRIDES_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        _wm_json.dump(overrides, fh, indent=2)
+    tmp.replace(p)
+
+
 def _record_visibility(ent: WorldEntity, ts: datetime, seen: bool) -> None:
     """Append a (ts_iso, seen) pair to the entity's rolling visibility
     history. Used by the smoothing logic in _handle_unmatched_entity so
@@ -189,24 +230,56 @@ class WorldModel:
     @staticmethod
     def _build_camera_topology(rooms_config: list[dict]) -> dict:
         """
-        Build a per-camera topology dict from the rooms[] config.
+        Build a per-camera topology dict from the rooms[] config, then
+        overlay any runtime polygon edits from data/polygon_overrides.json
+        (written by the dashboard polygon editor). Overrides win; missing
+        keys fall back to config.yaml.
+
         Camera ID derives from room ID — one camera per room in the
         current config. Multi-cam-per-room is a future expansion.
         """
+        # Load runtime overrides up-front so per-room merging can read
+        # them without re-loading the file on every iteration.
+        overrides = _load_polygon_overrides()
+
         topology: dict[str, dict] = {}
         for room in rooms_config:
             wm = room.get("world_model")
             if not wm or not wm.get("enabled", True):
                 continue
             cam_id = room["id"]
+            override = overrides.get(cam_id) or {}
             topology[cam_id] = {
                 "room": room["id"],
-                "frame_width": wm.get("frame_width", 640),
-                "frame_height": wm.get("frame_height", 480),
-                "exits": wm.get("exits", []),
-                "landmarks": wm.get("landmarks", []),
+                "frame_width": override.get(
+                    "frame_width", wm.get("frame_width", 640)
+                ),
+                "frame_height": override.get(
+                    "frame_height", wm.get("frame_height", 480)
+                ),
+                "exits": override.get("exits", wm.get("exits", [])),
+                "landmarks": override.get(
+                    "landmarks", wm.get("landmarks", [])
+                ),
             }
         return topology
+
+    def reload_polygons(self) -> None:
+        """Re-read polygon overrides from disk and rebuild camera
+        topology. Called by the dashboard editor after a save so the
+        live world model picks up the new polygons without restart."""
+        rooms_config = [
+            {"id": cam_id, "world_model": {"enabled": True, **cam}}
+            for cam_id, cam in self.cameras.items()
+        ]
+        # Fresh build replaces the existing cameras dict in place so
+        # in-flight references to self.cameras get the new values.
+        new_topo = self._build_camera_topology(rooms_config)
+        self.cameras = new_topo
+        logger.info(
+            f"[WorldModel] polygons reloaded for "
+            f"{len(self.cameras)} cameras"
+        )
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 

@@ -3244,32 +3244,70 @@ async function openLivePetTagModal(room) {
     alert("No resident pets configured in config.yaml.");
     return;
   }
-  // Fetch detections + snapshot in parallel.
+  // Two parallel sources: live YOLO (what's in the frame RIGHT NOW —
+  // useful even if the pet hasn't moved enough to log a recent event)
+  // AND the recent event log (so we get the attributed entity name
+  // for boxes that match historical events).
   const stamp = Date.now();
   const snapUrl = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?lb=${stamp}`;
-  let detections = [];
-  try {
-    const res = await fetch(
-      `/api/world_model/recent_animal_detections?room=${encodeURIComponent(room)}&seconds=30`,
-    );
-    if (res.ok) {
-      const body = await res.json();
-      detections = Array.isArray(body.detections) ? body.detections : [];
-    }
-  } catch {}
+  let [liveBody, recentBody] = await Promise.all([
+    fetch("/api/world_model/yolo_now", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room, species: ["cat", "dog"] }),
+    }).then(r => r.ok ? r.json() : { detections: [] }).catch(() => ({ detections: [] })),
+    fetch(`/api/world_model/recent_animal_detections?room=${encodeURIComponent(room)}&seconds=30`)
+      .then(r => r.ok ? r.json() : { detections: [] }).catch(() => ({ detections: [] })),
+  ]);
+  const liveDets = Array.isArray(liveBody.detections) ? liveBody.detections : [];
+  const recentDets = Array.isArray(recentBody.detections) ? recentBody.detections : [];
 
-  // Deduplicate by entity_id (we only need the most recent bbox per pet
-  // candidate visible in the room) so the user doesn't see 50 overlapping
-  // boxes from a single cat over a few seconds.
-  const seen = new Set();
+  // Merge: live detections first (they're the actual current frame),
+  // each enriched with the closest matching recent event's
+  // entity_name (so the bbox label shows what the system currently
+  // thinks it is). Fall back to recent events for cats sitting still.
+  function _iou(a, b) {
+    const [a1, b1, a2, b2] = a;
+    const [c1, d1, c2, d2] = b;
+    const ix1 = Math.max(a1, c1), iy1 = Math.max(b1, d1);
+    const ix2 = Math.min(a2, c2), iy2 = Math.min(b2, d2);
+    const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+    const aa = (a2 - a1) * (b2 - b1);
+    const bb = (c2 - c1) * (d2 - d1);
+    const u = aa + bb - inter;
+    return u > 0 ? inter / u : 0;
+  }
   const unique = [];
-  for (const d of detections) {
-    const key = d.entity_id || d.id;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    if (!d.bbox || d.bbox.length !== 4) continue;
-    unique.push(d);
-    if (unique.length >= 10) break;
+  for (const live of liveDets) {
+    let bestMatch = null;
+    let bestIou = 0;
+    for (const r of recentDets) {
+      if (!r.bbox || r.bbox.length !== 4) continue;
+      if (r.entity_type !== live.species) continue;
+      const i = _iou(live.bbox, r.bbox);
+      if (i > bestIou) { bestIou = i; bestMatch = r; }
+    }
+    unique.push({
+      bbox: live.bbox,
+      entity_type: live.species,
+      entity_name: (bestIou > 0.3 && bestMatch)
+        ? bestMatch.entity_name
+        : `(new ${live.species})`,
+      entity_id: bestMatch ? bestMatch.entity_id : null,
+      ts: bestMatch ? bestMatch.ts : new Date().toISOString(),
+      confidence: live.confidence,
+      source: "yolo_live",
+    });
+  }
+  // Drop in any recent events whose bbox doesn't have a corresponding
+  // live detection — covers cats that moved enough to log but are
+  // briefly out of frame on the snapshot we just fetched.
+  for (const r of recentDets) {
+    if (!r.bbox || r.bbox.length !== 4) continue;
+    const overlaps = unique.some(u => _iou(u.bbox, r.bbox) > 0.3);
+    if (overlaps) continue;
+    unique.push({ ...r, source: "event_log" });
+    if (unique.length >= 12) break;
   }
 
   const overlay = document.createElement("div");
@@ -3291,8 +3329,10 @@ async function openLivePetTagModal(room) {
       </div>
       <div class="modal-body">
         <div class="live-pet-hint">
-          Click a highlighted detection below, pick which pet it is,
-          then Save. Updates the last 30s of events whose bboxes
+          Yellow / purple boxes = pets JARVIS sees in the frame
+          <i>right now</i> (YOLO live). Box label shows what the system
+          currently thinks they are. Click a box, pick the correct
+          pet, Save. Updates the last 30s of events whose bboxes
           overlap (IoU &gt; 0.3).
         </div>
         <div class="live-pet-canvas-wrap">

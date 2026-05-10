@@ -74,3 +74,4 @@ Thumbs.db
 
 .claude/
 data/jarvis.pid
+data/polygon_overrides.json
