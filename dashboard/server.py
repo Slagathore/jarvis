@@ -867,6 +867,49 @@ class DashboardServer:
             )
             return JSONResponse({"ok": ok})
 
+        @app.post("/api/identity/pending/collapse")
+        async def identity_pending_collapse(request: Request):
+            """Maintenance: collapse near-duplicate unresolved pending
+            rows into single cluster representatives. Body:
+              {modality: "face"|"voice", min_sim: float=0.35}
+            Returns {kept, rejected, scanned}."""
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            modality = str(body.get("modality", "face")).strip() or "face"
+            try:
+                min_sim = float(body.get("min_sim", 0.35))
+            except (TypeError, ValueError):
+                min_sim = 0.35
+            result = await ident.collapse_pending_duplicates(
+                modality=modality, min_sim=min_sim,
+            )
+            await self.broadcast({
+                "type": "identity_pending_collapsed",
+                **result,
+            })
+            return JSONResponse(result)
+
+        @app.post("/api/identity/pending/reject_all")
+        async def identity_pending_reject_all():
+            """Maintenance: nuke every unresolved pending row. Returns
+            {rejected: int}. Use when the queue has gotten out of hand
+            and you'd rather start clean than triage."""
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            n = await ident.reject_all_unresolved_pending()
+            await self.broadcast({
+                "type": "identity_pending_bulk_resolved",
+                "count": 0, "action": "reject_all",
+                "rejected": n,
+            })
+            return JSONResponse({"rejected": n})
+
         @app.post("/api/identity/pending/bulk")
         async def identity_resolve_pending_bulk(request: Request):
             """Bulk resolve. Body:

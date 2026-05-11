@@ -4236,6 +4236,58 @@ function _updateReviewsCount() {
 
   assignBtn.addEventListener("click", () => doBulk("assign"));
   rejectBtn.addEventListener("click", () => doBulk("reject"));
+
+  const collapseBtn = document.getElementById("reviews-collapse");
+  const rejectAllBtn = document.getElementById("reviews-reject-all");
+  if (collapseBtn) {
+    collapseBtn.addEventListener("click", async () => {
+      collapseBtn.disabled = true;
+      setStatus("Collapsing duplicates…");
+      try {
+        const res = await fetch("/api/identity/pending/collapse", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ modality: "face", min_sim: 0.35 }),
+        });
+        const body = await res.json();
+        setStatus(
+          `Collapsed: kept ${body.kept} representatives, rejected ${body.rejected} duplicates (scanned ${body.scanned}).`,
+          "ok",
+        );
+        await loadReviewsTab();
+        refreshReviewsBadge();
+      } catch (e) {
+        setStatus(`Collapse failed: ${e.message || e}`, "err");
+      } finally {
+        collapseBtn.disabled = false;
+      }
+    });
+  }
+  if (rejectAllBtn) {
+    rejectAllBtn.addEventListener("click", async () => {
+      if (!confirm(
+        "Reject EVERY unresolved pending row?\n\n" +
+        "This is the nuclear option for runaway queues. " +
+        "It doesn't enroll anyone — just clears the backlog.\n\n" +
+        "Continue?",
+      )) return;
+      rejectAllBtn.disabled = true;
+      setStatus("Rejecting all…");
+      try {
+        const res = await fetch("/api/identity/pending/reject_all", {
+          method: "POST",
+        });
+        const body = await res.json();
+        setStatus(`Rejected ${body.rejected} unresolved rows.`, "ok");
+        await loadReviewsTab();
+        refreshReviewsBadge();
+      } catch (e) {
+        setStatus(`Reject all failed: ${e.message || e}`, "err");
+      } finally {
+        rejectAllBtn.disabled = false;
+      }
+    });
+  }
 })();
 
 // ── Perf tab ──────────────────────────────────────────────────────────────

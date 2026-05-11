@@ -2061,6 +2061,13 @@ main {
 .reviews-status { font-size: 0.85rem; color: var(--text-dim, #888); }
 .reviews-status.ok { color: #5d9; }
 .reviews-status.err { color: #e57; }
+.reviews-nuke {
+  border-color: rgba(255, 80, 110, 0.5) !important;
+  color: #e57 !important;
+}
+.reviews-nuke:hover {
+  background: rgba(255, 80, 110, 0.15) !important;
+}
 .reviews-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));

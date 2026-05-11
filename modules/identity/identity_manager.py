@@ -95,9 +95,24 @@ VOICE_SAMPLES_DIVERSITY_THRESHOLD = 0.92
 # existing pending-cluster centroid is at least this, fold into that cluster
 # rather than starting a new one.
 PENDING_MERGE_THRESHOLD = {
+    # The cosine threshold for folding a new pending sample into an
+    # existing pending cluster (i.e. "this is the same unknown person
+    # we've been collecting"). Started at 0.55 for face but that was too
+    # strict — the kind of low-quality face that hits the pending queue
+    # in the first place rarely re-clears 0.55 against a centroid built
+    # from other low-quality embeddings of the same person. Result: every
+    # new capture spawned a fresh cluster and the queue grew unbounded
+    # (Cole hit 2355 unresolved rows). 0.35 is loose enough that borderline
+    # same-person captures collapse, strict enough that genuinely different
+    # people stay in different clusters.
     "voice": 0.65,
-    "face":  0.55,
+    "face":  0.35,
 }
+
+# Hard cap on unresolved pending rows. Past this, _write_pending drops
+# the oldest unresolved row before inserting the new one so the queue
+# stays finite even if the merge fails to consolidate them all.
+MAX_UNRESOLVED_PENDING = 200
 
 
 @dataclass
@@ -1117,6 +1132,34 @@ class IdentityManager:
         cluster_id: Optional[int],
         face_bbox: Optional[tuple] = None,
     ) -> int:
+        # Enforce a hard cap on unresolved pending rows. Past the limit
+        # we drop the oldest unresolved rows before writing the new one.
+        # Prevents the queue from growing unbounded when face captures
+        # keep landing just below the merge threshold (Cole's 2355-row
+        # incident). Auto-rejects with resolved=2 so the cap doesn't
+        # silently lose evidence of what was happening.
+        try:
+            row = await self._db.fetchone(
+                "SELECT COUNT(*) AS n FROM identity_pending WHERE resolved = 0"
+            )
+            current = int(row["n"]) if row else 0
+            if current >= MAX_UNRESOLVED_PENDING:
+                drop = max(1, current - MAX_UNRESOLVED_PENDING + 1)
+                await self._db.execute(
+                    "UPDATE identity_pending SET resolved = 2 "
+                    "WHERE id IN ("
+                    "  SELECT id FROM identity_pending "
+                    "  WHERE resolved = 0 ORDER BY captured_at ASC LIMIT ?"
+                    ")",
+                    (drop,),
+                )
+                logger.info(
+                    f"[Identity] pending cap hit ({current}/"
+                    f"{MAX_UNRESOLVED_PENDING}); auto-rejected {drop} "
+                    "oldest unresolved row(s)"
+                )
+        except Exception as e:
+            logger.debug(f"[Identity] pending cap enforcement failed: {e}")
         bbox_json = json.dumps(list(face_bbox)) if face_bbox else None
         pending_id = await self._db.execute(
             "INSERT INTO identity_pending "
@@ -1571,6 +1614,93 @@ class IdentityManager:
                 )
                 out["failed"] += 1
         return out
+
+    async def reject_all_unresolved_pending(self) -> int:
+        """Mark every unresolved pending row as resolved=2 (rejected).
+        Nuclear option to clear a runaway pending queue. Returns the
+        count of rows affected."""
+        row = await self._db.fetchone(
+            "SELECT COUNT(*) AS n FROM identity_pending WHERE resolved = 0"
+        )
+        n = int(row["n"]) if row else 0
+        if n == 0:
+            return 0
+        await self._db.execute(
+            "UPDATE identity_pending SET resolved = 2 WHERE resolved = 0"
+        )
+        logger.info(f"[Identity] auto-rejected {n} unresolved pending rows")
+        return n
+
+    async def collapse_pending_duplicates(
+        self, modality: str = "face", min_sim: float = 0.35,
+    ) -> dict:
+        """Sweep unresolved pending rows of the given modality and
+        collapse similar ones into single cluster representatives.
+        Keeps the row with the highest similarity score against the
+        live centroid bank as the cluster rep; marks the rest
+        resolved=2. Returns {kept, rejected}. Cheap O(N^2) — fine for
+        N in the low thousands."""
+        kind = f"pending_cluster_{modality}"
+        rows = await self._db.fetchall(
+            "SELECT id, embedding, similarity, captured_at, image_jpeg IS NOT NULL AS has_image "
+            "FROM identity_pending "
+            "WHERE kind = ? AND resolved = 0 "
+            "ORDER BY captured_at ASC",
+            (kind,),
+        )
+        if not rows:
+            return {"kept": 0, "rejected": 0, "scanned": 0}
+        expected = (
+            ACTIVE_FACE_EMBEDDING_DIM if modality == "face" else 256
+        )
+        items: list[tuple[int, np.ndarray, float, int]] = []
+        for r in rows:
+            try:
+                emb = np.frombuffer(r["embedding"], dtype=np.float32)
+                if emb.size != expected:
+                    continue
+                items.append((
+                    int(r["id"]),
+                    emb,
+                    float(r["similarity"] or 0.0),
+                    int(r["has_image"]),
+                ))
+            except Exception:
+                continue
+        # Greedy clustering: walk newest-best-first; each item either
+        # joins an existing cluster (cosine >= min_sim to rep) or
+        # spawns a new one with itself as rep.
+        # Sort by has_image DESC then similarity DESC so the
+        # highest-quality preview is kept as the rep.
+        items.sort(key=lambda t: (-t[3], -t[2]))
+        reps: list[tuple[int, np.ndarray]] = []
+        kill: list[int] = []
+        for pid, emb, _sim, _has_img in items:
+            joined = False
+            for rep_id, rep_emb in reps:
+                if _cosine(emb, rep_emb) >= min_sim:
+                    kill.append(pid)
+                    joined = True
+                    break
+            if not joined:
+                reps.append((pid, emb))
+        if kill:
+            placeholders = ",".join("?" for _ in kill)
+            await self._db.execute(
+                f"UPDATE identity_pending SET resolved = 2 "
+                f"WHERE id IN ({placeholders})",
+                tuple(kill),
+            )
+        logger.info(
+            f"[Identity] collapsed pending {modality}: "
+            f"kept {len(reps)} reps, rejected {len(kill)} dupes "
+            f"out of {len(items)} scanned"
+        )
+        return {
+            "kept": len(reps),
+            "rejected": len(kill),
+            "scanned": len(items),
+        }
 
     async def delete_person(self, person_id: int) -> bool:
         """Delete a person and (via FK ON DELETE CASCADE) all their samples."""
