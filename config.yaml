@@ -100,8 +100,8 @@ rooms:
     device_name: default
     sample_rate_hz: 22050
     channels: 1
-  fps_active: 30
-  fps_idle: 30
+  fps_active: 10
+  fps_idle: 5
   # World Model geometry. Polygon coordinates below are PLACEHOLDERS — the
   # actual desk / under_desk / door regions need to be drawn against a real
   # frame from this camera (Phase 3.4 dashboard polygon viewer). Bbox
@@ -332,7 +332,7 @@ rooms:
 # flash an ESP for a room (e.g. for sensors, status LEDs, future audio).
 nodes:
 - room_id: office
-  fps_idle: 30
+  fps_idle: 5
 - room_id: living_room
   fps_idle: 1
 

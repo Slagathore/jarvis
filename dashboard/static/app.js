@@ -4257,15 +4257,18 @@ function renderPerf(state) {
   const grid = document.getElementById("perf-grid");
   if (!grid) return;
   const uptimeEl = document.getElementById("perf-uptime");
+  const uptimeS = Math.max(1, state.uptime_s || 1);
   if (uptimeEl) {
-    const s = Math.round(state.uptime_s || 0);
+    const s = Math.round(uptimeS);
     const m = Math.floor(s / 60);
     const sec = s % 60;
     uptimeEl.textContent = `uptime: ${m}m ${sec}s`;
   }
   const timings = state.timings || {};
+  const counters = state.counters || {};
   const entries = Object.entries(timings);
-  if (entries.length === 0) {
+  const counterEntries = Object.entries(counters);
+  if (entries.length === 0 && counterEntries.length === 0) {
     grid.innerHTML = '<div class="who-empty">No timing samples yet. Wait a few seconds for the hot paths to fire.</div>';
     return;
   }
@@ -4280,7 +4283,7 @@ function renderPerf(state) {
     if (ms < 60) return "perf-orange";
     return "perf-red";
   };
-  grid.innerHTML = entries.map(([name, t]) => `
+  const timingHtml = entries.map(([name, t]) => `
     <div class="perf-card">
       <div class="perf-name">${escapeHtml(name)}</div>
       <div class="perf-row">
@@ -4309,6 +4312,18 @@ function renderPerf(state) {
       </div>
     </div>
   `).join("");
+  // Counters render as a row of per-sec rates. Skip when empty.
+  const counterHtml = counterEntries.length
+    ? `<div class="perf-card perf-counters">
+        <div class="perf-name">counters (per/sec total)</div>
+        ${counterEntries.map(([n, v]) => `
+          <div class="perf-row">
+            <span class="perf-label">${escapeHtml(n)}</span>
+            <span class="perf-val">${(v / uptimeS).toFixed(1)}/s · ${v}</span>
+          </div>`).join("")}
+      </div>`
+    : "";
+  grid.innerHTML = timingHtml + counterHtml;
 }
 
 function startPerfRefresh() {

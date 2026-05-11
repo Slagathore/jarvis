@@ -196,8 +196,16 @@ class FaceRecognizer:
         """
         if not self._loaded:
             return None
-        result = await asyncio.to_thread(self._embed_largest_face_full, frame)
-        return None if result is None else result["embedding"]
+        from modules.context.perf_tracker import perf
+        import time as _t
+        t0 = _t.perf_counter()
+        try:
+            result = await asyncio.to_thread(
+                self._embed_largest_face_full, frame
+            )
+            return None if result is None else result["embedding"]
+        finally:
+            perf().record_ms("face.embed_frame", (_t.perf_counter() - t0) * 1000.0)
 
     async def embed_largest_face_full(
         self, frame: np.ndarray
@@ -209,7 +217,13 @@ class FaceRecognizer:
         """
         if not self._loaded:
             return None
-        return await asyncio.to_thread(self._embed_largest_face_full, frame)
+        from modules.context.perf_tracker import perf
+        import time as _t
+        t0 = _t.perf_counter()
+        try:
+            return await asyncio.to_thread(self._embed_largest_face_full, frame)
+        finally:
+            perf().record_ms("face.embed_largest", (_t.perf_counter() - t0) * 1000.0)
 
     async def detect_and_embed(self, frame: np.ndarray) -> list[dict]:
         """Return ALL detected faces (not just the largest). Same dict

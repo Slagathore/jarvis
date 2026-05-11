@@ -767,9 +767,12 @@ class Orchestrator:
         to the dashboard. Wake_word emits {room, db}; wake adapters emit
         the richer {room, db, peak_db, sample_rate}. Forward whatever's
         present so the bar widgets see both fields when available."""
+        from modules.context.perf_tracker import perf
+        room = event.get("room", "office")
+        perf().increment(f"audio_level.{room}")
         payload = {
             "type": "audio_level",
-            "room": event.get("room", "office"),
+            "room": room,
             "db": event.get("db", -100.0),
         }
         if "peak_db" in event:

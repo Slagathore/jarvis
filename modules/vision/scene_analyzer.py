@@ -110,7 +110,9 @@ class SceneAnalyzer:
         prompt = self._build_prompt(room, objects, persons=persons, person_states=person_states)
 
         try:
-            description = await self._llm.vision_query(frame, prompt)
+            from modules.context.perf_tracker import perf
+            with perf().timeit(f"scene_llm.{room}"):
+                description = await self._llm.vision_query(frame, prompt)
             if description:
                 stripped = description.strip()
                 self._descriptions[room] = stripped
