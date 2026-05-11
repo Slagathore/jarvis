@@ -74,12 +74,12 @@ class ObjectDetector:
 
     def __init__(self, config: dict) -> None:
         vision_cfg = config.get("vision", {})
-        # YOLOv8m default: nano was missing partially-occluded animals
-        # in dim Wyze frames (cat on patterned tablecloth, dog under
-        # sheets). Medium is ~8x slower than nano (~12ms on a 4070 Ti);
-        # still well within budget at 5fps. Conf threshold lowered to
-        # 0.20 to catch low-confidence pet detections.
-        self._model_name: str = vision_cfg.get("yolo_model", "yolov8m.pt")
+        # YOLOv8s default. Started at nano, jumped to medium for recall,
+        # the Perf tab showed medium was ~66ms/call and GPU-bound across
+        # 4 cameras. Small is ~15ms — comfortable at 6+ frames/sec total
+        # without queueing. Recall on partially-occluded pets is still
+        # much better than nano (Cole's original complaint).
+        self._model_name: str = vision_cfg.get("yolo_model", "yolov8s.pt")
         self._conf_threshold: float = float(vision_cfg.get("yolo_confidence", 0.20))
         self._model: Optional[Any] = None
 

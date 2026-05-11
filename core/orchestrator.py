@@ -3402,71 +3402,25 @@ class Orchestrator:
                                 ps_entry["posture"] = str(posture_result)
                             if ps_entry:
                                 scene_person_states = [ps_entry]
-                        last_desc = await self.scene_analyzer.describe_async(
-                            frame, room=room_id, objects=detections,
-                            persons=scene_persons,
-                            person_states=scene_person_states,
+                        # Scene description + baseline + anomaly + mess all
+                        # do LLM calls that can run 3-6 seconds each. Fire
+                        # them as a background task so the room loop doesn't
+                        # block on them. The current broadcast uses the
+                        # cached description from the prior iteration —
+                        # one frame's lag on the scene narration is invisible
+                        # to a human and totally worth the unblocked pipeline.
+                        prior_state = self._scene_state.get(room_id) or {}
+                        last_desc = prior_state.get("description")
+                        asyncio.create_task(
+                            self._run_scene_pipeline_bg(
+                                room_id=room_id,
+                                frame=frame,
+                                detections=detections,
+                                scene_persons=scene_persons,
+                                scene_person_states=scene_person_states,
+                            ),
+                            name=f"scene_bg:{room_id}",
                         )
-
-                        # BUG FIX: update_if_due() doesn't exist on RoomBaselines.
-                        # Actual API: needs_update(room) → bool, then update(room, desc).
-                        if self.room_baselines and last_desc:
-                            if await self.room_baselines.needs_update(room_id):
-                                await self.room_baselines.update(room_id, last_desc)
-
-                            # Anomaly scoring — only if we have a baseline + cooldown allows.
-                            # Compares current scene to baseline via LLM, fires room_anomaly
-                            # event when score exceeds threshold.
-                            if (
-                                self.anomaly_detector is not None
-                                and self.anomaly_detector.should_check(room_id)
-                            ):
-                                baseline = await self.room_baselines.get(room_id)
-                                if baseline and baseline != last_desc:
-                                    result = await self.anomaly_detector.score(
-                                        room_id, baseline, last_desc
-                                    )
-                                    if result is not None:
-                                        score, reason = result
-                                        logger.debug(
-                                            f"[Anomaly] '{room_id}' score={score:.1f} reason={reason!r}"
-                                        )
-                                        if score >= self.anomaly_detector.threshold:
-                                            await self._broadcast({
-                                                "type":   "room_anomaly",
-                                                "room":   room_id,
-                                                "score":  score,
-                                                "reason": reason,
-                                            })
-                                            logger.info(
-                                                f"[Anomaly] '{room_id}' {score:.1f}/10: {reason}"
-                                            )
-
-                            # Mess scoring — independent absolute tidiness check
-                            # against the current scene description (no baseline
-                            # comparison). Heavier cooldown so we don't burn LLM
-                            # calls on a steady-state room.
-                            if (
-                                self.mess_detector is not None
-                                and self.mess_detector.should_check(room_id)
-                                and last_desc
-                            ):
-                                mess_result = await self.mess_detector.score(room_id, last_desc)
-                                if mess_result is not None:
-                                    mess_score, mess_reason = mess_result
-                                    logger.debug(
-                                        f"[Mess] '{room_id}' tidiness={mess_score:.1f} reason={mess_reason!r}"
-                                    )
-                                    if mess_score >= self.mess_detector.threshold:
-                                        await self._broadcast({
-                                            "type":   "room_messy",
-                                            "room":   room_id,
-                                            "score":  mess_score,
-                                            "reason": mess_reason,
-                                        })
-                                        logger.info(
-                                            f"[Mess] '{room_id}' {mess_score:.1f}/10: {mess_reason}"
-                                        )
 
                         # Broadcast vision state — use lights_on bool directly
                         await self._broadcast({
@@ -4761,6 +4715,102 @@ class Orchestrator:
         import time as _time
         self._active_user_room = room
         self._active_user_room_ts = _time.monotonic()
+
+    async def _run_scene_pipeline_bg(
+        self,
+        room_id: str,
+        frame,
+        detections: list,
+        scene_persons,
+        scene_person_states,
+    ) -> None:
+        """Run the heavy LLM portion of the per-room scene pipeline as
+        a background task. Updates _scene_state[room_id]['description']
+        and broadcasts the room_anomaly / room_messy events when fired.
+        Failures are logged and swallowed — the room loop never sees
+        them. Cole asked for this after Perf showed scene_llm at 3-6
+        seconds per call, blocking the room loop."""
+        if not self.scene_analyzer:
+            return
+        try:
+            last_desc = await self.scene_analyzer.describe_async(
+                frame, room=room_id, objects=detections,
+                persons=scene_persons,
+                person_states=scene_person_states,
+            )
+        except Exception as e:
+            logger.debug(
+                f"[SceneBg] '{room_id}' describe_async failed: {e}"
+            )
+            return
+        # Update cache + push a follow-up vision broadcast so the
+        # dashboard description field is refreshed once the LLM call
+        # completes (even though the room loop already broadcast the
+        # cached version).
+        if last_desc:
+            cur = self._scene_state.get(room_id) or {}
+            cur["description"] = last_desc
+            cur["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._scene_state[room_id] = cur
+            await self._broadcast({
+                "type": "vision",
+                "room": room_id,
+                "description": last_desc,
+            })
+        # Baseline + anomaly + mess (each may hit the LLM again).
+        if self.room_baselines and last_desc:
+            try:
+                if await self.room_baselines.needs_update(room_id):
+                    await self.room_baselines.update(room_id, last_desc)
+            except Exception as e:
+                logger.debug(f"[SceneBg] '{room_id}' baseline failed: {e}")
+            if (self.anomaly_detector is not None
+                    and self.anomaly_detector.should_check(room_id)):
+                try:
+                    baseline = await self.room_baselines.get(room_id)
+                    if baseline and baseline != last_desc:
+                        result = await self.anomaly_detector.score(
+                            room_id, baseline, last_desc
+                        )
+                        if result is not None:
+                            score, reason = result
+                            logger.debug(
+                                f"[Anomaly] '{room_id}' score={score:.1f} reason={reason!r}"
+                            )
+                            if score >= self.anomaly_detector.threshold:
+                                await self._broadcast({
+                                    "type":   "room_anomaly",
+                                    "room":   room_id,
+                                    "score":  score,
+                                    "reason": reason,
+                                })
+                                logger.info(
+                                    f"[Anomaly] '{room_id}' {score:.1f}/10: {reason}"
+                                )
+                except Exception as e:
+                    logger.debug(f"[SceneBg] '{room_id}' anomaly failed: {e}")
+            if (self.mess_detector is not None
+                    and self.mess_detector.should_check(room_id)
+                    and last_desc):
+                try:
+                    mess_result = await self.mess_detector.score(room_id, last_desc)
+                    if mess_result is not None:
+                        mess_score, mess_reason = mess_result
+                        logger.debug(
+                            f"[Mess] '{room_id}' tidiness={mess_score:.1f} reason={mess_reason!r}"
+                        )
+                        if mess_score >= self.mess_detector.threshold:
+                            await self._broadcast({
+                                "type":   "room_messy",
+                                "room":   room_id,
+                                "score":  mess_score,
+                                "reason": mess_reason,
+                            })
+                            logger.info(
+                                f"[Mess] '{room_id}' {mess_score:.1f}/10: {mess_reason}"
+                            )
+                except Exception as e:
+                    logger.debug(f"[SceneBg] '{room_id}' mess failed: {e}")
 
     async def _broadcast(self, event: dict) -> None:
         """Send event to dashboard if enabled. Never blocks or raises."""
