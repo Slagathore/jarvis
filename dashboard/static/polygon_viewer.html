@@ -170,8 +170,10 @@ Routes used:
     }
     .stage svg .handle {
       cursor: grab;
+      transition: fill 0.1s;
     }
-    .stage svg .handle:active { cursor: grabbing; }
+    .stage svg .handle:active,
+    .stage svg .handle.dragging { cursor: grabbing; fill: #ffeb70; }
     .stage svg .insert-marker { cursor: copy; }
 
     .form-row {
@@ -444,6 +446,8 @@ Routes used:
         poly.setAttribute("stroke", color);
         poly.setAttribute("stroke-width", isSelected ? "4" : "2");
         poly.setAttribute("vector-effect", "non-scaling-stroke");
+        poly.setAttribute("data-poly-type", it.type);
+        poly.setAttribute("data-poly-index", String(it.index));
         poly.style.cursor = "pointer";
         poly.addEventListener("click", () => {
           selected = { type: it.type, index: it.index };
@@ -501,12 +505,13 @@ Routes used:
         overlay.appendChild(mark);
       }
 
-      // Vertex handles — draggable.
+      // Vertex handles — draggable. Bigger hit target (r=14 vs the old
+      // 10) so the cursor doesn't slip off during a real drag.
       pts.forEach((p, idx) => {
         const h = document.createElementNS(SVGNS, "circle");
         h.setAttribute("cx", p[0]);
         h.setAttribute("cy", p[1]);
-        h.setAttribute("r", "10");
+        h.setAttribute("r", "14");
         h.setAttribute("fill", "#fff");
         h.setAttribute("stroke", "#000");
         h.setAttribute("stroke-width", "1.5");
@@ -529,28 +534,42 @@ Routes used:
 
     function _onHandleDown(ev, it, vIdx, handleEl) {
       ev.preventDefault();
-      handleEl.setPointerCapture(ev.pointerId);
+      ev.stopPropagation();
+      // Listen on the document, not the handle — the cursor will leave
+      // the 10px circle constantly during a real drag, and pointer
+      // capture on the handle gets clobbered the moment we re-render.
+      // Update only the moving vertex's data + the polygon's points
+      // attribute in-place; defer the full re-render to pointerup so
+      // the insert-+ markers reposition once.
+      const pts = it.obj.polygon;
+      const polyEl = overlay.querySelector(
+        `polygon[data-poly-type="${it.type}"][data-poly-index="${it.index}"]`
+      );
+      handleEl.classList.add("dragging");
       const onMove = (mv) => {
         const pt = _eventToFrameXY(mv);
         if (!pt) return;
-        const pts = it.obj.polygon;
         pts[vIdx] = [pt.x, pt.y];
         handleEl.setAttribute("cx", pt.x);
         handleEl.setAttribute("cy", pt.y);
-        // Re-stringify the polygon path on the fly.
-        const polyEls = overlay.querySelectorAll("polygon");
-        // Cheap approach: just re-render. Stage isn't busy enough for this
-        // to feel laggy.
-        renderOverlay();
-        setDirty(true);
+        if (polyEl) {
+          polyEl.setAttribute(
+            "points",
+            pts.map(p => `${p[0]},${p[1]}`).join(" "),
+          );
+        }
       };
       const onUp = () => {
-        handleEl.removeEventListener("pointermove", onMove);
-        handleEl.removeEventListener("pointerup", onUp);
-        try { handleEl.releasePointerCapture(ev.pointerId); } catch {}
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+        document.removeEventListener("pointercancel", onUp);
+        handleEl.classList.remove("dragging");
+        setDirty(true);
+        renderAll();
       };
-      handleEl.addEventListener("pointermove", onMove);
-      handleEl.addEventListener("pointerup", onUp);
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp);
+      document.addEventListener("pointercancel", onUp);
     }
 
     function _eventToFrameXY(ev) {
