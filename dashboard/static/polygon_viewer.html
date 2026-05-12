@@ -132,6 +132,19 @@ Routes used:
       display: flex; gap: 6px; margin: 8px 0;
     }
     .add-buttons button { flex: 1; }
+    .add-buttons-stack {
+      flex-direction: column; align-items: stretch;
+    }
+    .add-buttons-stack button {
+      text-align: left;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .add-buttons button .swatch {
+      display: inline-block;
+      width: 10px; height: 10px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
 
     .stage-wrap {
       background: #161821;
@@ -207,18 +220,30 @@ Routes used:
 
   <main>
     <div class="sidebar">
-      <div class="sidebar-title">Exits</div>
+      <div class="sidebar-title">Exits (doors / pass-throughs)</div>
       <div class="poly-list" id="exits-list"></div>
-      <div class="add-buttons">
-        <button id="add-exit-room">+ to_room</button>
-        <button id="add-exit-unmonitored">+ unmonitored</button>
-        <button id="add-exit-exterior">+ exterior</button>
+      <div class="add-buttons add-buttons-stack">
+        <button id="add-exit-room" title="A doorway / arch / hallway leading to another room that has a camera. Pick which room from the dropdown after.">
+          <span class="swatch" style="background:#3aa0ff"></span>
+          + Door to another room
+        </button>
+        <button id="add-exit-unmonitored" title="Door to a part of the house that has NO camera (spare bedroom, bathroom, etc). Cole goes through and the system tracks him as 'in unmonitored zone' instead of 'departed'.">
+          <span class="swatch" style="background:#ff8a3a"></span>
+          + Door to a no-camera room
+        </button>
+        <button id="add-exit-exterior" title="Front door, back door, garage — any door that leaves the house. Crossing this triggers DEPARTED state and the cat-escape alarm if a cat crosses.">
+          <span class="swatch" style="background:#ff4d4d"></span>
+          + Door to outside
+        </button>
       </div>
 
-      <div class="sidebar-title">Landmarks</div>
+      <div class="sidebar-title">Landmarks (named regions in frame)</div>
       <div class="poly-list" id="landmarks-list"></div>
       <div class="add-buttons">
-        <button id="add-landmark">+ landmark</button>
+        <button id="add-landmark" title="Named region within the room — bed, couch, food_dish, litterbox, leash_hook, etc. Dwelling on a landmark for landmark_dwell_frames triggers an INTERACTED_WITH event.">
+          <span class="swatch" style="background:#7dd87d"></span>
+          + Landmark
+        </button>
       </div>
 
       <div class="sidebar-title">Selected polygon</div>
@@ -227,9 +252,10 @@ Routes used:
       </div>
 
       <div class="help-line">
-        Drag a vertex to move it. Click a + marker on an edge to add a
-        vertex. Right-click a vertex to delete it (min 3). Save persists
-        to data/polygon_overrides.json — never touches config.yaml.
+        Drag a vertex handle to move it. Click a yellow + marker on
+        an edge to add a vertex. Right-click a vertex to delete it
+        (min 3 per polygon). Save persists to
+        data/polygon_overrides.json (never touches config.yaml).
       </div>
     </div>
 
@@ -557,12 +583,18 @@ Routes used:
       }
       let html = "";
       if (selected.type === "exit") {
-        const kindOpts = ["to_room", "to_unmonitored_zone", "exterior_exit"]
-          .map(k => `<option value="${k}"${obj.kind === k ? " selected" : ""}>${k}</option>`)
+        const kindLabels = {
+          to_room: "to another room (camera)",
+          to_unmonitored_zone: "to room with no camera",
+          exterior_exit: "to outside (front/back/garage door)",
+        };
+        const kindOpts = Object.entries(kindLabels)
+          .map(([k, label]) =>
+            `<option value="${k}"${obj.kind === k ? " selected" : ""}>${label}</option>`)
           .join("");
         html += `
           <div class="form-row">
-            <label>kind</label>
+            <label>exit kind</label>
             <select data-key="kind">${kindOpts}</select>
           </div>`;
         if (obj.kind === "to_room" || obj.kind === "to_unmonitored_zone") {

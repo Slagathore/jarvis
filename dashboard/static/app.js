@@ -3405,12 +3405,39 @@ async function openLivePetTagModal(room) {
     const form = overlay.querySelector("#live-pet-form");
     if (form) {
       form.hidden = false;
-      // Filter the dropdown to matching species.
+      // Group the dropdown by species but DO NOT hide the wrong-species
+      // entries — YOLO sometimes misclassifies a cat as a dog (or
+      // vice versa) and the user must be able to override. Sort so the
+      // detected species comes first, then a separator, then the other.
       const sel = overlay.querySelector("#live-pet-select");
-      Array.from(sel.options).forEach((o) => {
-        o.hidden = o.dataset.species !== selectedDet.entity_type;
+      const detected = selectedDet.entity_type;
+      const opts = Array.from(sel.options);
+      // Restore visibility in case a prior selection had hidden some.
+      opts.forEach((o) => { o.hidden = false; });
+      // Stable sort: detected species first, alphabetical inside each group.
+      opts.sort((a, b) => {
+        const sa = a.dataset.species, sb = b.dataset.species;
+        if (sa === detected && sb !== detected) return -1;
+        if (sb === detected && sa !== detected) return 1;
+        return a.text.localeCompare(b.text);
       });
-      const first = Array.from(sel.options).find((o) => !o.hidden);
+      // Re-insert in sorted order; insert a disabled visual separator
+      // between species groups so it's obvious which pets match the
+      // detected species and which require an override.
+      sel.innerHTML = "";
+      let prevSpecies = null;
+      opts.forEach((o) => {
+        if (prevSpecies !== null && o.dataset.species !== prevSpecies) {
+          const sep = document.createElement("option");
+          sep.disabled = true;
+          sep.textContent = `── (override: ${o.dataset.species}) ──`;
+          sel.appendChild(sep);
+        }
+        sel.appendChild(o);
+        prevSpecies = o.dataset.species;
+      });
+      // Default to the first matching-species option.
+      const first = opts.find((o) => o.dataset.species === detected) || opts[0];
       if (first) sel.value = first.value;
     }
   }

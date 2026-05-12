@@ -1831,11 +1831,17 @@ class DashboardServer:
                 )
             from datetime import datetime as _dt, timezone as _tz, timedelta as _td
             cutoff = (_dt.now(_tz.utc) - _td(seconds=seconds)).isoformat()
+            # Query BOTH cat and dog rows — the user may be correcting a
+            # cross-species misattribution (e.g. clicking the cat on the
+            # table that the cost function tagged as Dalila the dog).
+            # The frontend now lets the user pick any pet regardless of
+            # the detected species, so the backend must follow suit.
             rows = await ws.db.fetchall(
-                "SELECT id, bbox FROM world_entity_events "
-                "WHERE room = ? AND ts >= ? AND entity_type = ? "
+                "SELECT id, bbox, entity_type FROM world_entity_events "
+                "WHERE room = ? AND ts >= ? "
+                "AND entity_type IN ('cat', 'dog') "
                 "AND bbox IS NOT NULL",
-                (room, cutoff, target.entity_type),
+                (room, cutoff),
             )
             import json as _json
             cx1, cy1, cx2, cy2 = (float(c) for c in click_bbox)
@@ -1843,6 +1849,7 @@ class DashboardServer:
             click_h = max(0.0, cy2 - cy1)
             click_area = click_w * click_h
             relabeled: list[str] = []
+            cross_species = 0
             for r in rows:
                 try:
                     rb = _json.loads(r["bbox"])
@@ -1860,11 +1867,24 @@ class DashboardServer:
                 iou = inter / union if union > 0 else 0.0
                 if iou >= 0.3:
                     relabeled.append(r["id"])
+                    if r["entity_type"] != target.entity_type:
+                        cross_species += 1
             for evt_id in relabeled:
+                # Also update entity_type so cross-species corrections
+                # (Dalila/dog -> Spooky/cat) flip the row's species.
+                # Otherwise downstream filters like list_pets / care
+                # summaries would still see the old class.
                 await ws.db.execute(
                     "UPDATE world_entity_events SET entity_id = ?, "
-                    "entity_name = ? WHERE id = ?",
-                    (target.id, target.display_name, evt_id),
+                    "entity_name = ?, entity_type = ? WHERE id = ?",
+                    (target.id, target.display_name,
+                     target.entity_type, evt_id),
+                )
+            if cross_species:
+                logger.info(
+                    f"[Tag] {cross_species} cross-species correction(s) "
+                    f"to '{target.display_name}' ({target.entity_type}) "
+                    f"in '{room}' — YOLO or cost-function misclassification"
                 )
             await self.broadcast({
                 "type": "world_pet_tagged_in_frame",
