@@ -150,3 +150,82 @@ class NotificationManager:
             except Exception:
                 pass
         return True
+
+    async def dismiss_for_target(
+        self, target_type: str, target_id: int,
+    ) -> int:
+        """Auto-dismiss every notification whose (target_type, target_id)
+        points at this resource. Called by the resolve paths (pending
+        review assign/reject, etc.) so a user who actions the underlying
+        thing doesn't then have to click the bell to clear the matching
+        alerts. Returns the number of rows deleted."""
+        try:
+            rows = await self._db.fetchall(
+                "SELECT id FROM notifications "
+                "WHERE target_type = ? AND target_id = ?",
+                (target_type, int(target_id)),
+            )
+            if not rows:
+                return 0
+            ids = [int(r["id"]) for r in rows]
+            placeholders = ",".join("?" for _ in ids)
+            await self._db.execute(
+                f"DELETE FROM notifications WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
+        except Exception as e:
+            logger.debug(f"[Notifications] dismiss_for_target failed: {e}")
+            return 0
+        if self._broadcast is not None:
+            try:
+                await self._broadcast({
+                    "type": "notification.deleted",
+                    "id": None,
+                    "ids": ids,
+                    "target_type": target_type,
+                    "target_id": int(target_id),
+                })
+            except Exception:
+                pass
+        return len(ids)
+
+    async def dismiss_for_targets(
+        self, target_type: str, target_ids: list,
+    ) -> int:
+        """Bulk variant of dismiss_for_target — one DELETE for an entire
+        batch of resolved rows (avoid N round-trips when bulk-assigning
+        50 pending reviews at once)."""
+        if not target_ids:
+            return 0
+        try:
+            ids_int = [int(t) for t in target_ids if t is not None]
+            if not ids_int:
+                return 0
+            placeholders = ",".join("?" for _ in ids_int)
+            rows = await self._db.fetchall(
+                f"SELECT id FROM notifications "
+                f"WHERE target_type = ? AND target_id IN ({placeholders})",
+                (target_type, *ids_int),
+            )
+            if not rows:
+                return 0
+            del_ids = [int(r["id"]) for r in rows]
+            del_placeholders = ",".join("?" for _ in del_ids)
+            await self._db.execute(
+                f"DELETE FROM notifications WHERE id IN ({del_placeholders})",
+                tuple(del_ids),
+            )
+        except Exception as e:
+            logger.debug(f"[Notifications] dismiss_for_targets failed: {e}")
+            return 0
+        if self._broadcast is not None:
+            try:
+                await self._broadcast({
+                    "type": "notification.deleted",
+                    "id": None,
+                    "ids": del_ids,
+                    "target_type": target_type,
+                })
+            except Exception:
+                pass
+        return len(del_ids)

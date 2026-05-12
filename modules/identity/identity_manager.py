@@ -1644,10 +1644,37 @@ class IdentityManager:
         emb = np.frombuffer(row["embedding"], dtype=np.float32).copy()
         modality = "voice" if "voice" in kind else "face"
 
+        # Auto-dismiss any "pending review" notifications pointing at
+        # this id. Resolving the underlying review means the user has
+        # already taken action — leaving a stale alert in the bell is
+        # noise.
+        async def _dismiss_notifs(pid: int) -> None:
+            n = self._notifier
+            if n is None:
+                return
+            try:
+                # When the resolution involves a cluster, every row in
+                # that cluster also gets resolved — sweep their alerts
+                # too so 8 cluster siblings don't leave 8 stale rows.
+                cid = row["cluster_id"] if "cluster_id" in row.keys() else None
+                if cid is not None:
+                    sibling_rows = await self._db.fetchall(
+                        "SELECT id FROM identity_pending WHERE cluster_id = ?",
+                        (cid,),
+                    )
+                    sibling_ids = [int(r["id"]) for r in sibling_rows]
+                    if sibling_ids:
+                        await n.dismiss_for_targets("pending", sibling_ids)
+                        return
+            except Exception:
+                pass
+            await n.dismiss_for_target("pending", pid)
+
         if action == "reject":
             await self._db.execute(
                 "UPDATE identity_pending SET resolved = 2 WHERE id = ?", (pending_id,)
             )
+            await _dismiss_notifs(pending_id)
             return True
 
         # Image bytes (if any) attached to this pending row — preserved on
@@ -1657,6 +1684,10 @@ class IdentityManager:
             row_image = row["image_jpeg"]
         except (IndexError, KeyError):
             row_image = None
+
+        # All non-reject branches converge on resolved=1 below; the
+        # _dismiss_notifs helper is also called below to sweep alerts
+        # tied to this pending id and any cluster siblings.
 
         if action == "confirm":
             # Drift confirm: row already has person_id
@@ -1674,6 +1705,7 @@ class IdentityManager:
             await self._db.execute(
                 "UPDATE identity_pending SET resolved = 1 WHERE id = ?", (pending_id,)
             )
+            await _dismiss_notifs(pending_id)
             return True
 
         if action == "assign":
@@ -1748,6 +1780,7 @@ class IdentityManager:
                     "UPDATE identity_pending SET resolved = 1 WHERE id = ?",
                     (pending_id,),
                 )
+            await _dismiss_notifs(pending_id)
             return True
 
         return False
@@ -1796,15 +1829,24 @@ class IdentityManager:
         """Mark every unresolved pending row as resolved=2 (rejected).
         Nuclear option to clear a runaway pending queue. Returns the
         count of rows affected."""
-        row = await self._db.fetchone(
-            "SELECT COUNT(*) AS n FROM identity_pending WHERE resolved = 0"
+        # Snapshot the affected ids BEFORE the UPDATE so we can sweep
+        # their notifications too (the notifications table doesn't
+        # have a CASCADE — they'd otherwise stay in the bell).
+        rows = await self._db.fetchall(
+            "SELECT id FROM identity_pending WHERE resolved = 0"
         )
-        n = int(row["n"]) if row else 0
+        n = len(rows)
         if n == 0:
             return 0
+        affected_ids = [int(r["id"]) for r in rows]
         await self._db.execute(
             "UPDATE identity_pending SET resolved = 2 WHERE resolved = 0"
         )
+        if self._notifier is not None:
+            try:
+                await self._notifier.dismiss_for_targets("pending", affected_ids)
+            except Exception as e:
+                logger.debug(f"[Identity] reject_all notif dismiss failed: {e}")
         logger.info(f"[Identity] auto-rejected {n} unresolved pending rows")
         return n
 
@@ -1868,6 +1910,16 @@ class IdentityManager:
                 f"WHERE id IN ({placeholders})",
                 tuple(kill),
             )
+            # Auto-dismiss the corresponding notifications too —
+            # collapsing duplicates fires the same UX intent as a
+            # bulk-reject (the user no longer has these to triage).
+            if self._notifier is not None:
+                try:
+                    await self._notifier.dismiss_for_targets("pending", kill)
+                except Exception as e:
+                    logger.debug(
+                        f"[Identity] collapse notif dismiss failed: {e}"
+                    )
         logger.info(
             f"[Identity] collapsed pending {modality}: "
             f"kept {len(reps)} reps, rejected {len(kill)} dupes "
