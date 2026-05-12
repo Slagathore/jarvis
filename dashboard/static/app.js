@@ -3244,22 +3244,33 @@ async function openLivePetTagModal(room) {
     alert("No resident pets configured in config.yaml.");
     return;
   }
-  // Two parallel sources: live YOLO (what's in the frame RIGHT NOW —
-  // useful even if the pet hasn't moved enough to log a recent event)
-  // AND the recent event log (so we get the attributed entity name
-  // for boxes that match historical events).
+  // YOLO runs on EVERY open. Three parallel queries:
+  //   (1) live YOLO for cat/dog (what's in the frame right now —
+  //       useful even if the pet hasn't moved enough to log a recent
+  //       event)
+  //   (2) live YOLO for person (display-only, so Cole can sanity-check
+  //       "is that thing a person or one of the cats?" without leaving
+  //       the modal)
+  //   (3) recent event log (gives us the system's current attributed
+  //       entity_name for boxes that match historical events).
   const stamp = Date.now();
   const snapUrl = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?lb=${stamp}`;
-  let [liveBody, recentBody] = await Promise.all([
+  let [liveBody, peopleBody, recentBody] = await Promise.all([
     fetch("/api/world_model/yolo_now", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ room, species: ["cat", "dog"] }),
     }).then(r => r.ok ? r.json() : { detections: [] }).catch(() => ({ detections: [] })),
+    fetch("/api/world_model/yolo_now", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room, species: ["person"] }),
+    }).then(r => r.ok ? r.json() : { detections: [] }).catch(() => ({ detections: [] })),
     fetch(`/api/world_model/recent_animal_detections?room=${encodeURIComponent(room)}&seconds=30`)
       .then(r => r.ok ? r.json() : { detections: [] }).catch(() => ({ detections: [] })),
   ]);
   const liveDets = Array.isArray(liveBody.detections) ? liveBody.detections : [];
+  const personDets = Array.isArray(peopleBody.detections) ? peopleBody.detections : [];
   const recentDets = Array.isArray(recentBody.detections) ? recentBody.detections : [];
 
   // Merge: live detections first (they're the actual current frame),
@@ -3309,6 +3320,22 @@ async function openLivePetTagModal(room) {
     unique.push({ ...r, source: "event_log" });
     if (unique.length >= 12) break;
   }
+  // Append person detections as display-only "flag" boxes. They
+  // render in a distinct color (see CSS .live-pet-box-person) so
+  // Cole can see who's where while tagging pets — no assign action
+  // attaches to them, identity flow lives in the Pending Reviews tab.
+  for (const p of personDets) {
+    if (!p.bbox || p.bbox.length !== 4) continue;
+    unique.push({
+      bbox: p.bbox,
+      entity_type: "person",
+      entity_name: "(person)",
+      entity_id: null,
+      ts: new Date().toISOString(),
+      confidence: p.confidence,
+      source: "yolo_live_person",
+    });
+  }
 
   const overlay = document.createElement("div");
   overlay.id = "live-pet-tag-modal";
@@ -3351,6 +3378,14 @@ async function openLivePetTagModal(room) {
             <select class="dev-select" id="live-pet-select">${opts}</select>
           </label>
           <button class="dev-btn" id="live-pet-save">Save</button>
+          <button class="dev-btn live-pet-not-pet" id="live-pet-not-pet"
+                  title="Not a pet at all — delete these bogus detections + mark this region as a false-positive zone for 6h.">
+            Not a pet
+          </button>
+          <button class="dev-btn live-pet-recheck" id="live-pet-recheck"
+                  title="Rerun YOLO on just this region at a lower confidence threshold. Catches small/partial pets the full-frame pass missed.">
+            Recheck region
+          </button>
           <button class="dev-btn live-pet-cancel" id="live-pet-cancel">Cancel</button>
           <span class="live-pet-status" id="live-pet-status"></span>
         </div>
@@ -3461,15 +3496,53 @@ async function openLivePetTagModal(room) {
     });
   }
 
+  // Mark a detection as resolved (visually) and reset the form so
+  // the user can pick the next box without re-opening the modal —
+  // there are usually 2-3 animals in frame and re-opening loses the
+  // YOLO call's context.
+  function _markResolved(idx, statusText) {
+    if (idx == null) return;
+    const boxEl = overlay.querySelector(`.live-pet-box[data-idx="${idx}"]`);
+    const rowEl = overlay.querySelector(`.live-pet-det-row[data-idx="${idx}"]`);
+    if (boxEl) {
+      boxEl.classList.remove("active");
+      boxEl.classList.add("resolved");
+      const lbl = boxEl.querySelector(".live-pet-box-label");
+      if (lbl && statusText) lbl.textContent = statusText;
+    }
+    if (rowEl) {
+      rowEl.classList.remove("active");
+      rowEl.classList.add("resolved");
+    }
+    selectedDet = null;
+    overlay.querySelector("#live-pet-form").hidden = true;
+  }
+
+  function _selectedIdx() {
+    if (!selectedDet) return null;
+    const i = unique.indexOf(selectedDet);
+    return i >= 0 ? i : null;
+  }
+
   // Save handler.
   const saveBtn = overlay.querySelector("#live-pet-save");
   const cancelBtn = overlay.querySelector("#live-pet-cancel");
+  const notPetBtn = overlay.querySelector("#live-pet-not-pet");
+  const recheckBtn = overlay.querySelector("#live-pet-recheck");
   const statusEl = overlay.querySelector("#live-pet-status");
   if (saveBtn) {
     saveBtn.addEventListener("click", async () => {
       if (!selectedDet) return;
+      // Person boxes are display-only — there's no animal to tag
+      // here. The Pending Reviews tab handles identity assignment.
+      if (selectedDet.entity_type === "person") {
+        statusEl.textContent = "person boxes are display-only — use the Pending Reviews tab to assign identity.";
+        statusEl.className = "live-pet-status err";
+        return;
+      }
       const target = overlay.querySelector("#live-pet-select").value;
       if (!target) return;
+      const idx = _selectedIdx();
       statusEl.textContent = "saving…";
       statusEl.className = "live-pet-status";
       try {
@@ -3488,11 +3561,107 @@ async function openLivePetTagModal(room) {
           throw new Error(err.detail || `HTTP ${res.status}`);
         }
         const body = await res.json();
-        statusEl.textContent = `relabeled ${body.relabeled} event(s) as ${body.pet_name} ✓`;
+        statusEl.textContent = `relabeled ${body.relabeled} event(s) as ${body.pet_name} ✓ — pick the next box.`;
         statusEl.classList.add("ok");
-        setTimeout(() => { closeLivePetTagModal(); loadWorldEvents(); }, 900);
+        _markResolved(idx, body.pet_name);
+        loadWorldEvents();
       } catch (e) {
         statusEl.textContent = `failed: ${e.message || e}`;
+        statusEl.classList.add("err");
+      }
+    });
+  }
+  if (notPetBtn) {
+    notPetBtn.addEventListener("click", async () => {
+      if (!selectedDet) return;
+      const idx = _selectedIdx();
+      statusEl.textContent = "marking false-positive…";
+      statusEl.className = "live-pet-status";
+      try {
+        const res = await fetch("/api/world_model/not_an_animal", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            room,
+            bbox: selectedDet.bbox,
+            seconds: 30,
+          }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        const body = await res.json();
+        statusEl.textContent = `cleared ${body.deleted_events} bogus event(s); region suppressed for 6h ✓`;
+        statusEl.classList.add("ok");
+        _markResolved(idx, "(not a pet)");
+        loadWorldEvents();
+      } catch (e) {
+        statusEl.textContent = `failed: ${e.message || e}`;
+        statusEl.classList.add("err");
+      }
+    });
+  }
+  if (recheckBtn) {
+    recheckBtn.addEventListener("click", async () => {
+      if (!selectedDet) return;
+      statusEl.textContent = "rechecking region at lower threshold…";
+      statusEl.className = "live-pet-status";
+      try {
+        const res = await fetch("/api/world_model/yolo_region", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            room,
+            bbox: selectedDet.bbox,
+            conf: 0.08,
+            padding: 0.20,
+          }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        const body = await res.json();
+        const found = (body.detections || []).filter(
+          (d) => d.class === "cat" || d.class === "dog" || d.class === "person",
+        );
+        if (found.length === 0) {
+          statusEl.textContent = "no cat/dog/person found even at low threshold.";
+          statusEl.classList.add("err");
+          return;
+        }
+        // Inject the new detections into `unique` and re-render overlays.
+        for (const d of found) {
+          unique.push({
+            bbox: d.box,
+            entity_type: d.class,
+            entity_name: d.class === "person" ? "(person)" : `(rechecked ${d.class})`,
+            entity_id: null,
+            ts: new Date().toISOString(),
+            confidence: d.confidence,
+            source: "yolo_recheck",
+          });
+        }
+        renderOverlays();
+        // Rebuild the side list too.
+        if (detListSlot) {
+          detListSlot.innerHTML = unique
+            .map((d, i) => `
+              <div class="live-pet-det-row" data-idx="${i}">
+                <span class="live-pet-det-name">${escapeHtml(d.entity_name || `?_${d.entity_type}`)}</span>
+                <span class="live-pet-det-species">${escapeHtml(d.entity_type)}</span>
+                <span class="live-pet-det-ago">${formatRelativeTs(d.ts)}</span>
+              </div>`)
+            .join("");
+          detListSlot.querySelectorAll(".live-pet-det-row").forEach((row) => {
+            row.addEventListener("click", () => _selectDet(Number(row.dataset.idx)));
+          });
+        }
+        statusEl.textContent = `found ${found.length} new detection(s) ✓ — click to tag.`;
+        statusEl.classList.add("ok");
+      } catch (e) {
+        statusEl.textContent = `recheck failed: ${e.message || e}`;
         statusEl.classList.add("err");
       }
     });
@@ -3502,7 +3671,7 @@ async function openLivePetTagModal(room) {
       selectedDet = null;
       overlay.querySelector("#live-pet-form").hidden = true;
       overlay.querySelectorAll(".live-pet-box, .live-pet-det-row").forEach((el) => {
-        el.classList.remove("active");
+        if (!el.classList.contains("resolved")) el.classList.remove("active");
       });
     });
   }

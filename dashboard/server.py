@@ -1747,6 +1747,89 @@ class DashboardServer:
                 "room": room,
             })
 
+        @app.post("/api/world_model/yolo_region")
+        async def world_model_yolo_region(request: Request):
+            """Rerun YOLO on a user-selected rectangular region of a
+            fresh snapshot from `room`, with a much looser confidence
+            threshold than the regular pipeline (default 0.10 vs the
+            standard ~0.20). Useful when you see a pet in the frame
+            but the live overlay doesn't — the standard pass on a
+            full frame is tuned to suppress false positives, this
+            region pass trades that for sensitivity.
+
+            Body: {room, bbox: [x1,y1,x2,y2], conf?=0.10, padding?=0.15}
+
+            Returns detections with bboxes already mapped back into
+            full-frame coordinates so they overlay correctly on the
+            modal's snapshot."""
+            orch = self._orchestrator
+            if orch is None:
+                raise HTTPException(status_code=503, detail="No orchestrator")
+            body = await request.json()
+            room = (body.get("room") or "").strip()
+            click_bbox = body.get("bbox") or []
+            conf = float(body.get("conf") or 0.10)
+            padding = float(body.get("padding") or 0.15)
+            if not room or len(click_bbox) != 4:
+                raise HTTPException(
+                    status_code=400,
+                    detail="room and bbox=[x1,y1,x2,y2] required",
+                )
+            cm = getattr(orch, "cameras", None)
+            detector = getattr(orch, "object_detector", None)
+            if cm is None or detector is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Camera manager or YOLO not initialized",
+                )
+            frame = await cm.capture_frame_async(room)
+            if frame is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"No frame from camera '{room}'",
+                )
+            fh, fw = int(frame.shape[0]), int(frame.shape[1])
+            cx1, cy1, cx2, cy2 = (float(c) for c in click_bbox)
+            # Pad the ROI so YOLO has context around the object.
+            w = max(1.0, cx2 - cx1)
+            h = max(1.0, cy2 - cy1)
+            px = int(round(w * padding))
+            py = int(round(h * padding))
+            rx1 = max(0, int(cx1) - px)
+            ry1 = max(0, int(cy1) - py)
+            rx2 = min(fw, int(cx2) + px)
+            ry2 = min(fh, int(cy2) + py)
+            if rx2 <= rx1 or ry2 <= ry1:
+                return JSONResponse({"detections": [], "roi": [rx1, ry1, rx2, ry2]})
+            crop = frame[ry1:ry2, rx1:rx2]
+            if not hasattr(detector, "detect_with_threshold_async"):
+                # Older detector without ROI helper — fall back to
+                # standard detect_async on the crop. Slightly worse
+                # sensitivity but functional.
+                dets = await detector.detect_async(crop)
+            else:
+                dets = await detector.detect_with_threshold_async(crop, conf)
+            out: list[dict] = []
+            for d in dets:
+                box = d.get("box") or []
+                if len(box) != 4:
+                    continue
+                # Map crop coords back into full-frame coords.
+                bx1, by1, bx2, by2 = (int(c) for c in box)
+                out.append({
+                    "class": d.get("class"),
+                    "confidence": d.get("confidence", 0.0),
+                    "label": d.get("label"),
+                    "box": [rx1 + bx1, ry1 + by1, rx1 + bx2, ry1 + by2],
+                })
+            return JSONResponse({
+                "detections": out,
+                "roi": [rx1, ry1, rx2, ry2],
+                "frame_width": fw,
+                "frame_height": fh,
+                "conf": conf,
+            })
+
         @app.get("/api/world_model/recent_animal_detections")
         async def world_model_recent_animal_detections(
             room: str, seconds: int = 30, species: Optional[str] = None,
@@ -1798,6 +1881,111 @@ class DashboardServer:
                     f"[/api/world_model/recent_animal_detections] {e}"
                 )
                 raise HTTPException(status_code=500, detail=str(e)) from e
+
+        @app.post("/api/world_model/not_an_animal")
+        async def world_model_not_an_animal(request: Request):
+            """Negative-reinforcement: the user clicked a bbox that
+            YOLO/the world model thought was a cat or dog, but it isn't —
+            it's a box around nothing (shadow, plush, plant, etc).
+            Body: {room, bbox: [x1,y1,x2,y2], seconds=30}
+
+            Action: delete every cat/dog event whose bbox overlaps the
+            click (IoU >= 0.3) in the last `seconds`, AND register the
+            region as a false-positive zone for that room so the
+            object-detector pipeline can soft-suppress similar
+            detections at low confidence. The region cache lives on the
+            orchestrator (in-memory, expires after 6h) so a restart
+            clears it — false-positive sources tend to be transient
+            (a hung-up jacket, a plush on the couch) and we'd rather
+            re-learn than persist a stale suppression mask.
+            """
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            if ws is None:
+                raise HTTPException(status_code=503, detail="World model offline")
+            body = await request.json()
+            room = (body.get("room") or "").strip()
+            click_bbox = body.get("bbox") or []
+            seconds = int(body.get("seconds") or 30)
+            if not room or len(click_bbox) != 4:
+                raise HTTPException(
+                    status_code=400,
+                    detail="room and bbox=[x1,y1,x2,y2] required",
+                )
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            now = _dt.now(_tz.utc)
+            cutoff = (now - _td(seconds=seconds)).isoformat()
+            rows = await ws.db.fetchall(
+                "SELECT id, bbox FROM world_entity_events "
+                "WHERE room = ? AND ts >= ? "
+                "AND entity_type IN ('cat', 'dog') "
+                "AND bbox IS NOT NULL",
+                (room, cutoff),
+            )
+            import json as _json
+            cx1, cy1, cx2, cy2 = (float(c) for c in click_bbox)
+            click_w = max(0.0, cx2 - cx1)
+            click_h = max(0.0, cy2 - cy1)
+            click_area = click_w * click_h
+            to_delete: list[str] = []
+            for r in rows:
+                try:
+                    rb = _json.loads(r["bbox"])
+                    if len(rb) != 4:
+                        continue
+                    rx1, ry1, rx2, ry2 = (float(c) for c in rb)
+                except Exception:
+                    continue
+                ix1, iy1 = max(rx1, cx1), max(ry1, cy1)
+                ix2, iy2 = min(rx2, cx2), min(ry2, cy2)
+                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                ra = max(0.0, rx2 - rx1) * max(0.0, ry2 - ry1)
+                union = click_area + ra - inter
+                iou = inter / union if union > 0 else 0.0
+                if iou >= 0.3:
+                    to_delete.append(r["id"])
+            if to_delete:
+                placeholders = ",".join("?" for _ in to_delete)
+                await ws.db.execute(
+                    f"DELETE FROM world_entity_events WHERE id IN ({placeholders})",
+                    to_delete,
+                )
+            # Register a soft-suppression region on the orchestrator so
+            # the next pipeline tick can downweight low-confidence
+            # detections in this bbox. Expiry is 6h — the false-positive
+            # source (shadow, plush, plant) usually moves or lights
+            # change by then; persistent ones will get re-flagged.
+            assert orch is not None
+            negatives = getattr(orch, "_vision_negative_regions", None)
+            if negatives is None:
+                negatives = []
+                orch._vision_negative_regions = negatives  # type: ignore[attr-defined]
+            negatives.append({
+                "room": room,
+                "bbox": [cx1, cy1, cx2, cy2],
+                "registered_at": now.isoformat(),
+                "expires_at": (now + _td(hours=6)).isoformat(),
+            })
+            # Trim expired entries so the list doesn't grow forever.
+            now_iso = now.isoformat()
+            orch._vision_negative_regions = [  # type: ignore[attr-defined]
+                n for n in negatives
+                if n.get("expires_at", "") > now_iso
+            ]
+            await self.broadcast({
+                "type": "world_negative_region_added",
+                "room": room,
+                "deleted_events": len(to_delete),
+            })
+            logger.info(
+                f"[NotAnAnimal] '{room}': deleted {len(to_delete)} bogus "
+                f"cat/dog event(s); region marked false-positive for 6h"
+            )
+            return JSONResponse({
+                "ok": True,
+                "deleted_events": len(to_delete),
+                "room": room,
+            })
 
         @app.post("/api/world_model/tag_in_frame")
         async def world_model_tag_in_frame(request: Request):

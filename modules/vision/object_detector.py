@@ -200,6 +200,37 @@ class ObjectDetector:
         """Async wrapper — runs inference in thread pool."""
         return await asyncio.to_thread(self.detect, frame)
 
+    def detect_with_threshold(
+        self,
+        frame: Optional[np.ndarray],
+        conf: float,
+    ) -> list[dict]:
+        """Same as detect() but with a one-shot confidence threshold
+        override. Used by the dashboard's "rerun YOLO on this region"
+        tool — the standard threshold is tuned to suppress noise on
+        full frames, but a user-selected ROI is allowed to use a much
+        looser bar."""
+        model = self._model
+        if frame is None or model is None:
+            return []
+        saved = self._conf_threshold
+        try:
+            self._conf_threshold = float(conf)
+            from modules.context.perf_tracker import perf
+            with perf().timeit(
+                f"yolo_roi.{self._model_name.replace('.pt','')}"
+            ):
+                return self._detect_inner(frame, model)
+        finally:
+            self._conf_threshold = saved
+
+    async def detect_with_threshold_async(
+        self,
+        frame: Optional[np.ndarray],
+        conf: float,
+    ) -> list[dict]:
+        return await asyncio.to_thread(self.detect_with_threshold, frame, conf)
+
     @staticmethod
     def summarize(detections: list[dict]) -> str:
         """
