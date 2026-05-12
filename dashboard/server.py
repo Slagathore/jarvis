@@ -2864,6 +2864,35 @@ class DashboardServer:
                 headers={"Cache-Control": "max-age=3600"},
             )
 
+        @app.post("/api/world_model/cluster/event/{event_id}/delete")
+        async def cluster_event_delete(event_id: str):
+            """Drop a single world_entity_events row — used by the
+            cluster viewer's "remove from cluster" action when the
+            user spots a row that doesn't belong with the rest (a
+            cat misclassified as a dog, a stray detection on a
+            stuffed animal, etc). The row is gone permanently;
+            future cluster builds won't re-pull it.
+            """
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            if ws is None:
+                raise HTTPException(status_code=503, detail="World store unavailable")
+            row = await ws.db.fetchone(
+                "SELECT id FROM world_entity_events WHERE id = ?",
+                (event_id,),
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="Event not found")
+            await ws.db.execute(
+                "DELETE FROM world_entity_events WHERE id = ?",
+                (event_id,),
+            )
+            await self.broadcast({
+                "type": "world_event_deleted",
+                "event_id": event_id,
+            })
+            return JSONResponse({"ok": True, "event_id": event_id})
+
         @app.post("/api/world_model/cluster/apply")
         async def cluster_apply(payload: dict):
             """Submit cluster labels — body shape:

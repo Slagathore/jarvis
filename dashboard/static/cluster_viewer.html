@@ -123,10 +123,19 @@ Routes used:
       display: flex;
       align-items: center;
       justify-content: center;
+      cursor: pointer;
+      border: 2px solid transparent;
+      transition: border-color 0.1s, transform 0.1s;
+    }
+    .cluster-cell:hover { transform: scale(1.02); }
+    .cluster-cell.selected {
+      border-color: #6ce6a6;
+      box-shadow: 0 0 0 1px #6ce6a6, 0 0 10px rgba(108,230,166,0.4);
     }
     .cluster-cell img {
       width: 100%; height: 100%;
       object-fit: cover;
+      display: block;
     }
     .cluster-cell .meta {
       font-size: 9px;
@@ -134,17 +143,73 @@ Routes used:
       padding: 4px;
       text-align: center;
       line-height: 1.3;
+      pointer-events: none;
     }
+    .cluster-cell .badge {
+      position: absolute;
+      top: 2px; left: 2px;
+      background: rgba(108,230,166,0.85);
+      color: #06080b;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 2px;
+      pointer-events: none;
+    }
+    .cluster-name-input {
+      flex: 1;
+      background: #1a1d28;
+      color: #d8dce3;
+      border: 1px solid #2a2f3e;
+      border-radius: 3px;
+      padding: 4px 6px;
+      font-size: 11px;
+      font-family: inherit;
+    }
+    .cluster-name-input::placeholder { color: #555; font-style: italic; }
     .cluster-controls {
       display: flex;
       gap: 8px;
       align-items: center;
+      margin-bottom: 6px;
     }
     .cluster-controls select { flex: 1; }
     .cluster-controls .applied {
       color: #6ce6a6;
       font-size: 11px;
       letter-spacing: 0.1em;
+    }
+    .selbar {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      background: #14161e;
+      border-bottom: 1px solid #2a2f3e;
+      padding: 8px 18px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 12px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    }
+    .selbar.hidden { display: none; }
+    .selbar .count {
+      color: #6ce6a6;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+    .selbar select {
+      background: #1a1d28; color: #d8dce3;
+      border: 1px solid #2a2f3e; padding: 4px 8px;
+      border-radius: 3px; font-family: inherit; font-size: 12px;
+    }
+    .selbar button.danger {
+      border-color: rgba(229,103,103,0.4);
+      color: #f88;
+    }
+    .selbar button.danger:hover:not(:disabled) {
+      background: rgba(229,103,103,0.12);
+      border-color: #e57;
     }
     .toast {
       position: fixed;
@@ -179,6 +244,18 @@ Routes used:
     </div>
     <div class="status" id="status">idle</div>
   </header>
+
+  <div class="selbar hidden" id="selbar">
+    <span class="count" id="sel-count">0 selected</span>
+    <label>
+      Move to:
+      <select id="sel-move-target"></select>
+    </label>
+    <button id="sel-move-btn">Move</button>
+    <button id="sel-delete-btn" class="danger" title="Permanently delete these world_entity_events rows. They won't be re-pulled by future cluster builds.">Delete event(s)</button>
+    <button id="sel-clear-btn">Clear selection</button>
+  </div>
+
   <main>
     <div id="content" class="empty">
       <div>Click <strong>BUILD CLUSTERS</strong> to run K-means on
@@ -206,14 +283,52 @@ Routes used:
     // Local state — populated by buildClusters, consumed by saveLabels.
     let lastBuildSpecies = null;
     let lastClusters = {};        // {cluster_id: [event_ids]}
+    let lastSamples = {};         // {cluster_id: [sample, ...]} for re-render
     let pendingLabels = {};       // {cluster_id: pet_name}
+    let pendingNames = {};        // {cluster_id: user-typed display name}
     let knownPets = [];
+    const selected = new Set();   // event_ids
+    const selbar = $("selbar");
+    const selCount = $("sel-count");
+    const selMoveTarget = $("sel-move-target");
 
     function showToast(msg, isError = false) {
       toast.textContent = msg;
       toast.classList.toggle("error", isError);
       toast.classList.add("show");
       setTimeout(() => toast.classList.remove("show"), 2400);
+    }
+
+    function updateSelBar() {
+      const n = selected.size;
+      selCount.textContent = `${n} selected`;
+      selbar.classList.toggle("hidden", n === 0);
+      // Repopulate move-target with the OTHER clusters
+      selMoveTarget.innerHTML = "";
+      // Find which cluster each selected event lives in; show as
+      // candidates only the clusters that don't already hold ALL
+      // of them. (If user picked items from cluster 0 and 2,
+      // they can move to 1, 3, ...).
+      const sourceClusters = new Set();
+      for (const [cid, ids] of Object.entries(lastClusters)) {
+        if (ids.some((id) => selected.has(id))) sourceClusters.add(cid);
+      }
+      const candidates = Object.keys(lastClusters)
+        .filter((cid) => !(sourceClusters.size === 1 && sourceClusters.has(cid)));
+      for (const cid of candidates) {
+        const opt = document.createElement("option");
+        opt.value = cid;
+        const display = pendingNames[cid] || `CLUSTER ${cid}`;
+        opt.textContent = `${display} (${lastClusters[cid].length})`;
+        selMoveTarget.appendChild(opt);
+      }
+    }
+
+    function _findClusterOf(eventId) {
+      for (const [cid, ids] of Object.entries(lastClusters)) {
+        if (ids.includes(eventId)) return cid;
+      }
+      return null;
     }
 
     async function fetchKnownPets(species) {
@@ -251,10 +366,14 @@ Routes used:
           status.textContent = "not enough data";
           return;
         }
-        // Hydrate event_ids per cluster.
+        // Hydrate event_ids + samples per cluster.
+        lastSamples = {};
         for (const [cid, info] of Object.entries(body.clusters)) {
-          lastClusters[cid] = info.event_ids;
+          lastClusters[cid] = info.event_ids.slice();
+          lastSamples[cid] = info.samples || [];
         }
+        selected.clear();
+        updateSelBar();
         renderClusters(body.clusters);
         applyBtn.disabled = false;
         status.textContent = `${Object.keys(body.clusters).length} cluster(s)`;
@@ -285,37 +404,45 @@ Routes used:
       content.className = "clusters";
       content.innerHTML = "";
       const optionTags = [
-        '<option value="">— skip —</option>',
+        '<option value="">— skip (assign no pet) —</option>',
         ...knownPets.map(
           (n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`
         ),
       ].join("");
-      for (const [cid, info] of Object.entries(clusters).sort(
-        (a, b) => Number(a[0]) - Number(b[0])
-      )) {
-        const cellHTML = (info.samples || [])
-          .map((s) => {
-            const img = s.snapshot_path
-              ? `<img src="/api/world_model/cluster/event/${encodeURIComponent(s.event_id)}/image.jpg"
-                       alt="${escapeHtml(s.room || '')} ${escapeHtml(s.ts || '')}"
-                       onerror="this.onerror=null;this.replaceWith(metaCell(${JSON.stringify(s).replace(/"/g, '&quot;')}));"/>`
-              : metaCellHTML(s);
-            return `<div class="cluster-cell">${img}</div>`;
-          })
-          .join("");
+      const sortedIds = Object.keys(clusters).sort(
+        (a, b) => Number(a) - Number(b)
+      );
+      for (const cid of sortedIds) {
+        const info = clusters[cid];
+        const samples = lastSamples[cid] || info.samples || [];
         const card = document.createElement("div");
         card.className = "cluster";
+        card.dataset.cid = cid;
+        const name = pendingNames[cid] || "";
+        const pet = pendingLabels[cid] || "";
         card.innerHTML = `
           <div class="cluster-head">
             <span class="cluster-id">CLUSTER ${cid}</span>
-            <span class="cluster-size">${info.size} events</span>
+            <span class="cluster-size">${(lastClusters[cid] || []).length} events</span>
           </div>
-          <div class="cluster-grid">${cellHTML}</div>
+          <div class="cluster-controls">
+            <input class="cluster-name-input" type="text"
+                   placeholder="Optional cluster name (e.g. 'striped one in office')"
+                   data-cluster="${cid}" value="${escapeHtml(name)}" />
+          </div>
+          <div class="cluster-grid" data-cid="${cid}"></div>
           <div class="cluster-controls">
             <select data-cluster="${cid}">${optionTags}</select>
             <span class="applied" id="applied-${cid}"></span>
           </div>
         `;
+        const grid = card.querySelector(".cluster-grid");
+        for (const s of samples) {
+          grid.appendChild(buildCell(s));
+        }
+        // Restore pet pre-selection if user previously picked one.
+        const sel = card.querySelector("select[data-cluster]");
+        if (pet) sel.value = pet;
         content.appendChild(card);
       }
       // Wire dropdowns
@@ -324,14 +451,76 @@ Routes used:
           const cid = sel.dataset.cluster;
           if (sel.value) pendingLabels[cid] = sel.value;
           else delete pendingLabels[cid];
+          applyBtn.disabled = Object.keys(pendingLabels).length === 0;
+        });
+      });
+      content.querySelectorAll(".cluster-name-input").forEach((inp) => {
+        inp.addEventListener("input", () => {
+          const cid = inp.dataset.cluster;
+          if (inp.value.trim()) pendingNames[cid] = inp.value.trim();
+          else delete pendingNames[cid];
+          // Refresh the size header (the move-target dropdown reads
+          // pendingNames too).
+          updateSelBar();
         });
       });
     }
 
-    function metaCellHTML(s) {
-      const colour = s.color_class ? s.color_class : "?";
+    function buildCell(s) {
+      const cell = document.createElement("div");
+      cell.className = "cluster-cell";
+      cell.dataset.eventId = s.event_id;
+      cell.title = `${s.room || "?"} · ${s.ts || ""} · ${s.color_class || "?"}`;
+
+      // The classic "black thumbnail with just 'unknown'" problem was
+      // a non-existent file path + an onerror-replace that put a
+      // tiny meta cell into a still-black tile. Approach now: try
+      // the image; on failure, replace the WHOLE cell contents with
+      // an ASCII glyph + the metadata block so it actually reads.
+      if (s.snapshot_path) {
+        const img = document.createElement("img");
+        img.alt = `${s.room || ""} ${s.ts || ""}`;
+        img.loading = "lazy";
+        img.src = `/api/world_model/cluster/event/${encodeURIComponent(s.event_id)}/image.jpg`;
+        img.addEventListener("error", () => {
+          cell.innerHTML = "";
+          cell.appendChild(metaNode(s, true));
+        });
+        cell.appendChild(img);
+      } else {
+        cell.appendChild(metaNode(s, false));
+      }
+      if (selected.has(s.event_id)) cell.classList.add("selected");
+
+      cell.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (selected.has(s.event_id)) {
+          selected.delete(s.event_id);
+          cell.classList.remove("selected");
+        } else {
+          selected.add(s.event_id);
+          cell.classList.add("selected");
+        }
+        updateSelBar();
+      });
+      return cell;
+    }
+
+    function metaNode(s, isMissing) {
+      const div = document.createElement("div");
+      div.className = "meta";
       const room = s.room || "?";
-      return `<div class="meta">${escapeHtml(colour)}<br>${escapeHtml(room)}</div>`;
+      const colour = s.color_class || "?";
+      const size = s.size_normalized != null
+        ? `${(s.size_normalized * 100).toFixed(1)}% frame`
+        : "—";
+      const tag = isMissing ? "snapshot missing" : "no snapshot";
+      div.innerHTML = `<div style="color:#5a5; font-size:14px; margin-bottom:4px;">▣</div>` +
+        `<div>${escapeHtml(colour)}</div>` +
+        `<div>${escapeHtml(room)}</div>` +
+        `<div style="opacity:0.6;">${escapeHtml(size)}</div>` +
+        `<div style="opacity:0.4; font-style:italic; margin-top:2px;">${tag}</div>`;
+      return div;
     }
 
     function escapeHtml(s) {
@@ -384,10 +573,92 @@ Routes used:
       }
     }
 
-    // Re-enable apply when any label changes
-    document.addEventListener("change", (ev) => {
-      if (ev.target.matches("select[data-cluster]")) {
-        applyBtn.disabled = Object.keys(pendingLabels).length === 0;
+    // Selection-bar actions
+    $("sel-clear-btn").addEventListener("click", () => {
+      selected.clear();
+      document.querySelectorAll(".cluster-cell.selected")
+        .forEach((c) => c.classList.remove("selected"));
+      updateSelBar();
+    });
+
+    $("sel-move-btn").addEventListener("click", () => {
+      const target = selMoveTarget.value;
+      if (!target || selected.size === 0) return;
+      const movedIds = Array.from(selected);
+      // Strip moved ids out of their current clusters, append to target.
+      for (const id of movedIds) {
+        const src = _findClusterOf(id);
+        if (src === null) continue;
+        const srcArr = lastClusters[src];
+        const idx = srcArr.indexOf(id);
+        if (idx >= 0) srcArr.splice(idx, 1);
+        // Move sample metadata too so the cells render in the new home.
+        const srcSamples = lastSamples[src] || [];
+        const sampleIdx = srcSamples.findIndex(
+          (s) => s.event_id === id,
+        );
+        if (sampleIdx >= 0) {
+          const [moved] = srcSamples.splice(sampleIdx, 1);
+          if (!lastSamples[target]) lastSamples[target] = [];
+          lastSamples[target].push(moved);
+        }
+        if (!lastClusters[target]) lastClusters[target] = [];
+        lastClusters[target].push(id);
+      }
+      selected.clear();
+      showToast(`Moved ${movedIds.length} event(s) to cluster ${target}.`);
+      // Re-render with the current data (we already have all samples).
+      const clustersForRender = {};
+      for (const cid of Object.keys(lastClusters)) {
+        clustersForRender[cid] = { size: lastClusters[cid].length };
+      }
+      renderClusters(clustersForRender);
+      updateSelBar();
+    });
+
+    $("sel-delete-btn").addEventListener("click", async () => {
+      if (selected.size === 0) return;
+      if (!confirm(
+        `Permanently delete ${selected.size} event row(s)? They won't ` +
+        `be re-pulled by future cluster builds.`
+      )) return;
+      const ids = Array.from(selected);
+      let failures = 0;
+      for (const id of ids) {
+        try {
+          const res = await fetch(
+            `/api/world_model/cluster/event/${encodeURIComponent(id)}/delete`,
+            { method: "POST" },
+          );
+          if (!res.ok) failures++;
+        } catch {
+          failures++;
+        }
+      }
+      // Strip deleted from local state too.
+      for (const id of ids) {
+        const src = _findClusterOf(id);
+        if (src !== null) {
+          const arr = lastClusters[src];
+          const idx = arr.indexOf(id);
+          if (idx >= 0) arr.splice(idx, 1);
+          const samples = lastSamples[src] || [];
+          const si = samples.findIndex((s) => s.event_id === id);
+          if (si >= 0) samples.splice(si, 1);
+        }
+      }
+      selected.clear();
+      const clustersForRender = {};
+      for (const cid of Object.keys(lastClusters)) {
+        clustersForRender[cid] = { size: lastClusters[cid].length };
+      }
+      renderClusters(clustersForRender);
+      updateSelBar();
+      if (failures) {
+        showToast(`Deleted ${ids.length - failures} of ${ids.length}.`,
+          failures === ids.length);
+      } else {
+        showToast(`Deleted ${ids.length} event(s).`);
       }
     });
 
