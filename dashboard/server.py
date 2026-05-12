@@ -207,8 +207,45 @@ class DashboardServer:
         self._interruptibility = manager
 
     def register_orchestrator(self, orchestrator) -> None:
-        """Wire the orchestrator so endpoints can poke its state (enrollment flag)."""
+        """Wire the orchestrator so endpoints can poke its state (enrollment
+        flag). Also subscribe the dashboard's broadcast pipe to the bus's
+        world topics — previously both `world.entity_event` and
+        `world.state_snapshot` had no subscribers and the bus dropped
+        them on every publish (visible as 'No subscribers for ...' DEBUG
+        spam). Forwarding them gives the World Events and Interactions
+        panels live updates instead of relying solely on the 5–10s REST
+        poll, and silences the dropped-event noise.
+        """
         self._orchestrator = orchestrator
+        bus = getattr(orchestrator, "bus", None)
+        if bus is None:
+            return
+
+        async def _on_entity_event(payload: dict) -> None:
+            await self.broadcast({
+                "type": "world.entity_event",
+                **payload,
+            })
+
+        async def _on_state_snapshot(payload: dict) -> None:
+            # Snapshot is big-ish (every entity); throttle to no more than
+            # one broadcast per ~5s so a 30s-cadence publisher doesn't
+            # accidentally turn into a firehose under future tuning.
+            now = datetime.now().timestamp()
+            last = getattr(self, "_last_snapshot_broadcast", 0.0)
+            if now - last < 5.0:
+                return
+            self._last_snapshot_broadcast = now  # type: ignore[attr-defined]
+            await self.broadcast({
+                "type": "world.state_snapshot",
+                **payload,
+            })
+
+        try:
+            bus.subscribe("world.entity_event", _on_entity_event)
+            bus.subscribe("world.state_snapshot", _on_state_snapshot)
+        except Exception as e:
+            logger.warning(f"[Dashboard] world bus subscribe failed: {e}")
 
     def register_speaker_id(self, speaker_id) -> None:
         """Wire SpeakerIdentifier so /api/speakers endpoints can list/delete enrollments."""

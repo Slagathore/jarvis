@@ -30,7 +30,7 @@ Spec:    new 2.md §8 (Storage Layer) and §16 (Full Code: WorldStore).
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import numpy as np
@@ -385,6 +385,97 @@ class WorldStore:
         params.append(limit)
         rows = await self.db.fetchall(q, tuple(params))
         return [dict(r) for r in rows]
+
+
+    # ── Snapshot disk retention ─────────────────────────────────────────────
+
+    async def prune_snapshot_files(
+        self,
+        snapshot_dir: Any,  # pathlib.Path; typed-as-Any to avoid importing
+        retain_hours: int = 48,
+        per_pet_keep: int = 20,
+    ) -> dict:
+        """
+        Walk `snapshot_dir`, delete every JPEG that is BOTH older than
+        `retain_hours` AND not in the per-pet keep-N set.
+
+        Retention rules:
+          • Last 48h of activity → keep all referenced snapshots
+            (interactions panel needs them).
+          • Older than that → keep only the N most-recent snapshots per
+            named pet so the lore-card thumbnails don't go blank after
+            the rolling window slides past.
+
+        Files that exist on disk but aren't referenced by any event row
+        are also pruned aggressively — they're orphaned snapshots from
+        observations that never produced an event (cooldown skipped
+        the event but the crop was saved anyway, etc).
+        """
+        from pathlib import Path as _Path
+        d = _Path(snapshot_dir)
+        if not d.exists() or not d.is_dir():
+            return {"scanned": 0, "kept": 0, "deleted": 0}
+
+        cutoff = _utcnow() - timedelta(hours=int(retain_hours))
+        # 1. Referenced in the keep-window.
+        rows = await self.db.fetchall(
+            "SELECT DISTINCT snapshot_path FROM world_entity_events "
+            "WHERE ts >= ? AND snapshot_path IS NOT NULL",
+            (cutoff.isoformat(),),
+        )
+        keep_paths: set[str] = {
+            r["snapshot_path"] for r in rows if r["snapshot_path"]
+        }
+        # 2. Top per-pet keep, regardless of age.
+        pet_rows = await self.db.fetchall(
+            "SELECT entity_name, snapshot_path, ts FROM world_entity_events "
+            "WHERE snapshot_path IS NOT NULL "
+            "AND entity_type IN ('cat','dog') "
+            "AND entity_name IS NOT NULL "
+            "ORDER BY ts DESC",
+        )
+        per_pet_counts: dict[str, int] = {}
+        for r in pet_rows:
+            name = r["entity_name"]
+            if not name:
+                continue
+            n = per_pet_counts.get(name, 0)
+            if n >= int(per_pet_keep):
+                continue
+            keep_paths.add(r["snapshot_path"])
+            per_pet_counts[name] = n + 1
+
+        # Normalize keep-set to resolved absolute paths so case / sep
+        # differences on Windows don't cause spurious deletes.
+        keep_resolved: set[str] = set()
+        for p in keep_paths:
+            try:
+                keep_resolved.add(str(_Path(p).resolve()))
+            except Exception:
+                continue
+
+        scanned = 0
+        deleted = 0
+        kept = 0
+        for fp in d.iterdir():
+            if not fp.is_file():
+                continue
+            if fp.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                continue
+            scanned += 1
+            try:
+                resolved = str(fp.resolve())
+            except Exception:
+                resolved = str(fp)
+            if resolved in keep_resolved:
+                kept += 1
+                continue
+            try:
+                fp.unlink()
+                deleted += 1
+            except OSError:
+                pass
+        return {"scanned": scanned, "kept": kept, "deleted": deleted}
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────

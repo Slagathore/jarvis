@@ -3810,6 +3810,38 @@ class Orchestrator:
                     logger.warning(
                         f"[WorldModel] object prune failed: {e}"
                     )
+
+                # Snapshot retention: drop JPEGs older than 48h that
+                # aren't in the per-pet keep-N set. Keeps disk bounded
+                # now that we save crops aggressively for interaction
+                # precursors. Tunable via world_model.nightly.
+                try:
+                    ob = getattr(self, "observation_builder", None)
+                    snap_dir = getattr(ob, "snapshot_dir", None) if ob else None
+                    if snap_dir is not None and world.store is not None:
+                        retain_hours = int(cfg.get(
+                            "snapshot_retain_hours", 48,
+                        ))
+                        per_pet_keep = int(cfg.get(
+                            "snapshot_per_pet_keep", 20,
+                        ))
+                        stats = await world.store.prune_snapshot_files(
+                            snap_dir,
+                            retain_hours=retain_hours,
+                            per_pet_keep=per_pet_keep,
+                        )
+                        if stats.get("deleted"):
+                            logger.info(
+                                f"[WorldModel] nightly: snapshot prune "
+                                f"deleted {stats['deleted']} of {stats['scanned']} "
+                                f"(kept {stats['kept']}; "
+                                f"window={retain_hours}h, "
+                                f"per_pet_keep={per_pet_keep})"
+                            )
+                except Exception as e:
+                    logger.warning(
+                        f"[WorldModel] snapshot prune failed: {e}"
+                    )
             except asyncio.CancelledError:
                 break
             except Exception:

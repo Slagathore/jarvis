@@ -149,11 +149,21 @@ class ObservationBuilder:
         # at 120s because we already have face-enrollment thumbs.
         # All values are tunable via /api/tunables (Settings tab).
         self._snapshot_min_interval_s: dict[str, float] = {
-            "person": 120.0,
+            # Person cooldown was 120s — that was tuned for keeping disk
+            # usage down, but it meant the Interactions panel rendered
+            # "(no thumb)" for most rows because the underlying person
+            # observation didn't save a crop. 30s leaves room for the
+            # hand-present override (above) to fill in interaction
+            # precursors without saturating disk; the 48h retention
+            # sweep + per-pet keep-N policy keep growth bounded.
+            "person": 30.0,
             "cat": 10.0,
             "dog": 10.0,
             "openvocab": 120.0,
-            "object": 600.0,
+            # Object cooldown was 600s. PLACED_DOWN events fire on
+            # object FIRST_SEEN / REAPPEARED, so a 10-min cooldown
+            # guarantees most placedowns have no thumb. Drop to 60s.
+            "object": 60.0,
         }
         # Track per-room loop tasks so we can cancel on shutdown without
         # leaking. Keyed by room id.
@@ -369,11 +379,21 @@ class ObservationBuilder:
 
         # Save crop for enrollment / dashboard. Optional: gated on
         # snapshot_dir being set so tests / lightweight setups skip it.
+        # When hands are present, bypass the cooldown — this person
+        # observation is an interaction precursor (INTERACTED_WITH,
+        # PICKED_UP, PLACED_DOWN, HANDED_OFF all derive from it), and
+        # without a saved crop the Interactions panel can't render a
+        # thumbnail. The cost is at most one extra JPEG per hand frame
+        # in a busy room; the 48h retention sweep keeps disk bounded.
         crop_path: Optional[Path] = None
+        snapshot_ok = (
+            self._snapshot_allowed("person", room, ts)
+            or bool(hand_bboxes)
+        )
         if (self.snapshot_dir is not None
                 and crop is not None
                 and crop.size > 0
-                and self._snapshot_allowed("person", room, ts)):
+                and snapshot_ok):
             try:
                 import cv2  # noqa: E402 — lazy so test envs without cv2 don't choke
                 fname = (

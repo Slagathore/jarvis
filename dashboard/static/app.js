@@ -229,6 +229,30 @@ function applyEvent(event) {
     case "selfedit.pending_added":
       loadSelfEditStatus();
       break;
+    case "world.entity_event":
+      // A new entity event fired on the bus. Refresh the panels
+      // immediately rather than waiting on the next 5s/10s poll. The
+      // panel functions are idempotent and rate-limited by their own
+      // setInterval, so an extra refresh here is cheap.
+      loadWorldEvents();
+      // Interactions only fire for a small subset of event types —
+      // only re-pull when one of those types lands.
+      if (event.event_type === "interacted_with" ||
+          event.event_type === "picked_up" ||
+          event.event_type === "placed_down" ||
+          event.event_type === "handed_off") {
+        loadInteractions();
+      }
+      // Pet cards key off entity state changes — refresh so the
+      // "last seen N ago" text stays current.
+      if (event.entity_type === "cat" || event.entity_type === "dog") {
+        if (typeof loadPets === "function") loadPets();
+      }
+      break;
+    case "world.state_snapshot":
+      // Throttled to ≤1/5s by the server; cheap UI refresh.
+      if (typeof loadPets === "function") loadPets();
+      break;
   }
 }
 
