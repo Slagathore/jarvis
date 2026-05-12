@@ -87,6 +87,8 @@
             Bulk action target:
             <select id="reviews-bulk-target"></select>
           </label>
+          <input type="text" class="reminder-input" id="reviews-bulk-new-name"
+                 placeholder="New person name" hidden />
           <button class="dev-btn" id="reviews-bulk-assign">Assign selected</button>
           <button class="dev-btn" id="reviews-bulk-reject">Reject selected</button>
           <button class="dev-btn" id="reviews-collapse" title="Cluster similar embeddings and reject duplicates so you don't have to review the same face 50 times">Collapse duplicates</button>
@@ -537,14 +539,6 @@
           </div>
           <div class="memory-list" id="memory-list">
             <div class="who-empty">No memories yet.</div>
-          </div>
-        </div>
-
-        <!-- Pending review (drift conflicts + unknown clusters surfaced for naming) -->
-        <div class="card" id="pending-card">
-          <div class="card-label">PENDING REVIEW</div>
-          <div class="pending-list" id="pending-list">
-            <div class="who-empty">No pending review items.</div>
           </div>
         </div>
 

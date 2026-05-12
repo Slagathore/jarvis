@@ -2079,10 +2079,26 @@ main {
   border-radius: 6px;
   display: flex; flex-direction: column;
   overflow: hidden;
-  transition: opacity 0.15s, border-color 0.15s;
+  transition: opacity 0.15s, border-color 0.15s, background 0.15s;
+  cursor: pointer;
 }
-.review-card.review-selected { border-color: var(--accent, #6cf); }
+.review-card:hover { background: rgba(255,255,255,0.04); }
+.review-card.review-selected {
+  border-color: var(--accent, #6cf);
+  background: rgba(108,207,255,0.07);
+}
 .review-card.review-resolving { opacity: 0.3; }
+.review-assign {
+  padding: 6px 10px;
+  display: flex; gap: 6px; flex-wrap: wrap;
+  align-items: center;
+  border-top: 1px solid var(--border);
+  background: rgba(255,255,255,0.02);
+  cursor: default;
+}
+.review-assign .review-person-sel { flex: 1 1 120px; min-width: 0; font-size: 0.78rem; }
+.review-assign .review-new-name { flex: 1 1 100%; font-size: 0.78rem; }
+.review-assign .review-quick { font-size: 0.75rem; padding: 4px 8px; }
 .review-head {
   padding: 6px 10px;
   display: flex; align-items: center; gap: 8px;
@@ -2702,6 +2718,12 @@ main {
   letter-spacing: 0.1em;
   font-size: 9px;
   margin-right: 4px;
+  opacity: 0.7;
+}
+.pet-where-prefix {
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 9px;
   opacity: 0.7;
 }
 .pet-where-room {

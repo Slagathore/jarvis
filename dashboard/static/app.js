@@ -193,8 +193,16 @@ function applyEvent(event) {
     }
     case "identity_pending_added":
     case "identity_pending_resolved":
-      loadPending();
+    case "identity_pending_collapsed":
+    case "identity_pending_bulk_resolved":
+      refreshReviewsBadge();
       loadPersons();
+      // If the user has the Reviews tab open, refresh its grid so a
+      // dropped row disappears immediately.
+      if (document.getElementById("tab-pane-reviews") &&
+          !document.getElementById("tab-pane-reviews").hidden) {
+        loadReviewsTab();
+      }
       break;
     case "notification.added":
     case "notification.read":
@@ -1140,13 +1148,9 @@ function loadPersons() {
       _personsCache = persons || [];
       _personsCacheVersion += 1;
       renderPersons(_personsCache);
-      // Re-render pending too, since its dropdown reads from _personsCache.
-      const pl = document.getElementById("pending-list");
-      if (pl && pl.dataset.lastItems) {
-        try {
-          renderPending(JSON.parse(pl.dataset.lastItems));
-        } catch (_) {}
-      }
+      // The old in-home pending-list card was retired in favour of the
+      // dedicated Pending Reviews tab — that tab pulls its own data
+      // when loaded, and the reviews-tab-badge tracks unread count.
     })
     .catch(() => {});
 }
@@ -1394,159 +1398,10 @@ function _personOptions(selectedName) {
   return html;
 }
 
-function renderPending(items) {
-  const el = document.getElementById("pending-list");
-  if (!el) return;
-  // Cache so loadPersons() can re-render after the persons list refreshes
-  // without re-fetching pending. Lets the dropdown stay in sync hot.
-  el.dataset.lastItems = JSON.stringify(items || []);
-  if (!items || items.length === 0) {
-    el.innerHTML = `<div class="who-empty">No pending review items.</div>`;
-    return;
-  }
-  el.innerHTML = "";
-  items.forEach((p) => {
-    const row = document.createElement("div");
-    row.className = "pending-row";
-    const isCluster = p.kind && p.kind.startsWith("pending_cluster_");
-    const modality = p.kind && p.kind.includes("voice") ? "voice" : "face";
-    // Backend ships a suggestion for cluster rows — the unconstrained
-    // top match against the live centroid bank. Use it both to label
-    // the hint ("Looks like Cole 0.42") and to pre-select the dropdown.
-    let hint;
-    if (isCluster) {
-      const baseSim = (p.similarity || 0).toFixed(2);
-      if (p.suggested_person_name) {
-        const sugSim = (p.suggested_similarity || 0).toFixed(2);
-        hint = `Unknown ${modality} cluster #${p.cluster_id || "?"} — looks like ` +
-               `<b>${escapeHtml(p.suggested_person_name)}</b> (${sugSim}). ` +
-               `Cluster centroid sim ${baseSim}.`;
-      } else {
-        hint = `Unknown ${modality} cluster #${p.cluster_id || "?"} — no enrolled match (${baseSim})`;
-      }
-    } else {
-      hint = `Drift on ${escapeHtml(p.person_name || "unknown")} — sim ${
-        (p.similarity || 0).toFixed(2)
-      } (anchored via ${p.anchored_via || "?"})`;
-    }
-    let preview = "";
-    if (p.has_image) {
-      // Wrap thumb in a positioning shell so we can overlay a face-bbox
-      // highlight when multiple people are in the capture frame.
-      const bboxJson = p.face_bbox ? JSON.stringify(p.face_bbox) : "";
-      preview = `
-        <div class="pending-thumb-wrap" data-bbox='${escapeHtml(bboxJson)}'>
-          <img class="pending-thumb pending-thumb-clickable"
-               src="/api/identity/pending/${p.id}/image.jpg"
-               alt="capture" title="Click to enlarge" />
-          ${p.face_bbox
-            ? `<div class="face-bbox-overlay"
-                  data-x1="${p.face_bbox[0]}" data-y1="${p.face_bbox[1]}"
-                  data-x2="${p.face_bbox[2]}" data-y2="${p.face_bbox[3]}"></div>`
-            : ""
-          }
-        </div>`;
-    } else if (p.has_audio) {
-      preview = `<audio controls class="pending-audio" src="/api/identity/pending/${p.id}/audio.wav"></audio>`;
-    }
-    // Drift rows: pre-select the anchored person. Cluster rows: pre-
-    // select the suggested top-match person so a single click confirms.
-    const preselect = p.person_name || p.suggested_person_name || null;
-    const optionsHtml = _personOptions(preselect);
-    row.innerHTML = `
-      ${preview}
-      <div class="pending-meta">
-        <div class="pending-hint">${hint}</div>
-        <div class="pending-actions">
-          ${
-            !isCluster
-              ? `<button class="dev-btn pending-confirm" data-id="${p.id}">YES, IT'S ${escapeHtml(p.person_name || "")}</button>`
-              : ""
-          }
-          <select class="dev-select pending-select">${optionsHtml}</select>
-          <input type="text" class="reminder-input pending-name" placeholder="New person name" hidden />
-          <button class="dev-btn pending-assign" data-id="${p.id}">${isCluster ? "ASSIGN" : "REASSIGN"}</button>
-          <button class="dev-btn pending-reject" data-id="${p.id}">REJECT</button>
-        </div>
-      </div>
-    `;
-    const select = row.querySelector(".pending-select");
-    const newInput = row.querySelector(".pending-name");
-    select.addEventListener("change", () => {
-      if (select.value === NEW_PERSON_SENTINEL) {
-        newInput.hidden = false;
-        newInput.focus();
-      } else {
-        newInput.hidden = true;
-        newInput.value = "";
-      }
-    });
-    const confirmBtn = row.querySelector(".pending-confirm");
-    if (confirmBtn) {
-      confirmBtn.addEventListener("click", () => resolvePending(p.id, "confirm"));
-    }
-    row.querySelector(".pending-assign").addEventListener("click", () => {
-      let target = select.value;
-      if (target === NEW_PERSON_SENTINEL) {
-        target = newInput.value.trim();
-        if (!target) {
-          newInput.focus();
-          return;
-        }
-        // Warn if the user is creating a new person with a name that already
-        // exists case-insensitively — likely they meant to pick the existing
-        // entry from the dropdown.
-        const collision = _personsCache.find(
-          (pp) => pp.name && pp.name.toLowerCase() === target.toLowerCase()
-        );
-        if (collision) {
-          if (
-            !confirm(
-              `'${target}' will reuse the existing person '${collision.name}'.\n` +
-              `If this is genuinely a different person with the same name, ` +
-              `pick a distinct label first (e.g. '${target} S').\n\nProceed?`
-            )
-          ) {
-            return;
-          }
-          target = collision.name; // preserve original casing
-        }
-      }
-      if (!target) return;
-      resolvePending(p.id, "assign", target);
-    });
-    row.querySelector(".pending-reject").addEventListener("click", () => resolvePending(p.id, "reject"));
-    // Make the capture thumbnail (if any) open the lightbox at full
-    // resolution. The select dropdown is right next to it; users
-    // squinting at a 96px thumb were the original complaint.
-    const thumb = row.querySelector(".pending-thumb-clickable");
-    if (thumb) {
-      thumb.addEventListener("click", () => {
-        const caption = isCluster
-          ? `Cluster #${p.cluster_id || "?"} (${modality})`
-          : `Drift on ${p.person_name || "?"}`;
-        openImageLightbox(
-          `/api/identity/pending/${p.id}/image.jpg`,
-          caption,
-          p.captured_at,
-          p.face_bbox || null,
-        );
-      });
-      // Position the bbox overlay relative to the image's rendered
-      // dimensions. Stored bbox is in source-pixel coords; we scale
-      // it to the displayed size on every layout. Recompute on load
-      // and on window resize.
-      const overlay = thumb.parentElement.querySelector(".face-bbox-overlay");
-      if (overlay) {
-        const positionOverlay = () => _positionFaceBbox(thumb, overlay);
-        if (thumb.complete && thumb.naturalWidth > 0) positionOverlay();
-        else thumb.addEventListener("load", positionOverlay);
-        window.addEventListener("resize", positionOverlay);
-      }
-    }
-    el.appendChild(row);
-  });
-}
+// (renderPending was retired alongside the home-tab pending-list card;
+// the Pending Reviews tab is now the single surface for identity
+// resolution. _personOptions is still used by the per-card dropdown in
+// the Reviews tab — that's why it stays defined above.)
 
 function _positionFaceBbox(img, overlay) {
   // bbox stored as [x1, y1, x2, y2] in source-image pixel coords.
@@ -1572,31 +1427,14 @@ function _positionFaceBbox(img, overlay) {
   overlay.style.height = `${(y2 - y1) * scale}px`;
 }
 
-function loadPending() {
-  fetch("/api/identity/pending")
-    .then((r) => r.json())
-    .then(({ pending }) => renderPending(pending || []))
-    .catch(() => {});
-}
-
-function resolvePending(id, action, targetName) {
-  const body = { action };
-  if (targetName) body.target_name = targetName;
-  fetch(`/api/identity/pending/${id}/resolve`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  })
-    .then(() => {
-      loadPending();
-      loadPersons();
-    })
-    .catch(() => {});
-}
+// Old in-home loadPending() / resolvePending() helpers were retired
+// alongside the home-tab pending-list card. The Pending Reviews tab is
+// now the only place pending rows surface; its badge in the tab bar is
+// refreshed via refreshReviewsBadge() on every WS event.
 
 populatePersonRoomSelect();
 loadPersons();
-loadPending();
+refreshReviewsBadge();
 
 // ── NOTIFICATIONS (header bell) ───────────────────────────────────────────
 
@@ -1657,8 +1495,11 @@ function navigateToNotification(n) {
   const dd = document.getElementById("bell-dropdown");
   if (dd) dd.hidden = true;
   if (n.action === "open_pending") {
-    const card = document.getElementById("pending-card");
-    if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+    // Switch the user to the Pending Reviews tab (which replaced the
+    // old home-tab pending-list card) instead of scrolling to a card
+    // that no longer exists.
+    const btn = document.querySelector('.tab-btn[data-tab="reviews"]');
+    if (btn) btn.click();
   } else if (n.action === "open_person" && n.target_id) {
     const person = _personsCache.find((p) => p.id === n.target_id);
     if (person) openPersonProfile(person);
@@ -2841,17 +2682,44 @@ function renderPetCard(pet) {
   div.title = "Click for details + recent events";
   div.addEventListener("click", () => openPetLoreModal(pet));
 
-  // Where the pet "is". When we haven't seen them recently and the
-  // pet has an unmonitored_home, render with a hedge — matches the
-  // way where_is_pet's likely_room_inferred flag wants to be phrased.
-  let location = pet.last_seen_room || pet.likely_room || "?";
+  // Where the pet "is" — distinguish "currently visible" from
+  // "last seen N minutes ago in X" so the unseen / departed states
+  // actually tell Cole where the pet was last, not just "unseen".
+  const state = String(pet.state || "").toLowerCase();
+  const isSeen = state === "in_room_seen" || state === "present";
+  const lastRoom = pet.last_seen_room || pet.likely_room || "?";
+  const lastLandmark = pet.last_seen_landmark;
+  const lastAgo = formatRelativeTs(pet.last_seen_ts);
+
+  let location;
   let hedge = "";
-  if (pet.likely_room_inferred && pet.likely_room) {
-    location = pet.likely_room;
-    hedge = ' <span class="pet-hedge">(probably)</span>';
+  if (isSeen) {
+    location = lastRoom;
+    if (lastLandmark) location += ` · ${lastLandmark}`;
+  } else if (state === "departed") {
+    location = `departed · last seen in ${lastRoom}`;
+    if (lastLandmark) location += ` · ${lastLandmark}`;
+    if (pet.last_seen_ts) hedge = ` <span class="pet-hedge">${escapeHtml(lastAgo)}</span>`;
+  } else if (state === "unmonitored_zone" && pet.unmonitored_home) {
+    location = `probably in ${pet.unmonitored_home}`;
+    if (pet.last_seen_ts) {
+      hedge = ` <span class="pet-hedge">last seen in ${escapeHtml(lastRoom)} ${escapeHtml(lastAgo)}</span>`;
+    }
+  } else {
+    // in_room_unseen, ambiguous, or anything else — be explicit that
+    // this is a memory, not a live sighting.
+    location = `last seen in ${lastRoom}`;
+    if (lastLandmark) location += ` · ${lastLandmark}`;
+    if (pet.last_seen_ts) hedge = ` <span class="pet-hedge">${escapeHtml(lastAgo)}</span>`;
+    else hedge = ' <span class="pet-hedge">(no recent record)</span>';
   }
-  if (pet.last_seen_landmark) {
-    location += ` · ${pet.last_seen_landmark}`;
+  if (pet.likely_room_inferred && pet.likely_room && !isSeen
+      && state !== "unmonitored_zone" && state !== "departed") {
+    // Cost-function guess — fold it in as an extra hint so the user
+    // sees both the literal last sighting and the inferred likely room.
+    if (pet.likely_room !== pet.last_seen_room) {
+      hedge += ` <span class="pet-hedge">· probably ${escapeHtml(pet.likely_room)} now</span>`;
+    }
   }
 
   // Care chips — per-species subset only. Each chip shows "last seen N
@@ -2885,8 +2753,7 @@ function renderPetCard(pet) {
       <span class="pet-state ${stateClass}">${escapeHtml(pet.state || "?")}</span>
     </div>
     <div class="pet-row-where">
-      <span class="pet-where-label">in</span>
-      <span class="pet-where-room">${escapeHtml(location)}</span>${hedge}
+      <span class="pet-where-prefix">${isSeen ? "in " : ""}</span><span class="pet-where-room">${escapeHtml(location)}</span>${hedge}
     </div>
     <div class="pet-care">${chips}</div>
   `;
@@ -4225,6 +4092,8 @@ async function _loadBankStats() {
   }
 }
 
+let _reviewsPersons = [];
+
 async function loadReviewsTab() {
   const grid = document.getElementById("reviews-grid");
   const statsEl = document.getElementById("reviews-stats");
@@ -4239,11 +4108,33 @@ async function loadReviewsTab() {
   ]);
   _reviewsItems = items;
   _reviewsSelected.clear();
+  _reviewsPersons = persons;
+  // Keep _personsCache in sync so per-card dropdowns built via
+  // _personOptions() include current bank too — _personsCache is the
+  // canonical source for that helper and may not have been hydrated
+  // if the user lands on this tab first.
+  if (persons.length && _personsCache.length === 0) {
+    _personsCache = persons;
+    _personsCacheVersion += 1;
+  }
 
-  // Populate bulk-target dropdown with enrolled persons.
-  targetSel.innerHTML = persons
+  // Populate bulk-target dropdown with enrolled persons. Add the
+  // "+ new person…" sentinel as the last option so bulk-assign can
+  // create-and-attach in one click.
+  const bulkOpts = persons
     .map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)} (${p.face_samples} face samples)</option>`)
     .join("");
+  targetSel.innerHTML = bulkOpts +
+    `<option value="${NEW_PERSON_SENTINEL}">+ new person…</option>`;
+
+  // Show / hide the new-name input next to the bulk dropdown.
+  const bulkNewName = document.getElementById("reviews-bulk-new-name");
+  if (bulkNewName) {
+    bulkNewName.hidden = true;
+    bulkNewName.value = "";
+    targetSel.removeEventListener("change", _onBulkTargetChange);
+    targetSel.addEventListener("change", _onBulkTargetChange);
+  }
 
   // Per-person bank stats summary.
   if (statsEl) {
@@ -4264,6 +4155,19 @@ async function loadReviewsTab() {
   _updateReviewsCount();
 }
 
+function _onBulkTargetChange() {
+  const sel = document.getElementById("reviews-bulk-target");
+  const input = document.getElementById("reviews-bulk-new-name");
+  if (!sel || !input) return;
+  if (sel.value === NEW_PERSON_SENTINEL) {
+    input.hidden = false;
+    input.focus();
+  } else {
+    input.hidden = true;
+    input.value = "";
+  }
+}
+
 function _renderReviewCard(p) {
   const div = document.createElement("div");
   div.className = "review-card";
@@ -4276,6 +4180,8 @@ function _renderReviewCard(p) {
     : "";
   const bboxJson = p.face_bbox ? JSON.stringify(p.face_bbox) : "";
   const hasImg = p.has_image;
+  const preselectName = p.suggested_person_name || p.person_name || null;
+  const personOpts = _personOptions(preselectName);
   div.innerHTML = `
     <div class="review-head">
       <label class="review-check">
@@ -4295,19 +4201,59 @@ function _renderReviewCard(p) {
               data-x2="${p.face_bbox[2]}" data-y2="${p.face_bbox[3]}"></div>`
         : ""}
     </div>
+    <div class="review-assign">
+      <select class="dev-select review-person-sel">${personOpts}</select>
+      <input type="text" class="reminder-input review-new-name"
+             placeholder="New person name" hidden />
+      <button class="dev-btn review-quick" data-action="assign-this">Assign</button>
+    </div>
     <div class="review-foot">
-      <button class="dev-btn review-quick" data-action="suggested">Assign suggested</button>
+      ${p.suggested_person_name
+        ? `<button class="dev-btn review-quick" data-action="suggested">Assign suggested</button>`
+        : ""}
       <button class="dev-btn review-quick" data-action="reject">Reject</button>
     </div>
   `;
-  // Checkbox tracking.
   const cb = div.querySelector(".review-cb");
+  const sel = div.querySelector(".review-person-sel");
+  const newNameInput = div.querySelector(".review-new-name");
+
+  // Full-card click → toggle the checkbox. Excluded: the thumbnail
+  // (opens lightbox), buttons (have their own actions), and the
+  // per-card dropdown / new-name input (so clicking to focus them
+  // doesn't accidentally select). The checkbox label itself still
+  // works as a label, so a click on it does the toggle directly.
+  const _toggleSelection = () => {
+    cb.checked = !cb.checked;
+    cb.dispatchEvent(new Event("change"));
+  };
+  div.addEventListener("click", (e) => {
+    if (e.target.closest("button")) return;
+    if (e.target.closest(".review-thumb")) return;
+    if (e.target.closest(".review-person-sel")) return;
+    if (e.target.closest(".review-new-name")) return;
+    if (e.target.closest(".review-check")) return; // label handles it
+    _toggleSelection();
+  });
+
   cb.addEventListener("change", () => {
     if (cb.checked) _reviewsSelected.add(p.id);
     else _reviewsSelected.delete(p.id);
     _updateReviewsCount();
     div.classList.toggle("review-selected", cb.checked);
   });
+
+  // Per-card dropdown: switching to "+ new person…" reveals an input.
+  sel.addEventListener("change", () => {
+    if (sel.value === NEW_PERSON_SENTINEL) {
+      newNameInput.hidden = false;
+      newNameInput.focus();
+    } else {
+      newNameInput.hidden = true;
+      newNameInput.value = "";
+    }
+  });
+
   // Bbox overlay positioning.
   const img = div.querySelector(".review-thumb");
   const overlay = div.querySelector(".review-bbox");
@@ -4320,7 +4266,8 @@ function _renderReviewCard(p) {
   // Clicking the thumb opens the lightbox (with bbox).
   if (img && img.tagName === "IMG") {
     img.style.cursor = "zoom-in";
-    img.addEventListener("click", () => {
+    img.addEventListener("click", (e) => {
+      e.stopPropagation();
       openImageLightbox(
         `/api/identity/pending/${p.id}/image.jpg`,
         p.suggested_person_name || (isCluster ? `Cluster #${p.cluster_id}` : `Drift on ${p.person_name}`),
@@ -4329,17 +4276,14 @@ function _renderReviewCard(p) {
       );
     });
   }
-  // Quick action buttons.
+  // Per-card action buttons.
   div.querySelectorAll(".review-quick").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       const action = btn.dataset.action;
       try {
         if (action === "suggested") {
-          if (!p.suggested_person_name) {
-            alert("No suggestion available — select from bulk dropdown above.");
-            return;
-          }
+          if (!p.suggested_person_name) return;
           await fetch(`/api/identity/pending/${p.id}/resolve`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -4348,6 +4292,33 @@ function _renderReviewCard(p) {
               target_name: p.suggested_person_name,
             }),
           });
+        } else if (action === "assign-this") {
+          let target = sel.value;
+          if (target === NEW_PERSON_SENTINEL) {
+            target = (newNameInput.value || "").trim();
+            if (!target) {
+              newNameInput.focus();
+              return;
+            }
+            const collision = _personsCache.find(
+              (pp) => pp.name && pp.name.toLowerCase() === target.toLowerCase(),
+            );
+            if (collision) {
+              if (!confirm(
+                `'${target}' will reuse the existing person '${collision.name}'.\n` +
+                `If this is genuinely a different person with the same name, ` +
+                `pick a distinct label first (e.g. '${target} S').\n\nProceed?`,
+              )) return;
+              target = collision.name;
+            }
+          }
+          if (!target) return;
+          await fetch(`/api/identity/pending/${p.id}/resolve`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "assign", target_name: target }),
+          });
+          loadPersons();
         } else if (action === "reject") {
           await fetch(`/api/identity/pending/${p.id}/resolve`, {
             method: "POST",
@@ -4356,9 +4327,12 @@ function _renderReviewCard(p) {
           });
         }
         div.classList.add("review-resolving");
-        setTimeout(() => div.remove(), 200);
-      } catch (e) {
-        console.warn("[reviews] quick action failed:", e);
+        setTimeout(() => {
+          div.remove();
+          refreshReviewsBadge();
+        }, 200);
+      } catch (err) {
+        console.warn("[reviews] quick action failed:", err);
       }
     });
   });
@@ -4398,10 +4372,33 @@ function _updateReviewsCount() {
       setStatus("Nothing selected.", "err");
       return;
     }
-    const target = action === "assign" ? targetSel.value : null;
-    if (action === "assign" && !target) {
-      setStatus("Pick a person for the bulk target.", "err");
-      return;
+    let target = action === "assign" ? targetSel.value : null;
+    if (action === "assign") {
+      if (target === NEW_PERSON_SENTINEL) {
+        const newName = document.getElementById("reviews-bulk-new-name");
+        const typed = newName ? newName.value.trim() : "";
+        if (!typed) {
+          if (newName) newName.focus();
+          setStatus("Type a name for the new person.", "err");
+          return;
+        }
+        const collision = _personsCache.find(
+          (pp) => pp.name && pp.name.toLowerCase() === typed.toLowerCase(),
+        );
+        if (collision) {
+          if (!confirm(
+            `'${typed}' will reuse the existing person '${collision.name}'.\n` +
+            `Proceed (re-uses) or cancel and pick a distinct label?`,
+          )) return;
+          target = collision.name;
+        } else {
+          target = typed;
+        }
+      }
+      if (!target) {
+        setStatus("Pick a person for the bulk target.", "err");
+        return;
+      }
     }
     setStatus(`Processing ${ids.length}…`);
     assignBtn.disabled = rejectBtn.disabled = true;
@@ -4423,6 +4420,9 @@ function _updateReviewsCount() {
       // Reload the tab so resolved rows disappear and stats refresh.
       await loadReviewsTab();
       refreshReviewsBadge();
+      // Bulk-creating a new person? Re-fetch the persons cache so
+      // any future per-card dropdowns include the new name.
+      if (action === "assign") loadPersons();
     } catch (e) {
       setStatus(`Failed: ${e.message || e}`, "err");
     } finally {
