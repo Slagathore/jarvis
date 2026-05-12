@@ -92,6 +92,7 @@
           <button class="dev-btn" id="reviews-bulk-assign">Assign selected</button>
           <button class="dev-btn" id="reviews-bulk-reject">Reject selected</button>
           <button class="dev-btn" id="reviews-collapse" title="Cluster similar embeddings and reject duplicates so you don't have to review the same face 50 times">Collapse duplicates</button>
+          <button class="dev-btn" id="reviews-prune-bank" title="Harm-based prune: drop near-duplicate samples from every person's face bank (≥0.97 cosine). Reduces over-fit when one pose dominates the bank.">Prune redundant bank samples</button>
           <button class="dev-btn reviews-nuke" id="reviews-reject-all" title="Reject EVERY unresolved pending row. Nuclear option for runaway queues.">Reject ALL</button>
           <span class="reviews-status" id="reviews-status"></span>
           <span class="reviews-stats" id="reviews-stats"></span>

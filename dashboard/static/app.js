@@ -4459,6 +4459,36 @@ function _updateReviewsCount() {
       }
     });
   }
+  const pruneBtn = document.getElementById("reviews-prune-bank");
+  if (pruneBtn) {
+    pruneBtn.addEventListener("click", async () => {
+      if (!confirm(
+        "Drop near-duplicate face samples (≥0.97 cosine) from every " +
+        "person's bank?\n\nKeeps the oldest representative of each " +
+        "near-duplicate pair. Safe to run repeatedly — the cap (60 " +
+        "face / 40 voice) limits growth, this just trims the over-" +
+        "represented poses that pull centroids the wrong direction.",
+      )) return;
+      pruneBtn.disabled = true;
+      setStatus("Pruning…");
+      try {
+        const res = await fetch("/api/identity/bank_prune", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ modality: "both" }),
+        });
+        const body = await res.json();
+        const total = (body.results || [])
+          .reduce((acc, r) => acc + (r.total_dropped || 0), 0);
+        setStatus(`Pruned ${total} redundant sample(s).`, total ? "ok" : "");
+        await loadReviewsTab();
+      } catch (e) {
+        setStatus(`Prune failed: ${e.message || e}`, "err");
+      } finally {
+        pruneBtn.disabled = false;
+      }
+    });
+  }
   if (rejectAllBtn) {
     rejectAllBtn.addEventListener("click", async () => {
       if (!confirm(

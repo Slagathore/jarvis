@@ -944,6 +944,50 @@ class DashboardServer:
             })
             return JSONResponse(result)
 
+        @app.post("/api/identity/bank_prune")
+        async def identity_bank_prune(request: Request):
+            """Harm-based eviction pass: drop near-duplicate samples
+            from every person's face (and optionally voice) bank. The
+            standard add-path keeps the cap at 60 face / 40 voice;
+            this endpoint sweeps existing rows that snuck in over the
+            cap (resolved before the cap-evict path landed) or that
+            converged on each other after enrollment.
+
+            Body: {modality?: "face"|"voice"|"both" = "face",
+                   person_id?: int, threshold?: float}
+            Returns a per-person count of dropped rows.
+            """
+            ident = self._identity
+            if ident is None:
+                raise HTTPException(status_code=503, detail="Identity not available")
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            modality = str(body.get("modality") or "face")
+            pid = body.get("person_id")
+            try:
+                pid = int(pid) if pid is not None else None
+            except (TypeError, ValueError):
+                pid = None
+            threshold = body.get("threshold")
+            try:
+                threshold = float(threshold) if threshold is not None else None
+            except (TypeError, ValueError):
+                threshold = None
+            modalities = (
+                ["face", "voice"] if modality == "both" else [modality]
+            )
+            results: list[dict] = []
+            for m in modalities:
+                if m not in ("face", "voice"):
+                    continue
+                results.append(await ident.prune_bank_redundancy(
+                    person_id=pid, modality=m, threshold=threshold,
+                ))
+            await self.broadcast({"type": "identity_bank_pruned"})
+            return JSONResponse({"results": results})
+
         @app.get("/api/identity/bank_stats")
         async def identity_bank_stats():
             """Per-person sample count + dimensional health so the

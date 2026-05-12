@@ -74,7 +74,10 @@ ACTIVE_FACE_EMBEDDING_DIM = 512
 # preventing both bank bloat and the silent-overfit failure where a
 # person's centroid drifts toward whatever pose was most recently
 # captured. Override per-person via config.identity.face.* if needed.
-SAMPLES_PER_PERSON_MAX = 30        # capacity cap; matches §10 default
+SAMPLES_PER_PERSON_MAX = 60        # capacity cap (bumped 30→60: with
+                                   # multiple residents who look anything
+                                   # alike, 30 wasn't enough headroom for
+                                   # the margin gate to settle)
 SAMPLES_DIVERSITY_THRESHOLD = 0.95  # reject candidate if max sim ≥ this
 ENROLLMENT_QUALITY_GATES = {
     "min_face_area_px":      80 * 80,   # face crop must be ≥ 80×80
@@ -88,8 +91,19 @@ ENROLLMENT_QUALITY_GATES = {
 # threshold + smaller cap because voice clips have less effective
 # entropy than face crops. Quality gates are duration / SNR / VAD /
 # music — gated by the YAMNet pass per §10.
-VOICE_SAMPLES_PER_PERSON_MAX = 20
+VOICE_SAMPLES_PER_PERSON_MAX = 40
 VOICE_SAMPLES_DIVERSITY_THRESHOLD = 0.92
+
+# Pairwise cosine above which a face/voice sample is considered
+# redundant with another in the same person's bank — the harm-based
+# prune pass keeps only one representative from each near-duplicate
+# pair. Tighter than SAMPLES_DIVERSITY_THRESHOLD (which gates fresh
+# enrollment) because removing a real-but-tight sample is more
+# expensive than rejecting a fresh near-duplicate would have been.
+PRUNE_REDUNDANCY_THRESHOLD = {
+    "face": 0.97,
+    "voice": 0.95,
+}
 
 # Pending-cluster merge threshold — if a new unknown sample's cosine to an
 # existing pending-cluster centroid is at least this, fold into that cluster
@@ -640,17 +654,22 @@ class IdentityManager:
             logger.warning(f"[Identity] enroll_face '{name}' — no face detected")
             return None
         pid = await self.ensure_person(name)
-        sample_id = await self._db.execute(
-            "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source, image_jpeg, model_version) "
-            "VALUES (?, ?, ?, ?, 'enroll', ?, ?)",
-            (
-                pid, emb.astype(np.float32).tobytes(), pose, _now_iso(),
-                _jpeg(frame), ACTIVE_FACE_MODEL_VERSION,
-            ),
+        # Route through _save_sample so the cap+evict path is shared
+        # with drift-capture / live_question / pending-resolve inserts.
+        await self._save_sample(
+            modality="face",
+            person_id=pid,
+            emb=emb,
+            source="enroll",
+            pose=pose,
+            image_jpeg=_jpeg(frame),
         )
-        self._face_samples.setdefault(pid, []).append(emb.astype(np.float32))
-        logger.info(f"[Identity] Enrolled face for '{name}' (pose={pose}, id={sample_id})")
-        return sample_id
+        logger.info(f"[Identity] Enrolled face for '{name}' (pose={pose})")
+        # Caller used the return value only for logging in some paths;
+        # the new row's id isn't easily fetchable without a SELECT.
+        # Return person_id so callers that branched on truthiness still
+        # work (they all check `is None`).
+        return pid
 
     async def enroll_voice(
         self, name: str, audio: np.ndarray, prompt_id: str = "wake"
@@ -660,14 +679,15 @@ class IdentityManager:
             logger.warning(f"[Identity] enroll_voice '{name}' — embedding failed")
             return None
         pid = await self.ensure_person(name)
-        sample_id = await self._db.execute(
-            "INSERT INTO voice_samples (person_id, embedding, prompt_id, captured_at, source) "
-            "VALUES (?, ?, ?, ?, 'enroll')",
-            (pid, emb.astype(np.float32).tobytes(), prompt_id, _now_iso()),
+        await self._save_sample(
+            modality="voice",
+            person_id=pid,
+            emb=emb,
+            source="enroll",
+            prompt_id=prompt_id,
         )
-        self._voice_samples.setdefault(pid, []).append(emb.astype(np.float32))
-        logger.info(f"[Identity] Enrolled voice for '{name}' (prompt={prompt_id}, id={sample_id})")
-        return sample_id
+        logger.info(f"[Identity] Enrolled voice for '{name}' (prompt={prompt_id})")
+        return pid
 
     # ── §10 auto-enrollment (diversity-replacement coreset) ─────────────────
 
@@ -985,8 +1005,24 @@ class IdentityManager:
         prompt_id: Optional[str] = None,
         image_jpeg: Optional[bytes] = None,
     ) -> None:
+        """Single insert path for face + voice samples. Enforces the
+        per-person cap by evicting the most-redundant existing sample
+        when at capacity — the user explicitly assigned this row
+        (live_question / drift_capture / enroll), so we trust it and
+        don't reject; we just make room.
+
+        Pre-bump (cap=30) inserts ignored the cap entirely and the
+        bank grew unbounded — large pending-cluster resolutions could
+        add 50+ samples in one go and bias the centroid toward
+        whatever pose was dominant in that cluster."""
         emb_f32 = emb.astype(np.float32)
         if modality == "voice":
+            cap = int(VOICE_SAMPLES_PER_PERSON_MAX)
+            existing = list(self._voice_samples.get(person_id, []))
+            if len(existing) >= cap and len(existing) > 0:
+                await self._evict_most_redundant(
+                    modality="voice", person_id=person_id, existing=existing,
+                )
             await self._db.execute(
                 "INSERT INTO voice_samples (person_id, embedding, prompt_id, captured_at, source) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -994,6 +1030,12 @@ class IdentityManager:
             )
             self._voice_samples.setdefault(person_id, []).append(emb_f32)
         else:
+            cap = int(SAMPLES_PER_PERSON_MAX)
+            existing = list(self._face_samples.get(person_id, []))
+            if len(existing) >= cap and len(existing) > 0:
+                await self._evict_most_redundant(
+                    modality="face", person_id=person_id, existing=existing,
+                )
             await self._db.execute(
                 "INSERT INTO face_samples (person_id, embedding, pose, captured_at, source, image_jpeg, model_version) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1003,6 +1045,141 @@ class IdentityManager:
                 ),
             )
             self._face_samples.setdefault(person_id, []).append(emb_f32)
+
+    async def _evict_most_redundant(
+        self, modality: str, person_id: int, existing: list[np.ndarray],
+    ) -> None:
+        """Drop the in-memory + DB row for the highest-redundancy
+        sample in this person's bank. Order in self._{face,voice}_samples
+        mirrors the SELECT order in _reload_caches (rowid ASC), so we
+        re-query by id to find the row matching the redundant index."""
+        if not existing:
+            return
+        idx = _most_redundant_index(existing)
+        if modality == "voice":
+            rows = await self._db.fetchall(
+                "SELECT id FROM voice_samples WHERE person_id = ? "
+                "ORDER BY id ASC",
+                (person_id,),
+            )
+            table = "voice_samples"
+            cache = self._voice_samples
+        else:
+            rows = await self._db.fetchall(
+                "SELECT id FROM face_samples WHERE person_id = ? "
+                "AND model_version = ? ORDER BY id ASC",
+                (person_id, ACTIVE_FACE_MODEL_VERSION),
+            )
+            table = "face_samples"
+            cache = self._face_samples
+        if idx >= len(rows):
+            return
+        evict_id = int(rows[idx]["id"])
+        await self._db.execute(
+            f"DELETE FROM {table} WHERE id = ?", (evict_id,),
+        )
+        # Drop from in-memory cache too.
+        bank = cache.get(person_id, [])
+        if idx < len(bank):
+            del bank[idx]
+        logger.debug(
+            f"[Identity] {modality} cap-evict: dropped sample id={evict_id} "
+            f"for person {person_id} (most redundant of {len(rows)})"
+        )
+
+    async def prune_bank_redundancy(
+        self,
+        person_id: Optional[int] = None,
+        modality: str = "face",
+        threshold: Optional[float] = None,
+    ) -> dict:
+        """Harm-based eviction pass: scan a person's (or every
+        person's) sample bank and remove near-duplicate rows whose
+        pairwise cosine ≥ threshold. Each near-duplicate pair keeps
+        the older / first-inserted representative — younger ones are
+        more likely to come from drift-capture or live_question paths
+        that didn't pass the full quality gates.
+
+        This is the maintenance pass Cole asked for: don't evict when
+        not at capacity unless a sample is doing more harm than good.
+        High redundancy is the harm signal — duplicates pull the
+        centroid toward whatever pose was over-sampled, which is
+        exactly the failure mode where margin gates start rejecting
+        legitimate matches.
+        """
+        thr = float(
+            threshold
+            if threshold is not None
+            else PRUNE_REDUNDANCY_THRESHOLD.get(modality, 0.97)
+        )
+        if modality == "voice":
+            cache = self._voice_samples
+            table = "voice_samples"
+            where_extra = ""
+            params_extra: tuple = ()
+        else:
+            cache = self._face_samples
+            table = "face_samples"
+            where_extra = " AND model_version = ?"
+            params_extra = (ACTIVE_FACE_MODEL_VERSION,)
+
+        targets = [person_id] if person_id is not None else list(cache.keys())
+        total_dropped = 0
+        per_person: dict[int, int] = {}
+        for pid in targets:
+            embs = list(cache.get(pid, []))
+            if len(embs) < 2:
+                continue
+            # Find the actual DB ids in the same order as the cache.
+            rows = await self._db.fetchall(
+                f"SELECT id FROM {table} WHERE person_id = ?{where_extra} "
+                "ORDER BY id ASC",
+                (pid, *params_extra),
+            )
+            if len(rows) != len(embs):
+                # Cache and DB drifted (rare; rebuild bank in-memory).
+                logger.debug(
+                    f"[Identity] prune skipped person {pid}: cache/DB "
+                    f"row count mismatch ({len(embs)} vs {len(rows)})"
+                )
+                continue
+            row_ids = [int(r["id"]) for r in rows]
+            # Greedy near-duplicate pass: walk samples by age (oldest
+            # first), drop any later sample whose cosine to a kept
+            # one is ≥ threshold. The oldest representative stays.
+            kept_indices: list[int] = []
+            dropped_ids: list[int] = []
+            for i, e in enumerate(embs):
+                is_dup = False
+                for k in kept_indices:
+                    if _cosine(e, embs[k]) >= thr:
+                        is_dup = True
+                        break
+                if is_dup:
+                    dropped_ids.append(row_ids[i])
+                else:
+                    kept_indices.append(i)
+            if dropped_ids:
+                placeholders = ",".join("?" for _ in dropped_ids)
+                await self._db.execute(
+                    f"DELETE FROM {table} WHERE id IN ({placeholders})",
+                    tuple(dropped_ids),
+                )
+                cache[pid] = [embs[k] for k in kept_indices]
+                per_person[pid] = len(dropped_ids)
+                total_dropped += len(dropped_ids)
+        if total_dropped:
+            logger.info(
+                f"[Identity] {modality} bank prune: dropped {total_dropped} "
+                f"redundant sample(s) across {len(per_person)} person(s) "
+                f"(threshold={thr:.2f})"
+            )
+        return {
+            "modality": modality,
+            "threshold": thr,
+            "total_dropped": total_dropped,
+            "per_person": per_person,
+        }
 
     # ── pending clusters (for unknown samples) ──────────────────────────────
 
