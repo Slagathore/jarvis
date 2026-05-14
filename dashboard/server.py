@@ -51,6 +51,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
+from core.async_utils import TrackedTaskSet
+
 try:
     import cv2
     _CV2_AVAILABLE = True
@@ -67,6 +69,11 @@ class DashboardServer:
         self.port = port
         self.app = FastAPI(title="Jarvis Dashboard", docs_url=None, redoc_url=None)
         self._clients: list[WebSocket] = []
+        # Tracks fire-and-forget tasks the dashboard spawns from HTTP
+        # handlers (chat, voice-switch). Anchors them against GC and
+        # surfaces any exceptions through the project logger instead of
+        # the silent "Task exception was never retrieved" warning.
+        self._bg_tasks = TrackedTaskSet(label="Dashboard")
         self._state: dict = self._default_state()
         self._conversation: list[dict] = []  # Last 50 messages
         self._max_conversation = 50
@@ -585,7 +592,10 @@ class DashboardServer:
             text = str(body.get("text", "")).strip()
             room = str(body.get("room", "office"))
             if text and self._chat_handler:
-                asyncio.create_task(self._chat_handler(text, room))
+                self._bg_tasks.spawn(
+                    self._chat_handler(text, room),
+                    name=f"dashboard.chat:{room}",
+                )
             return JSONResponse({"ok": True})
 
         @app.get("/api/voices")
@@ -600,7 +610,10 @@ class DashboardServer:
             body = await request.json()
             voice = str(body.get("voice", "")).strip()
             if voice and self._voice_handler:
-                asyncio.create_task(self._voice_handler(voice))
+                self._bg_tasks.spawn(
+                    self._voice_handler(voice),
+                    name=f"dashboard.voice:{voice}",
+                )
                 self._active_voice = voice
             return JSONResponse({"ok": True, "voice": voice})
 

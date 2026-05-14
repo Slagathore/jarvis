@@ -34,6 +34,7 @@ import numpy as np
 from loguru import logger
 from scipy.optimize import linear_sum_assignment
 
+from core.async_utils import TrackedTaskSet
 from modules.world_model.geometry import bbox_center, bbox_iou, point_in_polygon
 from modules.world_model.store import WorldStore
 from modules.world_model.types import (
@@ -223,6 +224,9 @@ class WorldModel:
         # Background tasks the model owns; cancelled in stop().
         self._timer_task: Optional[asyncio.Task] = None
         self._snapshot_task: Optional[asyncio.Task] = None
+        # Fire-and-forget enrollment hand-offs to IdentityManager. Tracked
+        # so they survive GC, log their exceptions, and shut down cleanly.
+        self._bg_tasks = TrackedTaskSet(label="WorldModel")
         self._stopped = False
 
     # ── Topology ───────────────────────────────────────────────────────────
@@ -312,6 +316,10 @@ class WorldModel:
                     pass
         self._timer_task = None
         self._snapshot_task = None
+        try:
+            await self._bg_tasks.shutdown(timeout=2.0)
+        except Exception as e:
+            logger.debug(f"[WorldModel] bg-task drain failed: {e}")
 
     async def _load_from_store(self) -> None:
         """Hydrate entities from disk. Every PRESENT entity becomes
@@ -623,7 +631,10 @@ class WorldModel:
                     >= self.cfg.get("enrollment_min_conf", 0.85)
                 and obs.metadata.get("crop_path")
                 and obs.metadata.get("face_embedding") is not None):
-            asyncio.create_task(self._enroll_async(obs, attribution_conf))
+            self._bg_tasks.spawn(
+                self._enroll_async(obs, attribution_conf),
+                name=f"world.enroll:{obs.person_id}",
+            )
 
     async def _enroll_async(
         self, obs: Observation, attribution_conf: float,

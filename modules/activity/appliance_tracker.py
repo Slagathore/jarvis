@@ -35,12 +35,13 @@ Variables:
 #todo: Add per-room appliance assignment (which room's mic hears which appliance)
 """
 
-import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 from loguru import logger
+
+from core.async_utils import TrackedTaskSet
 
 # Minimum seconds of detected sound before marking appliance as "running"
 MIN_RUNNING_SECONDS: float = 15.0
@@ -95,6 +96,10 @@ class ApplianceTracker:
         self._states: dict[str, ApplianceState] = {
             name: ApplianceState(name=name) for name in KNOWN_APPLIANCES
         }
+        # Fire-and-forget publish tasks spawned from the sync _transition
+        # path. Tracking keeps them anchored against GC and surfaces any
+        # exception in publish() through the logger.
+        self._bg_tasks = TrackedTaskSet(label="ApplianceTracker")
 
     def update(self, classifications: list[dict]) -> None:
         """
@@ -174,8 +179,9 @@ class ApplianceTracker:
                         f"[Appliance] {appliance} done "
                         f"(ran {runtime_minutes:.1f}min)"
                     )
-                    asyncio.create_task(
-                        self._publish_done(appliance, runtime_minutes)
+                    self._bg_tasks.spawn(
+                        self._publish_done(appliance, runtime_minutes),
+                        name=f"appliance.publish:{appliance}",
                     )
 
             elif state.status == "done":

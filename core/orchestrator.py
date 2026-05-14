@@ -83,6 +83,7 @@ import httpx
 import numpy as np
 from loguru import logger
 
+from core.async_utils import TrackedTaskSet
 from core.event_bus import EventBus
 from core.exceptions import JarvisError
 from dashboard.server import DashboardServer
@@ -356,6 +357,11 @@ class Orchestrator:
         # fire ONE capture for the loudest (highest-confidence) room.
         self._pending_wakes: list[dict] = []
         self._wake_window_task: Optional[asyncio.Task] = None
+        # Tracks fire-and-forget tasks the orchestrator spawns
+        # (memory extraction, listen-followup, scene-narration). Anchors
+        # them against GC, logs their exceptions, and gets them cancelled
+        # cleanly in _shutdown.
+        self._bg_tasks = TrackedTaskSet(label="Orchestrator")
         # Continuous-conversation follow-up listener: after each TTS reply,
         # we open a window where the user can speak again without re-saying
         # the wake word. The depth counter tracks how nested we are; we don't
@@ -1544,10 +1550,11 @@ class Orchestrator:
         # Fire-and-forget memory extraction. Runs the curator LLM call in the
         # background so the user-facing TTS reply isn't gated on it.
         if self.memory is not None:
-            asyncio.create_task(
+            self._bg_tasks.spawn(
                 self.memory.extract_from_turn(
                     user_text=text, assistant_text=response, room=room
-                )
+                ),
+                name=f"memory.extract:{room}",
             )
 
         await self._speak(response, room=room, priority="conversation")
@@ -3444,7 +3451,7 @@ class Orchestrator:
                         # to a human and totally worth the unblocked pipeline.
                         prior_state = self._scene_state.get(room_id) or {}
                         last_desc = prior_state.get("description")
-                        asyncio.create_task(
+                        self._bg_tasks.spawn(
                             self._run_scene_pipeline_bg(
                                 room_id=room_id,
                                 frame=frame,
@@ -4768,7 +4775,10 @@ class Orchestrator:
                 # Fire-and-forget — _listen_followup acquires the wake lock
                 # internally so it serializes with normal wake captures and
                 # any other follow-up that's already running.
-                asyncio.create_task(self._listen_followup(room))
+                self._bg_tasks.spawn(
+                    self._listen_followup(room),
+                    name=f"listen_followup:{room}",
+                )
 
         except Exception as e:
             logger.error(f"[TTS] Speak error: {e}")
@@ -5036,6 +5046,14 @@ class Orchestrator:
             except (asyncio.CancelledError, Exception):
                 pass
         self._pending_wakes = []
+        # Cancel tracked background tasks (memory extraction, follow-up
+        # listeners, scene-pipeline jobs). Bounded so a hung task can't
+        # stall shutdown — the outer _shutdown is itself wrapped in an
+        # 8s asyncio.wait_for.
+        try:
+            await self._bg_tasks.shutdown(timeout=2.0)
+        except Exception as e:
+            logger.debug(f"[Shutdown] background-task drain failed: {e}")
         if self.wake:
             self.wake.stop()
         if self.wake_sources is not None:
