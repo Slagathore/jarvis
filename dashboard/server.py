@@ -83,6 +83,14 @@ class DashboardServer:
         self._active_voice: str = ""
         self._camera_manager = None  # Set by orchestrator via register_camera_manager()
         self._camera_jpeg_quality = 70
+        # Short-lived JPEG cache for /api/camera/{room}/snapshot.jpg. When
+        # multiple browser tabs poll the same room (or one tab polls
+        # faster than the camera produces new frames), this short-circuits
+        # the cv2.imencode + cm.capture_frame_async pair entirely. TTL is
+        # well under one camera frame interval, so user-perceptible
+        # latency is unchanged.
+        self._snapshot_cache: dict[str, tuple[float, bytes]] = {}
+        self._snapshot_cache_ttl_s: float = 0.15
         self._mic_manager = None     # Set by orchestrator via register_mic_manager()
         self._speaker_manager = None # Set by orchestrator via register_speaker_manager()
         self._room_settings = None   # Set by orchestrator via register_room_settings()
@@ -1695,14 +1703,29 @@ class DashboardServer:
                 raise HTTPException(status_code=503, detail="Camera manager not registered")
             if room not in cm.get_available_rooms():
                 raise HTTPException(status_code=404, detail=f"No camera for '{room}'")
+            # Short-TTL cache: dedupes back-to-back polls (multiple tabs,
+            # fast clients) without re-running capture+encode for each.
+            import time as _t
+            now = _t.monotonic()
+            cached = self._snapshot_cache.get(room)
+            if cached is not None:
+                cached_at, jpeg_bytes = cached
+                if now - cached_at < self._snapshot_cache_ttl_s:
+                    return Response(
+                        content=jpeg_bytes,
+                        media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"},
+                    )
             frame = await cm.capture_frame_async(room)
             if frame is None:
                 raise HTTPException(status_code=502, detail="Frame capture failed")
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self._camera_jpeg_quality])
             if not ok:
                 raise HTTPException(status_code=500, detail="JPEG encode failed")
+            jpeg_bytes = buf.tobytes()
+            self._snapshot_cache[room] = (now, jpeg_bytes)
             return Response(
-                content=buf.tobytes(),
+                content=jpeg_bytes,
                 media_type="image/jpeg",
                 headers={"Cache-Control": "no-store"},
             )

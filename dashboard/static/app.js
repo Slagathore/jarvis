@@ -22,6 +22,55 @@
 // Keeps the latest room data so updateRooms always renders the full set
 let roomsCache = {};
 
+// ── Visibility-aware polling ──────────────────────────────────────────────
+// All recurring dashboard polls go through safeInterval() so they:
+//  1. Pause while the browser tab is hidden — Chrome throttles background
+//     timers but the snapshot poll still triggers camera reads + JPEG
+//     encoding on the server every tick. We want the work to stop, not
+//     just slow down.
+//  2. Skip a tick if the previous run hasn't finished (in-flight guard) —
+//     a slow LLM/DB request used to stack up callbacks behind a 5s poll.
+//  3. Fire once on visibility return so the UI refreshes immediately
+//     instead of waiting for the next interval tick.
+const _safeIntervals = [];
+function safeInterval(fn, intervalMs) {
+  const entry = { fn, intervalMs, timer: null, running: false };
+  const tick = async () => {
+    if (document.hidden || entry.running) return;
+    entry.running = true;
+    try {
+      await fn();
+    } catch (e) {
+      console.warn("[safeInterval]", e);
+    } finally {
+      entry.running = false;
+    }
+  };
+  entry.timer = setInterval(tick, intervalMs);
+  _safeIntervals.push(entry);
+  return entry;
+}
+function stopSafeInterval(entry) {
+  if (!entry) return;
+  if (entry.timer) clearInterval(entry.timer);
+  const idx = _safeIntervals.indexOf(entry);
+  if (idx >= 0) _safeIntervals.splice(idx, 1);
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  // Tab just became visible — run every safeInterval once so the user
+  // doesn't stare at stale data while waiting for the next tick.
+  _safeIntervals.forEach((e) => {
+    if (e.running) return;
+    try {
+      const r = e.fn();
+      if (r && typeof r.then === "function") r.catch(() => {});
+    } catch (err) {
+      console.warn("[safeInterval:visible]", err);
+    }
+  });
+});
+
 // ── WebSocket Connection ───────────────────────────────────────────────────
 
 const WS_URL = `ws://${window.location.host}/ws`;
@@ -455,9 +504,9 @@ function renderWakeCalibration(rooms) {
 }
 
 loadDegradedStatus();
-setInterval(loadDegradedStatus, 5000);
+safeInterval(loadDegradedStatus, 5000);
 loadWakeCalibration();
-_wakeCalibrationTimer = setInterval(loadWakeCalibration, 3000);
+_wakeCalibrationTimer = safeInterval(loadWakeCalibration, 3000);
 
 // Set of room IDs that have a camera CONFIGURED (not necessarily currently
 // streaming). Populated from /api/cameras at startup so the reconnect
@@ -624,17 +673,24 @@ function refreshRoomFeeds() {
   imgs.forEach((img) => {
     const room = img.dataset.room;
     if (!room) return;
+    // In-flight guard: if the previous snapshot for this room is still
+    // loading, skip this tick rather than abandoning the request and
+    // stacking another one. Stale dataset is cleared on load/error.
+    if (img.dataset.loading === "1") return;
     const card = document.getElementById(`room-${room}`);
     img.onerror = () => {
+      img.dataset.loading = "";
       img.classList.add("dead");
       // Mark the whole card so the ⟳ button can pulse via CSS — the
       // user needs to spot it without thinking when a feed dies.
       if (card) card.classList.add("offline");
     };
     img.onload = () => {
+      img.dataset.loading = "";
       img.classList.remove("dead");
       if (card) card.classList.remove("offline");
     };
+    img.dataset.loading = "1";
     img.src = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?t=${stamp}`;
     // Wire click → lightbox (once). The dashboard down-scales 1080p
     // Wyze frames to ~640px; the lightbox shows the original snapshot
@@ -657,13 +713,15 @@ function refreshRoomFeeds() {
   });
 }
 
-// 250ms = ~4 fps in the dashboard. Smooth enough for "is something
-// happening in this room" without thrashing the JPEG encoder. Capture-side
-// rate is independent (config: rooms[].fps_active); for the office webcam
-// at 30fps capture, this gives ~4fps in the browser because the snapshot
-// endpoint takes a fresh frame per request and the network round trip
-// dominates. Bump if you want a smoother feed.
-setInterval(refreshRoomFeeds, 250);
+// 500ms = 2 fps. The dashboard is a "what's happening in each room"
+// status board, not a video player — humans can't perceive motion
+// smoothness much below ~10fps and we're nowhere near that anyway. The
+// 4fps we used to ship triggered cv2.imencode + a fresh camera read on
+// the server eight times per second total across rooms, even when the
+// tab was hidden. safeInterval pauses on document.hidden, the in-flight
+// guard above prevents stacking when the snapshot endpoint is slow, and
+// the orchestrator-side TTL cache deduplicates back-to-back requests.
+safeInterval(refreshRoomFeeds, 500);
 
 function updateRoomVision(roomId, data) {
   // Vision events imply the room has a camera, so make sure has_camera sticks
@@ -862,7 +920,7 @@ function updateClock() {
   }
 }
 
-setInterval(updateClock, 1000);
+safeInterval(updateClock, 1000);
 updateClock();
 
 // ── Voice Switcher ────────────────────────────────────────────────────────
@@ -1057,7 +1115,7 @@ if (reminderTextEl) {
 if (reminderAddBtn) reminderAddBtn.addEventListener("click", submitReminder);
 
 // Re-render every 30s so "in 5m" labels stay current
-setInterval(renderReminders, 30000);
+safeInterval(renderReminders, 30000);
 loadReminders();
 
 // ── Calendar ──────────────────────────────────────────────────────────────
@@ -1116,7 +1174,7 @@ function formatCalendarWhen(when, now) {
   return when.toLocaleString("en-US", { month: "short", day: "numeric", ...opts });
 }
 
-setInterval(loadCalendar, 5 * 60 * 1000);  // refresh every 5 min
+safeInterval(loadCalendar, 5 * 60 * 1000);  // refresh every 5 min
 loadCalendar();
 
 // ── Config editor ─────────────────────────────────────────────────────────
@@ -2111,7 +2169,7 @@ loadModels();
 // Periodic refresh — picks up models pulled via the Ollama CLI (or by
 // other means outside the dashboard) without needing a page reload.
 // 30s is frequent enough to feel "live" without spamming the daemon.
-setInterval(loadModels, 30000);
+safeInterval(loadModels, 30000);
 
 // ── MODEL TUNE MODAL (sampling params + thinking) ─────────────────────────
 
@@ -2788,7 +2846,7 @@ if (personaResumeNo) {
 // Re-fetch personas on connection + every 10s so other sessions
 // (auto-revert, dashboard tabs) stay in sync.
 loadPersonas();
-setInterval(loadPersonas, 10000);
+safeInterval(loadPersonas, 10000);
 
 // ── Pets (World Model §22) ────────────────────────────────────────────────
 // Render every resident cat + dog with current state, likely-room
@@ -2945,7 +3003,7 @@ loadPets();
 // 30s cadence — care-summary chips don't need real-time updates
 // (food/litterbox events fire on the order of hours), state changes
 // flow in via the WebSocket world.entity_event handler below.
-setInterval(loadPets, 30000);
+safeInterval(loadPets, 30000);
 
 // ── Pet lore card modal ───────────────────────────────────────────────────
 // Click a pet row → open a modal with the full seed metadata (color,
@@ -3837,7 +3895,7 @@ async function loadWorldEvents() {
 loadWorldEvents();
 // 5s cadence so landmark dwell events appear quickly during dev. Cheap:
 // the endpoint reads the indexed event log + decodes JSON, no I/O fanout.
-setInterval(loadWorldEvents, 5000);
+safeInterval(loadWorldEvents, 5000);
 
 // ── Interactions timeline (§24.6) ─────────────────────────────────────────
 // Pre-filtered tail of INTERACTED_WITH / PICKED_UP / PLACED_DOWN / HANDED_OFF
@@ -4008,7 +4066,7 @@ async function loadInteractions() {
 loadInteractions();
 // 10s cadence — interactions don't fire every second the way landmark
 // dwell does; cheaper than the 5s WORLD EVENTS poll.
-setInterval(loadInteractions, 10000);
+safeInterval(loadInteractions, 10000);
 
 // ── Clown alarm (§29.8 v4.1) ──────────────────────────────────────────────
 
@@ -4092,7 +4150,7 @@ async function loadClownStatus() {
   }
 }
 loadClownStatus();
-setInterval(loadClownStatus, 8000);
+safeInterval(loadClownStatus, 8000);
 
 (function wireClownControls() {
   const testBtn = document.getElementById("clown-test");
@@ -4204,7 +4262,7 @@ setInterval(loadClownStatus, 8000);
   });
   // Keep the tab badge in sync independent of which tab is open.
   refreshReviewsBadge();
-  setInterval(refreshReviewsBadge, 15000);
+  safeInterval(refreshReviewsBadge, 15000);
 })();
 
 // ── Pending Reviews tab ───────────────────────────────────────────────────
@@ -4780,13 +4838,13 @@ function startPerfRefresh() {
   loadPerfTab();
   const auto = document.getElementById("perf-auto-refresh");
   if (auto && auto.checked) {
-    _perfTimer = setInterval(loadPerfTab, 2000);
+    _perfTimer = safeInterval(loadPerfTab, 2000);
   }
 }
 
 function stopPerfRefresh() {
   if (_perfTimer) {
-    clearInterval(_perfTimer);
+    stopSafeInterval(_perfTimer);
     _perfTimer = null;
   }
 }
