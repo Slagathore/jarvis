@@ -80,6 +80,10 @@ class OllamaLLM:
         # the ':gapi' suffix gets selected — keeps the import + httpx pool out
         # of the boot path for users who never use the direct API.
         self._gemini_direct: Optional[Any] = None
+        # Shared httpx client for the async health check — avoids paying TLS
+        # / connection setup on every probe of /api/tags. Sync is_available()
+        # is one-shot at boot, so it stays plain httpx.get.
+        self._health_client: Optional[httpx.AsyncClient] = None
 
         # Set of model names that need think=False forced for tool-call
         # round-trips. Pre-populated for Gemini-3 Ollama-cloud variants
@@ -651,11 +655,22 @@ class OllamaLLM:
     async def is_available_async(self) -> bool:
         """Async health check. Returns True if Ollama is reachable."""
         try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(f"{self._base_url}/api/tags", timeout=3)
-                return r.status_code == 200
+            if self._health_client is None or self._health_client.is_closed:
+                self._health_client = httpx.AsyncClient(timeout=3)
+            r = await self._health_client.get(f"{self._base_url}/api/tags")
+            return r.status_code == 200
         except Exception:
             return False
+
+    async def aclose(self) -> None:
+        """Release the shared health client. Idempotent; called by the
+        orchestrator on shutdown."""
+        if self._health_client is not None and not self._health_client.is_closed:
+            try:
+                await self._health_client.aclose()
+            except Exception as e:
+                logger.debug(f"[LLM] health client aclose failed: {e}")
+        self._health_client = None
 
     @property
     def system_prompt(self) -> str:

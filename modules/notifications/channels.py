@@ -40,6 +40,28 @@ class NotificationChannel(ABC):
     """
     name: str = "base"
 
+    def __init__(self) -> None:
+        # Lazily created shared httpx client — created on first send.
+        # Reused across calls so we get connection pooling + keep-alive
+        # against the same notification endpoint instead of paying for
+        # fresh TLS / DNS / TCP setup per alert.
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def _get_client(self, timeout_s: float) -> httpx.AsyncClient:
+        """Return (and lazy-create) the shared client for this channel."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=timeout_s)
+        return self._client
+
+    async def aclose(self) -> None:
+        """Release the shared client if one was created. Idempotent."""
+        if self._client is not None and not self._client.is_closed:
+            try:
+                await self._client.aclose()
+            except Exception as e:
+                logger.debug(f"[Notifier] channel client aclose failed: {e}")
+        self._client = None
+
     @abstractmethod
     async def send(self, alert: Alert) -> None:
         ...
@@ -65,6 +87,7 @@ class NtfyChannel(NotificationChannel):
         topic: str = "jarvis_alerts",
         timeout_s: float = 5.0,
     ) -> None:
+        super().__init__()
         self._server = server.rstrip("/")
         self._topic = topic
         self._timeout = timeout_s
@@ -76,17 +99,17 @@ class NtfyChannel(NotificationChannel):
             AlertPriority.NORMAL: "default",
         }
         url = f"{self._server}/{self._topic}"
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
-                url,
-                content=alert.body.encode("utf-8"),
-                headers={
-                    "Title":    alert.title,
-                    "Priority": priority_map[alert.priority],
-                    "Tags":     self._tags_for(alert.alarm_type),
-                },
-            )
-            resp.raise_for_status()
+        client = self._get_client(self._timeout)
+        resp = await client.post(
+            url,
+            content=alert.body.encode("utf-8"),
+            headers={
+                "Title":    alert.title,
+                "Priority": priority_map[alert.priority],
+                "Tags":     self._tags_for(alert.alarm_type),
+            },
+        )
+        resp.raise_for_status()
 
     @staticmethod
     def _tags_for(alarm_type: str) -> str:
@@ -118,6 +141,7 @@ class TelegramChannel(NotificationChannel):
         alert_chat_id_env: str = "TELEGRAM_ALERT_CHAT_ID",
         timeout_s: float = 5.0,
     ) -> None:
+        super().__init__()
         self._bot_token_env = bot_token_env
         self._chat_id_env = alert_chat_id_env
         self._timeout = timeout_s
@@ -137,9 +161,9 @@ class TelegramChannel(NotificationChannel):
             "parse_mode": "Markdown",
             "disable_notification": alert.priority == AlertPriority.NORMAL,
         }
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
+        client = self._get_client(self._timeout)
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
 
 
 def _md_escape(text: str) -> str:
@@ -174,6 +198,7 @@ class HAChannel(NotificationChannel):
         token_env: str = "HOME_ASSISTANT_TOKEN",
         timeout_s: float = 5.0,
     ) -> None:
+        super().__init__()
         self._base = base_url.rstrip("/")
         self._service = service
         self._token_env = token_env
@@ -198,9 +223,9 @@ class HAChannel(NotificationChannel):
                 **alert.metadata,
             },
         }
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
+        client = self._get_client(self._timeout)
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
 
 
 # ── Factory: build channels from a config dict ──────────────────────────────

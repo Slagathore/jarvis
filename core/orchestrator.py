@@ -79,7 +79,6 @@ import base64
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import httpx
 import numpy as np
 from loguru import logger
 
@@ -3728,15 +3727,17 @@ class Orchestrator:
             try:
                 health = {}
 
-                # Check Ollama
+                # Check Ollama — use the LLM module's pooled health client
+                # so we get connection reuse + keep-alive across probes
+                # instead of paying TLS setup every 30s.
                 try:
-                    async with httpx.AsyncClient(timeout=5) as client:
-                        r = await client.get(
-                            f"{self.config['ollama']['base_url']}/api/tags"
-                        )
+                    if self.llm is not None:
+                        ollama_ok = await self.llm.is_available_async()
+                    else:
+                        ollama_ok = False
                     health["ollama"] = {
-                        "online": r.status_code == 200,
-                        "model": self.config["ollama"]["model"],
+                        "online": ollama_ok,
+                        "model": self.config["ollama"]["model"] if ollama_ok else "",
                     }
                 except Exception:
                     health["ollama"] = {"online": False, "model": ""}
@@ -5141,6 +5142,11 @@ class Orchestrator:
                 await self.llm.close()
             except Exception as e:
                 logger.debug(f"[Shutdown] LLM close failed: {e}")
+        if self.llm is not None and hasattr(self.llm, "aclose"):
+            try:
+                await self.llm.aclose()
+            except Exception as e:
+                logger.debug(f"[Shutdown] LLM aclose failed: {e}")
         if self._claude_client is not None and hasattr(self._claude_client, "close"):
             try:
                 await self._claude_client.close()
