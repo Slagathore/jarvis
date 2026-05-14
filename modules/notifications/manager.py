@@ -84,6 +84,7 @@ class NotificationManager:
         try:
             rows = await self._db.fetchall(sql, params)
         except Exception:
+            logger.exception("[Notifications] list_recent query failed")
             return []
         return [
             {
@@ -108,6 +109,7 @@ class NotificationManager:
             )
             return int(row["n"]) if row else 0
         except Exception:
+            logger.exception("[Notifications] unread_count query failed")
             return 0
 
     async def mark_read(self, notification_id: int) -> bool:
@@ -129,6 +131,7 @@ class NotificationManager:
         try:
             await self._db.execute("UPDATE notifications SET read = 1 WHERE read = 0")
         except Exception:
+            logger.exception("[Notifications] mark_all_read failed")
             return False
         if self._broadcast is not None:
             try:
@@ -143,6 +146,9 @@ class NotificationManager:
                 "DELETE FROM notifications WHERE id = ?", (notification_id,)
             )
         except Exception:
+            logger.exception(
+                f"[Notifications] delete failed for id={notification_id}"
+            )
             return False
         if self._broadcast is not None:
             try:
