@@ -281,8 +281,10 @@ class DatabaseManager:
             conn.row_factory = aiosqlite.Row
 
             # WAL mode allows concurrent reads while writing
-            await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute("PRAGMA foreign_keys=ON")
+            cursor = await conn.execute("PRAGMA journal_mode=WAL")
+            await cursor.close()
+            cursor = await conn.execute("PRAGMA foreign_keys=ON")
+            await cursor.close()
 
             # Apply schema
             await conn.executescript(SCHEMA_SQL)
@@ -308,7 +310,8 @@ class DatabaseManager:
                 "ALTER TABLE identity_pending ADD COLUMN face_bbox TEXT",
             ):
                 try:
-                    await conn.execute(migration_sql)
+                    cursor = await conn.execute(migration_sql)
+                    await cursor.close()
                 except aiosqlite.OperationalError:
                     pass  # column already exists
 
@@ -333,12 +336,16 @@ class DatabaseManager:
             DatabaseError: On SQL error or if init() was not called.
         """
         conn = self._get_connection()
+        cursor: Optional[aiosqlite.Cursor] = None
         try:
             cursor = await conn.execute(sql, params)
             await conn.commit()
             return int(cursor.lastrowid or 0)
         except aiosqlite.Error as e:
             raise DatabaseError(f"Execute failed [{sql[:80]}]: {e}") from e
+        finally:
+            if cursor is not None:
+                await cursor.close()
 
     async def fetchall(
         self,
@@ -353,11 +360,15 @@ class DatabaseManager:
             DatabaseError: On SQL error.
         """
         conn = self._get_connection()
+        cursor: Optional[aiosqlite.Cursor] = None
         try:
             cursor = await conn.execute(sql, params)
             return list(await cursor.fetchall())
         except aiosqlite.Error as e:
             raise DatabaseError(f"Fetchall failed [{sql[:80]}]: {e}") from e
+        finally:
+            if cursor is not None:
+                await cursor.close()
 
     async def fetchone(
         self,
@@ -371,11 +382,15 @@ class DatabaseManager:
             DatabaseError: On SQL error.
         """
         conn = self._get_connection()
+        cursor: Optional[aiosqlite.Cursor] = None
         try:
             cursor = await conn.execute(sql, params)
             return await cursor.fetchone()
         except aiosqlite.Error as e:
             raise DatabaseError(f"Fetchone failed [{sql[:80]}]: {e}") from e
+        finally:
+            if cursor is not None:
+                await cursor.close()
 
     async def close(self) -> None:
         """Close the database connection gracefully."""

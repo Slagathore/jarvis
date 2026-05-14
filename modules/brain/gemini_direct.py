@@ -20,10 +20,12 @@ import asyncio
 import base64
 import json
 import os
+import time
 from typing import Any, Optional
 
 import httpx
 from loguru import logger
+from modules.context.perf_tracker import perf
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -65,6 +67,20 @@ def _convert_messages_to_gemini(messages: list[dict[str, Any]]) -> tuple[list[di
                     }
                 }],
             })
+            continue
+        function_calls = msg.get("_gemini_function_calls") or []
+        if role == "assistant" and function_calls:
+            parts = []
+            if content:
+                parts.append({"text": content})
+            for call in function_calls:
+                parts.append({
+                    "functionCall": {
+                        "name": call.get("name"),
+                        "args": call.get("args") or {},
+                    }
+                })
+            contents.append({"role": "model", "parts": parts})
             continue
         # Merge consecutive same-role messages
         if contents and contents[-1].get("role") == gemini_role:
@@ -165,6 +181,14 @@ class GeminiDirectClient:
                     f"[Gemini] Tool-loop done in {iteration + 1} iter(s), "
                     f"final response ({len(text)} chars): {text[:120]}..."
                 )
+                perf().record_model_call(
+                    "tool-loop",
+                    _strip_gapi_suffix(model),
+                    latency_ms=0.0,
+                    ok=True,
+                    cloud=True,
+                    tool_iterations=iteration + 1,
+                )
                 return text
             # Append the model's tool-call turn so Gemini sees it on the next round
             running_messages.append({
@@ -194,6 +218,14 @@ class GeminiDirectClient:
                     "content": json.dumps(tool_result, default=str),
                 })
         # Out of iterations — return whatever last text we have
+        perf().record_model_call(
+            "tool-loop",
+            _strip_gapi_suffix(model),
+            latency_ms=0.0,
+            ok=False,
+            cloud=True,
+            tool_iterations=max_iterations,
+        )
         return text or "(tool loop exhausted)"
 
     async def vision_query(
@@ -219,6 +251,7 @@ class GeminiDirectClient:
             }],
         }
         client = await self._get_client()
+        started = time.perf_counter()
         try:
             resp = await client.post(
                 url,
@@ -228,8 +261,23 @@ class GeminiDirectClient:
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
+            perf().record_model_call(
+                "gemini-vision",
+                api_model,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                ok=False,
+                timeout=isinstance(e, httpx.TimeoutException),
+                cloud=True,
+            )
             logger.warning(f"[Gemini] vision_query failed: {e}")
             return ""
+        perf().record_model_call(
+            "gemini-vision",
+            api_model,
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            ok=True,
+            cloud=True,
+        )
         return self._extract_text(data)
 
     async def _generate(
@@ -253,6 +301,7 @@ class GeminiDirectClient:
                 body["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
 
         client = await self._get_client()
+        started = time.perf_counter()
         try:
             resp = await client.post(
                 url,
@@ -262,12 +311,34 @@ class GeminiDirectClient:
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPStatusError as e:
+            perf().record_model_call(
+                "gemini",
+                api_model,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                ok=False,
+                cloud=True,
+            )
             logger.warning(f"[Gemini] generate {e.response.status_code}: {e.response.text[:300]}")
             return {"text": "", "function_calls": []}
         except Exception as e:
+            perf().record_model_call(
+                "gemini",
+                api_model,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                ok=False,
+                timeout=isinstance(e, httpx.TimeoutException),
+                cloud=True,
+            )
             logger.warning(f"[Gemini] generate failed: {e}")
             return {"text": "", "function_calls": []}
 
+        perf().record_model_call(
+            "gemini",
+            api_model,
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            ok=True,
+            cloud=True,
+        )
         return {
             "text": self._extract_text(data),
             "function_calls": self._extract_function_calls(data),

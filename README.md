@@ -15,8 +15,8 @@ No cloud subscriptions. No wake-word-to-server round trips. Everything runs on y
 - **Watches rooms via camera** for mess, light state, posture, and presence using YOLOv8 + MediaPipe
 - **Classifies ambient audio** (appliances, music, silence) via TensorFlow/YAMNet
 - **Speaks proactively** when curiosity fires and you're interruptible — "Washer's done." / "Kitchen counter's looking a bit busy."
-- **Responds to direct questions** via Ollama LLM running locally
-- **Real-time dashboard** at `http://localhost:7070` — activity state, room status, conversation log, appliance tracking
+- **Responds to direct questions** via Ollama LLM running locally or configured cloud-backed models
+- **Real-time dashboard** at `http://localhost:7070` — activity state, room status, conversation log, appliance tracking, degraded-mode status, wake calibration, and perf/model-call metrics
 - **Multi-room support** via ESP32-CAM nodes over MQTT (optional hardware expansion)
 
 ---
@@ -28,7 +28,7 @@ No cloud subscriptions. No wake-word-to-server round trips. Everything runs on y
 │                    Orchestrator                      │
 │  (core/orchestrator.py — async task coordinator)    │
 └───────────────┬─────────────────────────────────────┘
-                │ EventBus (pub/sub, no direct imports)
+                │ EventBus (priority pub/sub, no direct imports)
     ┌───────────┼───────────────────────────────┐
     │           │                               │
 ┌───▼───┐  ┌───▼───────┐  ┌────────┐  ┌───────▼──────┐
@@ -53,7 +53,7 @@ No cloud subscriptions. No wake-word-to-server round trips. Everything runs on y
         └───────────────┘
 ```
 
-All modules communicate through an async event bus. Nothing imports anything except `core/`. This makes every module independently testable and replaceable.
+Most runtime modules communicate through the async event bus. The bus is bounded, priority-aware, and rate-limits high-volume telemetry topics so wake, safety, alarm, and control events do not sit behind bursts of camera/world/debug traffic.
 
 ---
 
@@ -131,6 +131,7 @@ Key sections:
 | `ollama.system_prompt` | Personality and household context — customize to your setup |
 | `voice.whisper.model_size` | STT accuracy vs. speed (`base` → `large-v3`) |
 | `voice.wake_word.model` | openWakeWord model name |
+| `system.event_bus` | Queue size and per-topic telemetry rate limits |
 | `rooms` | Per-room `video` / `mic` / `speaker` channels — see `WYZE_SETUP.md` |
 | `interruptibility.activity_scores` | How interruptible each detected activity is |
 | `curiosity.topic_cooldowns_hours` | How often Jarvis can proactively comment on each topic |
@@ -157,6 +158,7 @@ jarvis/
 │   ├── context/                # State fusion, interruptibility, curiosity, sleep
 │   ├── activity/               # PC monitor, audio classifier, appliance tracker
 │   ├── vision/                 # Camera, YOLOv8, MediaPipe pose, scene analysis
+│   ├── integrations/           # Sensor/actuator plugin contracts
 │   ├── memory/                 # SQLite database, event log, room baselines
 │   └── network/                # MQTT client, ESP32 node manager
 │
@@ -203,7 +205,19 @@ The only file that imports from multiple modules. Everything else communicates v
 
 ### `core/event_bus.py`
 
-Async FIFO queue. Producers call `await bus.publish(topic, payload)`. Consumers register with `bus.subscribe(topic, handler)`. A crashed handler never takes down the bus.
+Async priority queue. Producers call `await bus.publish(topic, payload)`. Consumers register with `bus.subscribe(topic, handler)`. Wake/safety/control topics are dispatched ahead of world/telemetry/debug topics, high-volume telemetry has token-bucket rate limits, and a crashed handler never takes down the bus.
+
+### `modules/integrations/`
+
+Small plugin-style contracts for future sensors and actuators. New integrations should implement `SensorPlugin` or `ActuatorPlugin`, publish/subscribe through `EventBus`, and register with `IntegrationRegistry` instead of adding more direct wiring to `core/orchestrator.py`.
+
+### Dashboard Operations
+
+The dashboard now includes:
+
+- **Perf tab model tracking** — per provider/model daily calls, cloud calls, average latency, timeout rate, and average tool-loop iterations.
+- **Degraded Mode card** — best-effort loaded/degraded/disabled status for wake word, STT, TTS, LLM, MQTT, cameras, identity, world model, open-vocab objects, and registered integrations.
+- **Wake Calibration card** — per-room RMS, peak level, wake score, false-positive count, and suggested sensitivity.
 
 ### `modules/context/state_fusion.py`
 
@@ -231,11 +245,11 @@ Credentials are **never** committed:
 
 ## Limitations / Roadmap
 
-- **Wake word on PC only** — ESP32 nodes don't yet publish wake events over MQTT (firmware pass needed)
-- **TTS audio routing** — All TTS plays on the PC speaker; per-room audio output to nodes isn't wired yet
-- **No persistent reminders** — Reminder system schema exists in DB but the scheduler isn't built
-- **No calendar integration** — Planned but not implemented
-- **YAMNet on CPU** — TensorFlow CUDA support requires additional setup; YAMNet runs on CPU by default
+- **Split the large coordinators** — `core/orchestrator.py` and `dashboard/server.py` are intentionally scheduled for decomposition; see `TODO_SPLIT_ORCHESTRATOR_DASHBOARD.md`.
+- **Migrate integrations gradually** — existing camera/audio/MQTT integrations still live in the orchestrator path, but new sensors/actuators should use `modules/integrations/`.
+- **Dashboard auth** — keep the dashboard on a trusted network until token auth is added, especially when `dashboard_host` is `0.0.0.0`.
+- **YAMNet on CPU** — TensorFlow CUDA support requires additional setup; YAMNet runs on CPU by default.
+- **Open-vocab weights** — `open-clip-torch` and `transformers` are now in requirements because `config.yaml` enables open-vocabulary object tracking by default. First boot downloads CLIP/OWLv2 weights to the Hugging Face cache.
 
 ---
 

@@ -93,6 +93,11 @@ class WyzeRtspMicSource(MicSource):
         # 2026-05-09 during shutdown).
         self._container: Optional[Any] = None
         self._close_lock = threading.Lock()
+        # Cap callback tasks queued onto the event loop. If the loop stalls
+        # or a callback blocks, fresh RTSP packets should be dropped rather
+        # than accumulating one asyncio Task per 80 ms audio chunk forever.
+        self._callback_tasks_inflight: int = 0
+        self._max_callback_tasks_inflight: int = 16
 
     @property
     def room(self) -> str:
@@ -304,10 +309,18 @@ class WyzeRtspMicSource(MicSource):
             pass
 
     def _schedule_cb(self, cb: MicCallback, chunk: bytes) -> None:
+        if self._callback_tasks_inflight >= self._max_callback_tasks_inflight:
+            return
+        self._callback_tasks_inflight += 1
         try:
-            asyncio.create_task(self._safe_invoke(cb, chunk))
+            task = asyncio.create_task(self._safe_invoke(cb, chunk))
+            task.add_done_callback(lambda _t: self._callback_task_done())
         except RuntimeError:
+            self._callback_task_done()
             pass  # loop closing
+
+    def _callback_task_done(self) -> None:
+        self._callback_tasks_inflight = max(0, self._callback_tasks_inflight - 1)
 
     async def _safe_invoke(self, cb: MicCallback, chunk: bytes) -> None:
         try:

@@ -29,6 +29,7 @@ Variables:
 
 import asyncio
 import base64
+import time
 from typing import Any, Optional
 
 import httpx
@@ -36,6 +37,7 @@ import numpy as np
 from loguru import logger
 
 from core.exceptions import LLMError
+from modules.context.perf_tracker import perf
 
 
 class OllamaLLM:
@@ -113,6 +115,31 @@ class OllamaLLM:
         n = (model_name or "").lower()
         return n.startswith("gemini-3") and ":cloud" in n
 
+    @staticmethod
+    def _is_cloud_model(model_name: str) -> bool:
+        n = (model_name or "").lower()
+        return ":cloud" in n or ":gapi" in n
+
+    def _record_model_call(
+        self,
+        provider: str,
+        model: str,
+        started: float,
+        *,
+        ok: bool,
+        timeout: bool = False,
+        tool_iterations: int = 0,
+    ) -> None:
+        perf().record_model_call(
+            provider,
+            model,
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            ok=ok,
+            timeout=timeout,
+            cloud=self._is_cloud_model(model),
+            tool_iterations=tool_iterations,
+        )
+
     def _get_gemini_direct(self) -> Any:
         if self._gemini_direct is None:
             from modules.brain.gemini_direct import GeminiDirectClient
@@ -171,6 +198,15 @@ class OllamaLLM:
         Without this, defaults from the model's modelfile are used."""
         self._settings_provider = registry
 
+    async def close(self) -> None:
+        """Release long-lived provider clients."""
+        if self._gemini_direct is not None:
+            try:
+                await self._gemini_direct.aclose()
+            except Exception:
+                pass
+            self._gemini_direct = None
+
     async def _build_options_and_think(self, model_name: str) -> tuple[dict, Optional[bool]]:
         """Translate stored model_settings into Ollama's options dict + think
         kwarg. Skips fields the user hasn't overridden so the model's
@@ -226,6 +262,7 @@ class OllamaLLM:
             chat_kwargs["options"] = options
         if think is not None:
             chat_kwargs["think"] = think
+        started = time.perf_counter()
         try:
             response = await asyncio.wait_for(
                 self._client.chat(**chat_kwargs),
@@ -233,11 +270,16 @@ class OllamaLLM:
             )
             text = response["message"]["content"].strip()
             logger.debug(f"[LLM] Response ({len(text)} chars): {text[:100]}...")
+            self._record_model_call("ollama", self._model, started, ok=True)
             return text
 
         except asyncio.TimeoutError:
+            self._record_model_call(
+                "ollama", self._model, started, ok=False, timeout=True
+            )
             raise LLMError(f"Ollama chat timed out after {self._timeout}s")
         except Exception as e:
+            self._record_model_call("ollama", self._model, started, ok=False)
             raise LLMError(f"Ollama chat failed: {e}") from e
 
     async def chat_with_tools(
@@ -339,12 +381,16 @@ class OllamaLLM:
                     effective_think = False
                 if effective_think is not None:
                     chat_kwargs["think"] = effective_think
+                started = time.perf_counter()
                 try:
                     response = await asyncio.wait_for(
                         self._client.chat(**chat_kwargs),
                         timeout=self._timeout,
                     )
                 except asyncio.TimeoutError:
+                    self._record_model_call(
+                        "ollama", active_model, started, ok=False, timeout=True
+                    )
                     raise LLMError(f"Ollama chat (tools) timed out after {self._timeout}s")
                 except Exception as e:
                     # Workaround: Gemini 3 thinking models via Ollama-cloud
@@ -391,23 +437,44 @@ class OllamaLLM:
                             trimmed.pop()
                         chat_kwargs["messages"] = trimmed
                         working_messages = trimmed
+                        self._record_model_call(
+                            "ollama", active_model, started, ok=False
+                        )
+                        started = time.perf_counter()
                         try:
                             response = await asyncio.wait_for(
                                 self._client.chat(**chat_kwargs),
                                 timeout=self._timeout,
                             )
                         except asyncio.TimeoutError:
+                            self._record_model_call(
+                                "ollama",
+                                active_model,
+                                started,
+                                ok=False,
+                                timeout=True,
+                            )
                             raise LLMError(
                                 f"Ollama chat (tools) timed out after {self._timeout}s "
                                 "(after thought_signature retry)"
                             )
                         except Exception as e2:
+                            self._record_model_call(
+                                "ollama", active_model, started, ok=False
+                            )
                             raise LLMError(
                                 f"Ollama chat (tools) failed even after "
                                 f"think=False retry: {e2}"
                             ) from e2
                     else:
+                        self._record_model_call(
+                            "ollama", active_model, started, ok=False
+                        )
                         raise LLMError(f"Ollama chat (tools) failed: {e}") from e
+                else:
+                    self._record_model_call(
+                        "ollama", active_model, started, ok=True
+                    )
 
                 message = response.get("message", {}) or {}
                 tool_calls = message.get("tool_calls") or []
@@ -417,6 +484,14 @@ class OllamaLLM:
                 logger.debug(
                     f"[LLM] Tool-loop done in {iteration + 1} iter(s), "
                     f"final response ({len(text)} chars): {text[:100]}..."
+                )
+                perf().record_model_call(
+                    "tool-loop",
+                    active_model,
+                    latency_ms=0.0,
+                    ok=True,
+                    cloud=self._is_cloud_model(active_model),
+                    tool_iterations=iteration + 1,
                 )
                 return text
 
@@ -476,6 +551,14 @@ class OllamaLLM:
         logger.warning(
             f"[LLM] Tool loop hit max_iterations={max_iterations} without final answer"
         )
+        perf().record_model_call(
+            "tool-loop",
+            active_model,
+            latency_ms=0.0,
+            ok=False,
+            cloud=self._is_cloud_model(active_model),
+            tool_iterations=max_iterations,
+        )
         return ""
 
     async def vision_query(
@@ -528,6 +611,7 @@ class OllamaLLM:
             chat_kwargs["options"] = options
         if think is not None:
             chat_kwargs["think"] = think
+        started = time.perf_counter()
         try:
             response = await asyncio.wait_for(
                 self._client.chat(**chat_kwargs),
@@ -535,11 +619,22 @@ class OllamaLLM:
             )
             description = response["message"]["content"].strip()
             logger.debug(f"[LLM] Vision: {description[:120]}")
+            self._record_model_call("ollama-vision", self._vision_model, started, ok=True)
             return description
 
         except asyncio.TimeoutError:
+            self._record_model_call(
+                "ollama-vision",
+                self._vision_model,
+                started,
+                ok=False,
+                timeout=True,
+            )
             raise LLMError(f"Vision query timed out after {self._timeout}s")
         except Exception as e:
+            self._record_model_call(
+                "ollama-vision", self._vision_model, started, ok=False
+            )
             raise LLMError(f"Vision query failed: {e}") from e
 
     def is_available(self) -> bool:

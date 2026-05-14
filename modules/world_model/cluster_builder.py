@@ -126,11 +126,15 @@ class AnimalClusterBuilder:
         # at module load time for callers that never cluster.
         from sklearn.cluster import KMeans
         km = KMeans(
-            n_clusters=int(n_clusters), n_init=10, random_state=42,
+            n_clusters=int(n_clusters), n_init="auto", random_state=42,
         ).fit(X)
 
         clusters: dict[int, list[str]] = {i: [] for i in range(int(n_clusters))}
-        for label, e in zip(km.labels_, unattrib):
+        labels = km.labels_
+        if labels is None:
+            logger.warning(f"[ClusterBuilder] {species}: KMeans produced no labels")
+            return {}
+        for label, e in zip(labels, unattrib):
             clusters[int(label)].append(e["id"])
         logger.info(
             f"[ClusterBuilder] {species}: built {len(clusters)} clusters "

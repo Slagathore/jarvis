@@ -6,6 +6,15 @@ system:
   dashboard_enabled: true
   dashboard_port: 7070
   dashboard_host: 0.0.0.0
+  event_bus:
+    max_queue_size: 1000
+    rate_limits:
+      audio.level:
+        per_second: 12
+        burst: 24
+      world.state_snapshot:
+        per_second: 0.5
+        burst: 2
 ollama:
   model: gemini-3-flash-preview:cloud
   vision_model: gemini-3-flash-preview:cloud
@@ -730,7 +739,7 @@ outdoor_pets:
 # as world-model entities — leaving it empty tracks all 80, which is
 # noisy. Detection runs every frame for these (interval=0).
 #
-# Open-vocab tracking requires `open_clip_torch` and `transformers`
+# Open-vocab tracking requires `open-clip-torch` and `transformers`
 # installed; OWLv2 + CLIP weights download to the HF cache on first boot.
 tracked_objects:
   open_vocabulary:

@@ -71,6 +71,7 @@ function applyFullState(state, conversation) {
   updateHealth(state.system);
   roomsCache = state.rooms || {};
   updateRooms(roomsCache);
+  renderWakeCalibration(Object.values(state.wake_calibration || {}));
 
   if (state.last_speech) {
     updateSpeech(state.last_speech);
@@ -134,6 +135,11 @@ function applyEvent(event) {
       break;
     case "audio_level":
       updateRoomAudio(event.room, event.db, event.peak_db);
+      scheduleWakeCalibrationRefresh();
+      break;
+    case "wake_score":
+    case "wake_calibration":
+      scheduleWakeCalibrationRefresh();
       break;
     case "reminder_added":
       addReminder(event);
@@ -337,6 +343,121 @@ function updateHealth(system) {
   setDot("h-whisper", system.whisper?.loaded ? "online" : "offline");
   setText("h-whisper-detail", system.whisper?.model || "—");
 }
+
+async function loadDegradedStatus() {
+  try {
+    const res = await fetch("/api/degraded");
+    if (!res.ok) return;
+    renderDegradedStatus(await res.json());
+  } catch (err) {
+    console.warn("[degraded] load failed:", err);
+  }
+}
+
+function renderDegradedStatus(data) {
+  const summary = document.getElementById("degraded-summary");
+  const list = document.getElementById("degraded-list");
+  if (!summary || !list) return;
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const overall = data?.overall === "ok" ? "ok" : "degraded";
+  summary.textContent = overall === "ok" ? "All core capabilities nominal" : "Running with degraded capabilities";
+  summary.className = `degraded-summary ${overall}`;
+  list.innerHTML = items.map((item) => {
+    const status = item.status || "unknown";
+    const detail = item.detail ? ` · ${escapeHtml(item.detail)}` : "";
+    return `
+      <div class="degraded-item ${status}">
+        <span class="dot ${status === "loaded" ? "online" : status === "disabled" ? "" : "offline"}"></span>
+        <span class="degraded-name">${escapeHtml(item.name || "unknown")}</span>
+        <span class="degraded-detail">${escapeHtml(status)}${detail}</span>
+      </div>`;
+  }).join("");
+}
+
+let _wakeCalibrationTimer = null;
+let _wakeCalibrationLoading = false;
+let _wakeCalibrationRefreshSoon = null;
+
+async function loadWakeCalibration() {
+  if (_wakeCalibrationLoading) return;
+  _wakeCalibrationLoading = true;
+  try {
+    const res = await fetch("/api/wake_calibration");
+    if (!res.ok) return;
+    const body = await res.json();
+    renderWakeCalibration(body.rooms || []);
+  } catch (err) {
+    console.warn("[wake_calibration] load failed:", err);
+  } finally {
+    _wakeCalibrationLoading = false;
+  }
+}
+
+function scheduleWakeCalibrationRefresh() {
+  if (_wakeCalibrationRefreshSoon) return;
+  _wakeCalibrationRefreshSoon = setTimeout(() => {
+    _wakeCalibrationRefreshSoon = null;
+    loadWakeCalibration();
+  }, 500);
+}
+
+function renderWakeCalibration(rooms) {
+  const el = document.getElementById("wake-calibration-list");
+  if (!el) return;
+  const list = Array.isArray(rooms) ? rooms : [];
+  if (!list.length) {
+    el.innerHTML = `<div class="who-empty">Waiting for mic levels…</div>`;
+    return;
+  }
+  el.innerHTML = list.map((r) => {
+    const room = r.room || "unknown";
+    const rms = r.rms_db == null ? "—" : `${Number(r.rms_db).toFixed(0)} dB`;
+    const peak = r.peak_db == null ? "—" : `${Number(r.peak_db).toFixed(0)} dB`;
+    const score = Number(r.wake_score || 0);
+    const sensitivity = Number(r.sensitivity || 0.5);
+    const suggested = Number(r.suggested_sensitivity || sensitivity);
+    const fp = Number(r.false_positive_count || 0);
+    const pct = Math.max(0, Math.min(100, Math.round(score * 100)));
+    const sensPct = Math.max(0, Math.min(100, Math.round(sensitivity * 100)));
+    return `
+      <div class="wake-row">
+        <div class="wake-row-head">
+          <span class="wake-room">${escapeHtml(room.replace(/_/g, " ").toUpperCase())}</span>
+          <button class="wake-fp-btn" data-room="${escapeHtml(room)}" title="Mark the last wake in this room as false">False wake</button>
+        </div>
+        <div class="wake-stats">
+          <span>RMS ${rms}</span>
+          <span>Peak ${peak}</span>
+          <span>False ${fp}</span>
+          <span>Suggest ${suggested.toFixed(2)}</span>
+        </div>
+        <div class="wake-score-track" title="Wake score ${score.toFixed(3)} / sensitivity ${sensitivity.toFixed(2)}">
+          <div class="wake-score-fill" style="width:${pct}%"></div>
+          <div class="wake-score-threshold" style="left:${sensPct}%"></div>
+        </div>
+      </div>`;
+  }).join("");
+  el.querySelectorAll(".wake-fp-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const room = btn.dataset.room;
+      if (!room) return;
+      btn.disabled = true;
+      try {
+        await fetch(`/api/wake_calibration/${encodeURIComponent(room)}/false_positive`, {
+          method: "POST",
+        });
+        loadWakeCalibration();
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
+}
+
+loadDegradedStatus();
+setInterval(loadDegradedStatus, 5000);
+loadWakeCalibration();
+_wakeCalibrationTimer = setInterval(loadWakeCalibration, 3000);
 
 // Set of room IDs that have a camera CONFIGURED (not necessarily currently
 // streaming). Populated from /api/cameras at startup so the reconnect
@@ -4568,9 +4689,10 @@ function renderPerf(state) {
   }
   const timings = state.timings || {};
   const counters = state.counters || {};
+  const modelCalls = Array.isArray(state.model_calls) ? state.model_calls : [];
   const entries = Object.entries(timings);
   const counterEntries = Object.entries(counters);
-  if (entries.length === 0 && counterEntries.length === 0) {
+  if (entries.length === 0 && counterEntries.length === 0 && modelCalls.length === 0) {
     grid.innerHTML = '<div class="who-empty">No timing samples yet. Wait a few seconds for the hot paths to fire.</div>';
     return;
   }
@@ -4625,7 +4747,32 @@ function renderPerf(state) {
           </div>`).join("")}
       </div>`
     : "";
-  grid.innerHTML = timingHtml + counterHtml;
+  const modelHtml = modelCalls.length
+    ? `<div class="perf-card perf-counters perf-model-calls">
+        <div class="perf-name">model cost / latency (today)</div>
+        ${modelCalls.map((m) => `
+          <div class="perf-model-row">
+            <div class="perf-model-name">${escapeHtml(m.provider)} · ${escapeHtml(m.model)}</div>
+            <div class="perf-row">
+              <span class="perf-label">calls</span>
+              <span class="perf-val">${m.calls} (${m.cloud_calls || 0} cloud)</span>
+            </div>
+            <div class="perf-row">
+              <span class="perf-label">avg</span>
+              <span class="perf-val ${_color(m.avg_latency_ms || 0)}">${Number(m.avg_latency_ms || 0).toFixed(1)} ms</span>
+            </div>
+            <div class="perf-row">
+              <span class="perf-label">timeouts</span>
+              <span class="perf-val">${Math.round(Number(m.timeout_rate || 0) * 100)}%</span>
+            </div>
+            <div class="perf-row">
+              <span class="perf-label">tool iters</span>
+              <span class="perf-val">${Number(m.avg_tool_iterations || 0).toFixed(1)}</span>
+            </div>
+          </div>`).join("")}
+      </div>`
+    : "";
+  grid.innerHTML = modelHtml + timingHtml + counterHtml;
 }
 
 function startPerfRefresh() {

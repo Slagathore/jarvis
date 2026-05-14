@@ -451,6 +451,114 @@ main {
   color: var(--text-muted);
 }
 
+/* ── Degraded Mode + Wake Calibration ────────────────────────────────────── */
+.degraded-summary {
+  font-size: 12px;
+  margin-bottom: 8px;
+  color: var(--text-dim);
+}
+
+.degraded-summary.ok {
+  color: var(--green);
+}
+
+.degraded-summary.degraded {
+  color: var(--amber);
+}
+
+.degraded-list,
+.wake-calibration-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.degraded-item {
+  display: grid;
+  grid-template-columns: 14px minmax(90px, 1fr) minmax(70px, auto);
+  gap: 6px;
+  align-items: center;
+  font-size: 11px;
+}
+
+.degraded-name {
+  color: var(--text);
+}
+
+.degraded-detail {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-align: right;
+}
+
+.wake-row {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.wake-row:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.wake-row-head,
+.wake-stats {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.wake-room {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.wake-fp-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10px;
+  padding: 3px 7px;
+  cursor: pointer;
+}
+
+.wake-fp-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+
+.wake-stats {
+  margin: 5px 0;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  flex-wrap: wrap;
+}
+
+.wake-score-track {
+  position: relative;
+  height: 7px;
+  background: rgba(255,255,255,0.08);
+  overflow: hidden;
+}
+
+.wake-score-fill {
+  height: 100%;
+  background: var(--cyan);
+  transition: width 0.15s linear;
+}
+
+.wake-score-threshold {
+  position: absolute;
+  top: -2px;
+  width: 2px;
+  height: 11px;
+  background: var(--amber);
+}
+
 /* ── Status Dots ──────────────────────────────────────────────────────────── */
 .dot {
   width: 8px;
@@ -2014,6 +2122,25 @@ main {
   display: flex; justify-content: space-between;
   font-size: 0.78rem;
   padding: 1px 0;
+}
+.perf-model-calls {
+  grid-column: 1 / -1;
+}
+.perf-model-row {
+  border-top: 1px solid var(--border);
+  padding-top: 7px;
+  margin-top: 7px;
+}
+.perf-model-row:first-of-type {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
+}
+.perf-model-name {
+  color: var(--text);
+  font-family: var(--mono, monospace);
+  font-size: 0.78rem;
+  margin-bottom: 4px;
 }
 .perf-label {
   color: var(--text-dim, #888);

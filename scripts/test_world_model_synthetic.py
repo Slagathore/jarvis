@@ -28,6 +28,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from modules.world_model.store import WorldStore
 from modules.world_model.types import EntityState, Observation
 from modules.world_model.world_model import WorldModel
+import modules.world_model.world_model as world_model_module
+
+# These synthetic tests use their inline geometry. Ignore any local runtime
+# polygon edits from the dashboard, which are machine-specific and gitignored.
+world_model_module._POLYGON_OVERRIDES_PATH = Path(
+    "data/__synthetic_tests_no_polygon_overrides__.json"
+)
 
 
 # ── Stubs ────────────────────────────────────────────────────────────────────
@@ -77,6 +84,13 @@ CONFIG = {
     "interaction_debounce_frames": 3,
     "stationary_long_minutes": 5,
     "enrollment_min_conf": 0.85,
+    # These legacy state-machine tests assert the original immediate
+    # disappearance behavior. Runtime defaults now use multi-frame
+    # smoothing to avoid YOLO flicker spam, so keep this synthetic suite
+    # pinned to the old timing explicitly.
+    "visibility_grace_seconds": 1.0,
+    "visibility_min_samples": 1,
+    "visibility_seen_fraction_floor": 0.99,
 }
 
 

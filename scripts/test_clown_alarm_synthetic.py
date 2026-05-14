@@ -187,7 +187,7 @@ async def test_curated_path_no_improv(tmpdir: Path) -> None:
     """Pool with only curated entries - fire selects one, audio
     sequence runs, alarm self-resolves via on_complete."""
     pool_path = tmpdir / "pool_curated.yaml"
-    _write_pool(pool_path, military_count=3, has_improv=False)
+    _write_pool(pool_path, military_count=3, domestic_count=0, has_improv=False)
     alarm, bus, audio = _make_alarm(pool_path)
     await alarm.start()
 

@@ -86,6 +86,7 @@ from loguru import logger
 from core.event_bus import EventBus
 from core.exceptions import JarvisError
 from dashboard.server import DashboardServer
+from modules.integrations import IntegrationContext, IntegrationRegistry
 from modules.activity.appliance_tracker import ApplianceTracker
 from modules.activity.audio_classifier import AudioClassifier
 from modules.activity.pc_monitor import PCMonitor
@@ -162,7 +163,25 @@ _ECHO_SUPPRESSION_TAIL_S: float = 1.5
 class Orchestrator:
     def __init__(self, config: dict):
         self.config = config
-        self.bus = EventBus()
+        bus_cfg = (config.get("system") or {}).get("event_bus", {})
+        rate_limits: dict[str, tuple[float, int]] = {}
+        raw_limits = bus_cfg.get("rate_limits", {}) if isinstance(bus_cfg, dict) else {}
+        if isinstance(raw_limits, dict):
+            for topic, limit in raw_limits.items():
+                if not isinstance(limit, dict):
+                    continue
+                try:
+                    rate_limits[str(topic)] = (
+                        float(limit.get("per_second", 0.0)),
+                        int(limit.get("burst", 1)),
+                    )
+                except (TypeError, ValueError):
+                    continue
+        self.bus = EventBus(
+            max_queue_size=int(bus_cfg.get("max_queue_size", 1000))
+            if isinstance(bus_cfg, dict) else 1000,
+            topic_rate_limits=rate_limits or None,
+        )
 
         # These are populated in _init_* methods called from run()
         self.db: Optional[DatabaseManager] = None
@@ -284,6 +303,7 @@ class Orchestrator:
         self.mqtt: Optional[MQTTClient] = None
         self.nodes: Optional[NodeManager] = None
         self.webhooks: Optional[WebhookManager] = None
+        self.integrations = IntegrationRegistry()
 
         self.reminders_store: Optional[RemindersStore] = None
         self.reminder_scheduler: Optional[ReminderScheduler] = None
@@ -710,6 +730,7 @@ class Orchestrator:
         # Coalescer first — it batches per-mic wake events over a short
         # window and forwards only the loudest to _on_wake_detected.
         self.bus.subscribe("voice.wake_detected", self._on_wake_event_raw)
+        self.bus.subscribe("voice.wake_score", self._on_wake_score)
         self.bus.subscribe("appliance.state_changed", self._on_appliance_changed)
         self.bus.subscribe("node.status", self._on_node_status)
         self.bus.subscribe("audio.level", self._on_audio_level)
@@ -780,6 +801,16 @@ class Orchestrator:
         if "sample_rate" in event:
             payload["sample_rate"] = event["sample_rate"]
         await self._broadcast(payload)
+
+    async def _on_wake_score(self, event: dict) -> None:
+        """Forward low-rate wake-word scores to the dashboard calibration UI."""
+        await self._broadcast({
+            "type": "wake_score",
+            "room": event.get("room", "office"),
+            "model": event.get("model", ""),
+            "score": float(event.get("score", 0.0) or 0.0),
+            "sensitivity": float(event.get("sensitivity", 0.5) or 0.5),
+        })
 
     # ── Wake Word + Conversation Pipeline ─────────────────────────────────
 
@@ -5067,6 +5098,28 @@ class Orchestrator:
             except Exception as e:
                 logger.debug(f"[Shutdown] WyzeCamControl close for '{room}' failed: {e}")
 
+        if self.webhooks is not None:
+            try:
+                await self.webhooks.close()
+            except Exception as e:
+                logger.debug(f"[Shutdown] WebhookManager close failed: {e}")
+
+        try:
+            await self.integrations.stop_all()
+        except Exception as e:
+            logger.debug(f"[Shutdown] integrations stop failed: {e}")
+
+        if self.llm is not None and hasattr(self.llm, "close"):
+            try:
+                await self.llm.close()
+            except Exception as e:
+                logger.debug(f"[Shutdown] LLM close failed: {e}")
+        if self._claude_client is not None and hasattr(self._claude_client, "close"):
+            try:
+                await self._claude_client.close()
+            except Exception as e:
+                logger.debug(f"[Shutdown] Claude close failed: {e}")
+
         if self.db:
             try:
                 await self.db.close()
@@ -5417,6 +5470,13 @@ class Orchestrator:
                 self.dashboard.register_selfedit(self.selfedit)
             if self.webhooks:
                 self.dashboard.register_webhook_manager(self.webhooks)
+
+        await self.integrations.start_all(IntegrationContext(
+            config=self.config,
+            bus=self.bus,
+            dashboard=self.dashboard,
+            db=self.db,
+        ))
 
         # Register event handlers
         self._register_event_handlers()

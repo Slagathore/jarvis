@@ -41,6 +41,7 @@ Endpoints:
 import asyncio
 import json
 import os
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, cast
@@ -93,6 +94,7 @@ class DashboardServer:
         self._computer = None         # Set by orchestrator via register_computer()
         self._selfedit = None         # Set by orchestrator via register_selfedit()
         self._webhook_manager = None  # Set by orchestrator via register_webhook_manager()
+        self._wake_calibration: dict[str, dict] = {}
 
         self._setup_routes()
 
@@ -118,6 +120,7 @@ class DashboardServer:
                 "nodes":     {},
             },
             "last_speech": None,
+            "wake_calibration": {},
             "updated_at": datetime.now().isoformat(),
         }
 
@@ -284,6 +287,117 @@ class DashboardServer:
         """Wire WebhookManager so /api/webhook/{name} endpoints can dispatch inbound calls."""
         self._webhook_manager = webhooks
 
+    def _wake_room_state(self, room: str) -> dict:
+        item = self._wake_calibration.setdefault(room, {
+            "room": room,
+            "rms_db": None,
+            "peak_db": None,
+            "wake_score": 0.0,
+            "wake_model": "",
+            "sensitivity": 0.5,
+            "false_positive_count": 0,
+            "suggested_sensitivity": 0.5,
+            "updated_at": None,
+        })
+        return item
+
+    def _suggest_wake_sensitivity(self, item: dict) -> float:
+        current = float(item.get("sensitivity") or 0.5)
+        false_positives = int(item.get("false_positive_count") or 0)
+        score = float(item.get("wake_score") or 0.0)
+        if false_positives >= 3:
+            suggested = current + 0.10
+        elif false_positives >= 1:
+            suggested = current + 0.05
+        elif score > 0 and score < max(0.05, current * 0.45):
+            suggested = current - 0.05
+        else:
+            suggested = current
+        return round(min(0.95, max(0.05, suggested)), 2)
+
+    def _capability_status(self) -> dict:
+        """Return best-effort degraded-mode state for the dashboard."""
+        orch = self._orchestrator
+
+        def _item(name: str, status: str, detail: str = "") -> dict:
+            return {"name": name, "status": status, "detail": detail}
+
+        if orch is None:
+            return {
+                "overall": "degraded",
+                "items": [_item("orchestrator", "error", "not registered")],
+            }
+
+        items: list[dict] = []
+        wake = getattr(orch, "wake", None)
+        items.append(_item(
+            "wake word",
+            "loaded" if getattr(wake, "loaded", False) else "error",
+            str(getattr(wake, "device", "")),
+        ))
+        stt = getattr(orch, "stt", None)
+        items.append(_item(
+            "stt",
+            "loaded" if getattr(stt, "loaded", False) else "error",
+            str(getattr(stt, "_model_size", "")),
+        ))
+        tts = getattr(orch, "tts", None)
+        items.append(_item(
+            "tts",
+            "loaded" if getattr(tts, "loaded", False) else "error",
+            str(getattr(tts, "_active_voice", "")),
+        ))
+        llm = getattr(orch, "llm", None)
+        items.append(_item(
+            "llm",
+            "loaded" if llm is not None else "disabled",
+            str(getattr(llm, "model", "")),
+        ))
+        mqtt = getattr(orch, "mqtt", None)
+        mqtt_online = bool(getattr(mqtt, "_connected", False))
+        items.append(_item("mqtt", "loaded" if mqtt_online else "degraded"))
+        cal = getattr(orch, "calendar", None)
+        items.append(_item(
+            "calendar",
+            "loaded" if getattr(cal, "is_authenticated", False) else "disabled",
+        ))
+        cameras = getattr(orch, "cameras", None)
+        cam_rooms = cameras.get_available_rooms() if cameras is not None else []
+        items.append(_item(
+            "cameras",
+            "loaded" if cam_rooms else "degraded",
+            f"{len(cam_rooms)} online",
+        ))
+        items.append(_item(
+            "world model",
+            "loaded" if getattr(orch, "world_model", None) is not None else "disabled",
+        ))
+        items.append(_item(
+            "face id",
+            "loaded" if getattr(orch, "face_recognizer", None) is not None else "disabled",
+        ))
+        items.append(_item(
+            "speaker id",
+            "loaded" if getattr(orch, "speaker_id", None) is not None else "disabled",
+        ))
+        ob = getattr(orch, "observation_builder", None)
+        openvocab = getattr(ob, "openvocab_detector", None)
+        items.append(_item(
+            "open-vocab objects",
+            "loaded" if openvocab is not None else "disabled",
+        ))
+        integrations = getattr(orch, "integrations", None)
+        for plugin in integrations.status() if integrations is not None else []:
+            items.append(_item(
+                f"integration:{plugin.get('name', 'unknown')}",
+                str(plugin.get("status", "unknown")),
+                str(plugin.get("detail", plugin.get("error", ""))),
+            ))
+
+        bad = [i for i in items if i["status"] in {"error", "degraded"}]
+        overall = "ok" if not bad else "degraded"
+        return {"overall": overall, "items": items}
+
     def _setup_routes(self):
         app = self.app
 
@@ -322,18 +436,21 @@ class DashboardServer:
             self._clients.append(ws)
             logger.debug(f"[Dashboard] Client connected ({len(self._clients)} total)")
 
-            # Send current full state immediately on connect
-            await ws.send_json({
-                "type": "full_state",
-                "state": self._state,
-                "conversation": self._conversation,
-            })
-
             try:
+                # Send current full state immediately on connect.
+                await ws.send_json({
+                    "type": "full_state",
+                    "state": self._state,
+                    "conversation": self._conversation,
+                })
                 while True:
                     # Keep connection alive, receive pings from client
                     await ws.receive_text()
             except WebSocketDisconnect:
+                pass
+            except Exception as e:
+                logger.debug(f"[Dashboard] WebSocket client error: {e}")
+            finally:
                 if ws in self._clients:
                     self._clients.remove(ws)
                 logger.debug(
@@ -349,8 +466,20 @@ class DashboardServer:
             a per-client loguru sink so filters apply at source, not on
             the wire."""
             await ws.accept()
+            loop = asyncio.get_running_loop()
             queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
             filt = {"min_level_no": 0, "include": []}
+
+            def _enqueue_log(payload: dict) -> None:
+                try:
+                    queue.put_nowait(payload)
+                except asyncio.QueueFull:
+                    # Drop the oldest record so a paused Logs tab cannot keep
+                    # stale log entries alive indefinitely.
+                    with suppress(Exception):
+                        queue.get_nowait()
+                    with suppress(Exception):
+                        queue.put_nowait(payload)
 
             def _sink(message):
                 try:
@@ -369,10 +498,8 @@ class DashboardServer:
                         "line": r["line"],
                         "message": r["message"],
                     }
-                    try:
-                        queue.put_nowait(payload)
-                    except asyncio.QueueFull:
-                        pass
+                    if not loop.is_closed():
+                        loop.call_soon_threadsafe(_enqueue_log, payload)
                 except Exception:
                     pass
 
@@ -404,6 +531,8 @@ class DashboardServer:
                 pass
             finally:
                 sender.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await sender
                 try:
                     logger.remove(sink_id)
                 except Exception:
@@ -423,6 +552,32 @@ class DashboardServer:
                 "clients": len(self._clients),
                 "updated_at": self._state.get("updated_at"),
             })
+
+        @app.get("/api/degraded")
+        async def degraded_status():
+            return JSONResponse(self._capability_status())
+
+        @app.get("/api/wake_calibration")
+        async def wake_calibration_get():
+            return JSONResponse({
+                "rooms": sorted(
+                    self._wake_calibration.values(),
+                    key=lambda r: str(r.get("room", "")),
+                )
+            })
+
+        @app.post("/api/wake_calibration/{room}/false_positive")
+        async def wake_calibration_false_positive(room: str):
+            item = self._wake_room_state(room)
+            item["false_positive_count"] = int(item.get("false_positive_count") or 0) + 1
+            item["suggested_sensitivity"] = self._suggest_wake_sensitivity(item)
+            item["updated_at"] = datetime.now().isoformat()
+            await self.broadcast({
+                "type": "wake_calibration",
+                "room": room,
+                **item,
+            })
+            return JSONResponse(item)
 
         @app.post("/api/chat")
         async def chat_endpoint(request: Request):
@@ -3339,9 +3494,12 @@ class DashboardServer:
 
         # Push to all connected clients
         dead = []
-        for client in self._clients:
+        for client in list(self._clients):
             try:
-                await client.send_json({"type": "event", "event": event})
+                await asyncio.wait_for(
+                    client.send_json({"type": "event", "event": event}),
+                    timeout=2.0,
+                )
             except Exception:
                 dead.append(client)
 
@@ -3414,6 +3572,37 @@ class DashboardServer:
                 if room not in self._state["rooms"]:
                     self._state["rooms"][room] = {}
                 self._state["rooms"][room]["audio_db"] = event.get("db")
+                if "peak_db" in event:
+                    self._state["rooms"][room]["audio_peak_db"] = event.get("peak_db")
+                item = self._wake_room_state(room)
+                item["rms_db"] = event.get("db")
+                item["peak_db"] = event.get("peak_db", item.get("peak_db"))
+                item["updated_at"] = event.get("timestamp")
+                item["suggested_sensitivity"] = self._suggest_wake_sensitivity(item)
+                self._state["wake_calibration"] = self._wake_calibration
+
+        elif etype == "wake_score":
+            room = event.get("room")
+            if room:
+                item = self._wake_room_state(room)
+                item["wake_score"] = event.get("score", 0.0)
+                item["wake_model"] = event.get("model", "")
+                item["sensitivity"] = event.get("sensitivity", item.get("sensitivity", 0.5))
+                item["updated_at"] = event.get("timestamp")
+                item["suggested_sensitivity"] = self._suggest_wake_sensitivity(item)
+                if room not in self._state["rooms"]:
+                    self._state["rooms"][room] = {}
+                self._state["rooms"][room]["wake_score"] = item["wake_score"]
+                self._state["rooms"][room]["wake_sensitivity"] = item["sensitivity"]
+                self._state["wake_calibration"] = self._wake_calibration
+
+        elif etype == "wake_calibration":
+            room = event.get("room")
+            if room:
+                item = self._wake_room_state(room)
+                item.update({k: v for k, v in event.items() if k in item})
+                item["suggested_sensitivity"] = self._suggest_wake_sensitivity(item)
+                self._state["wake_calibration"] = self._wake_calibration
 
     async def run(self):
         """Start the dashboard server. Run as a background asyncio task.

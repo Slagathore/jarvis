@@ -104,6 +104,9 @@ class MQTTClient:
             return False
 
         try:
+            if self._client is not None:
+                await self._close_client()
+
             kwargs: dict[str, Any] = {
                 "hostname": self._broker,
                 "port":     self._port,
@@ -123,20 +126,25 @@ class MQTTClient:
 
         except Exception as e:
             logger.error(f"[MQTT] Connection failed: {e}")
-            self._connected = False
+            await self._close_client()
             return False
 
     async def disconnect(self) -> None:
         """Gracefully close the MQTT connection."""
         self._stop_event.set()
+        await self._close_client()
+        logger.info("[MQTT] Disconnected")
+
+    async def _close_client(self) -> None:
+        """Close the current aiomqtt context without changing stop policy."""
         self._connected = False
-        if self._client:
+        client = self._client
+        self._client = None
+        if client is not None:
             try:
-                await self._client.__aexit__(None, None, None)
+                await client.__aexit__(None, None, None)
             except Exception:
                 pass
-            self._client = None
-        logger.info("[MQTT] Disconnected")
 
     async def publish(
         self,
@@ -214,18 +222,26 @@ class MQTTClient:
 
                 # Message loop
                 await self._consume_messages(client)
+                if not self._stop_event.is_set():
+                    logger.warning(
+                        f"[MQTT] Message stream ended — reconnecting in "
+                        f"{self._reconnect_delay}s"
+                    )
+                    await self._close_client()
+                    await asyncio.sleep(self._reconnect_delay)
 
             except MqttError as e:
                 logger.warning(f"[MQTT] Connection lost: {e} — reconnecting in {self._reconnect_delay}s")
-                self._connected = False
+                await self._close_client()
                 await asyncio.sleep(self._reconnect_delay)
 
             except asyncio.CancelledError:
+                await self._close_client()
                 break
 
             except Exception as e:
                 logger.error(f"[MQTT] Unexpected error in listen loop: {e}")
-                self._connected = False
+                await self._close_client()
                 await asyncio.sleep(self._reconnect_delay)
 
     async def _consume_messages(self, client: Any) -> None:

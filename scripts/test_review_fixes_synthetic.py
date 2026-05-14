@@ -86,7 +86,7 @@ class FakeIdentityManager:
         self.calls = 0
 
     async def identify_from_embedding_async(
-        self, emb: Any, modality: str = "face",
+        self, emb: Any, modality: str = "face", **kwargs: Any,
     ):
         self.calls += 1
         return self._match

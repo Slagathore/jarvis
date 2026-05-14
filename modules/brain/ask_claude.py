@@ -18,9 +18,12 @@ Classes: ClaudeClient
 from __future__ import annotations
 
 import os
+import inspect
+import time
 from typing import Optional
 
 from loguru import logger
+from modules.context.perf_tracker import perf
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 
@@ -50,6 +53,25 @@ class ClaudeClient:
             self._client = AsyncAnthropic(api_key=self._api_key)
         return self._client
 
+    async def close(self) -> None:
+        """Release the underlying Anthropic HTTP client if it was opened."""
+        client = self._client
+        self._client = None
+        if client is not None:
+            close = getattr(client, "close", None)
+            aclose = getattr(client, "aclose", None)
+            try:
+                if callable(aclose):
+                    result = aclose()
+                    if inspect.isawaitable(result):
+                        await result
+                elif callable(close):
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+            except Exception:
+                pass
+
     async def ask(
         self,
         question: str,
@@ -73,6 +95,7 @@ class ClaudeClient:
             "explicitly asks for depth."
         )
         user_content = question if not context else f"{question}\n\nContext:\n{context}"
+        started = time.perf_counter()
         try:
             resp = await client.messages.create(
                 model=model,
@@ -88,7 +111,23 @@ class ClaudeClient:
                     chunks.append(text)
                 elif isinstance(block, dict) and block.get("type") == "text":
                     chunks.append(block.get("text", ""))
-            return "".join(chunks).strip()
+            out = "".join(chunks).strip()
+            perf().record_model_call(
+                "anthropic",
+                model,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                ok=True,
+                cloud=True,
+            )
+            return out
         except Exception as e:
+            perf().record_model_call(
+                "anthropic",
+                model,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                ok=False,
+                timeout="timeout" in str(e).lower(),
+                cloud=True,
+            )
             logger.warning(f"[Claude] ask failed: {e}")
             return f"(ask_claude failed: {e})"

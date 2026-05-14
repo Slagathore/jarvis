@@ -86,6 +86,7 @@ class MicWakeRunner:
         self._model: Optional[Any] = None
         self._task: Optional[asyncio.Task] = None
         self._last_detection: float = 0.0
+        self._last_score_emit: float = 0.0
         self._running: bool = False
 
     @property
@@ -141,9 +142,20 @@ class MicWakeRunner:
                     continue
                 for model_name, score in predictions.items():
                     score_v = float(score)
+                    now = time.monotonic()
+                    if now - self._last_score_emit >= 0.5:
+                        self._last_score_emit = now
+                        await self._bus.publish(
+                            "voice.wake_score",
+                            {
+                                "room": self.room,
+                                "model": model_name,
+                                "score": score_v,
+                                "sensitivity": sensitivity,
+                            },
+                        )
                     if score_v < sensitivity:
                         continue
-                    now = time.monotonic()
                     if (now - self._last_detection) < cooldown:
                         continue
                     self._last_detection = now

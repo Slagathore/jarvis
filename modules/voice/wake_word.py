@@ -87,6 +87,7 @@ class WakeWordDetector:
         self._suspended: bool = False  # True while recording has the mic
         self._model: Optional[Any] = None
         self._last_detection: float = 0.0
+        self._last_score_emit: float = 0.0
         # Rolling buffer of the last few seconds of int16 audio chunks. Other
         # consumers (e.g. AudioClassifier) read from this instead of opening
         # their own InputStream — Windows WASAPI hates dual streams on the
@@ -307,8 +308,20 @@ class WakeWordDetector:
 
                     for model_name, score in predictions.items():
                         score_value = float(score)
+                        now = time.monotonic()
+                        if now - self._last_score_emit >= 0.5:
+                            self._last_score_emit = now
+                            self._publish_threadsafe(
+                                loop,
+                                "voice.wake_score",
+                                {
+                                    "room": self._room,
+                                    "model": model_name,
+                                    "score": score_value,
+                                    "sensitivity": sensitivity,
+                                },
+                            )
                         if score_value >= sensitivity:
-                            now = time.monotonic()
                             if (now - self._last_detection) < cooldown:
                                 continue  # Still in cooldown window
 

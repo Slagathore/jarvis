@@ -39,13 +39,55 @@ Variables: EventHandler (type alias)
 """
 
 import asyncio
+import heapq
+import itertools
+import time
 from collections import defaultdict
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Optional
 
 from loguru import logger
 
 # Type alias: any async function that accepts a dict payload
 EventHandler = Callable[[dict], Coroutine[Any, Any, None]]
+
+
+class EventPriority:
+    """Semantic event priorities. Lower numbers dispatch first."""
+
+    CRITICAL = 0
+    VOICE = 10
+    CONTROL = 20
+    WORLD = 50
+    TELEMETRY = 80
+    DEBUG = 90
+
+
+_DEFAULT_TOPIC_PRIORITIES: dict[str, int] = {
+    "safety.": EventPriority.CRITICAL,
+    "alarm.": EventPriority.CRITICAL,
+    "fire.": EventPriority.CRITICAL,
+    "cat_escape.": EventPriority.CRITICAL,
+    "voice.wake_detected": EventPriority.VOICE,
+    "voice.": EventPriority.VOICE,
+    "reminder.due": EventPriority.CONTROL,
+    "node.status": EventPriority.CONTROL,
+    "camera.health": EventPriority.CONTROL,
+    "world.": EventPriority.WORLD,
+    "vision.observation": EventPriority.WORLD,
+    "audio.level": EventPriority.TELEMETRY,
+    "telemetry.": EventPriority.TELEMETRY,
+    "debug.": EventPriority.DEBUG,
+}
+
+_DEFAULT_TOPIC_RATE_LIMITS: dict[str, tuple[float, int]] = {
+    # High-frequency dashboard meters. Fresh samples replace stale samples
+    # visually, so dropping excess is better than making wake/safety wait.
+    "audio.level": (12.0, 24),
+    "telemetry.": (20.0, 40),
+    "debug.": (5.0, 10),
+    # World snapshots can be large; entity-level events still flow normally.
+    "world.state_snapshot": (0.5, 2),
+}
 
 
 class _SubscriptionHandle:
@@ -68,7 +110,8 @@ class EventBus:
     Central async publish/subscribe event bus.
 
     Thread-safety: All operations must run in the same event loop.
-    The queue is unbounded — producers will never block.
+    The queue is bounded — sustained overload backpressures producers
+    instead of growing memory without limit.
     Errors in individual handlers are logged but do not crash the bus.
 
     Usage:
@@ -78,11 +121,30 @@ class EventBus:
         await bus.publish("voice.wake_detected", {"room": "office"})
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_queue_size: int = 1000,
+        *,
+        topic_priorities: Optional[dict[str, int]] = None,
+        topic_rate_limits: Optional[dict[str, tuple[float, int]]] = None,
+    ) -> None:
         # topic string → list of registered async handlers
         self._subscribers: dict[str, list[EventHandler]] = defaultdict(list)
-        # Unbounded FIFO queue of (topic, payload) tuples
-        self._queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
+        # Bounded semantic priority queue of (priority, sequence, topic,
+        # payload) tuples. Critical wake/safety events dispatch before
+        # telemetry bursts while preserving FIFO order inside each priority.
+        self._queue: asyncio.PriorityQueue[tuple[int, int, str, dict]] = asyncio.PriorityQueue(
+            maxsize=max(1, int(max_queue_size))
+        )
+        self._sequence = itertools.count()
+        self._topic_priorities = dict(_DEFAULT_TOPIC_PRIORITIES)
+        if topic_priorities:
+            self._topic_priorities.update(topic_priorities)
+        self._topic_rate_limits = dict(_DEFAULT_TOPIC_RATE_LIMITS)
+        if topic_rate_limits:
+            self._topic_rate_limits.update(topic_rate_limits)
+        self._rate_buckets: dict[str, dict[str, float]] = {}
+        self._dropped_by_topic: dict[str, int] = defaultdict(int)
         self._running: bool = False
 
     # ── Public API ───────────────────────────────────────────────────────────
@@ -97,12 +159,23 @@ class EventBus:
         logger.debug(f"[EventBus] '{topic}' ← {handler.__qualname__}")
         return _SubscriptionHandle()
 
-    async def publish(self, topic: str, payload: dict) -> None:
+    async def publish(
+        self,
+        topic: str,
+        payload: dict,
+        *,
+        priority: Optional[int] = None,
+    ) -> None:
         """
         Enqueue an event for dispatch. Returns immediately — does not wait
         for handlers to execute. Safe to call from any coroutine.
         """
-        await self._queue.put((topic, payload))
+        if not self._allow_by_rate_limit(topic):
+            self._dropped_by_topic[topic] += 1
+            logger.debug(f"[EventBus] Rate-limited '{topic}' — event dropped")
+            return
+        event_priority = int(priority) if priority is not None else self._priority_for(topic)
+        await self._put_event(event_priority, topic, payload)
 
     async def run(self) -> None:
         """
@@ -116,7 +189,9 @@ class EventBus:
         while self._running:
             try:
                 # Use timeout so we can respond to _running=False promptly
-                topic, payload = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                _, _, topic, payload = await asyncio.wait_for(
+                    self._queue.get(), timeout=1.0
+                )
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -149,6 +224,83 @@ class EventBus:
 
     # ── Internal ─────────────────────────────────────────────────────────────
 
+    def _priority_for(self, topic: str) -> int:
+        best_len = -1
+        best_priority = EventPriority.WORLD
+        for pattern, priority in self._topic_priorities.items():
+            if topic == pattern or topic.startswith(pattern):
+                if len(pattern) > best_len:
+                    best_len = len(pattern)
+                    best_priority = int(priority)
+        return best_priority
+
+    def _rate_limit_for(self, topic: str) -> Optional[tuple[str, float, int]]:
+        best_pattern = ""
+        best_limit: Optional[tuple[float, int]] = None
+        for pattern, limit in self._topic_rate_limits.items():
+            if topic == pattern or topic.startswith(pattern):
+                if len(pattern) > len(best_pattern):
+                    best_pattern = pattern
+                    best_limit = limit
+        if best_limit is None:
+            return None
+        rate, burst = best_limit
+        return best_pattern, max(0.0, float(rate)), max(1, int(burst))
+
+    def _allow_by_rate_limit(self, topic: str) -> bool:
+        limit = self._rate_limit_for(topic)
+        if limit is None:
+            return True
+        bucket_key, rate, burst = limit
+        if rate <= 0.0:
+            return False
+        now = time.monotonic()
+        bucket = self._rate_buckets.get(bucket_key)
+        if bucket is None:
+            self._rate_buckets[bucket_key] = {"tokens": float(burst - 1), "ts": now}
+            return True
+        elapsed = max(0.0, now - bucket["ts"])
+        bucket["tokens"] = min(float(burst), bucket["tokens"] + elapsed * rate)
+        bucket["ts"] = now
+        if bucket["tokens"] >= 1.0:
+            bucket["tokens"] -= 1.0
+            return True
+        return False
+
+    async def _put_event(self, priority: int, topic: str, payload: dict) -> None:
+        item = (priority, next(self._sequence), topic, payload)
+        try:
+            self._queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            pass
+
+        # If telemetry filled the bounded queue, a critical/voice/control
+        # event should evict the worst queued low-priority event instead of
+        # waiting behind it. This uses asyncio.PriorityQueue internals, but
+        # keeps the public API stable and preserves bounded memory.
+        if priority <= EventPriority.CONTROL:
+            raw_queue = self._queue._queue  # type: ignore[attr-defined]
+            if raw_queue:
+                worst_idx, worst_item = max(
+                    enumerate(raw_queue),
+                    key=lambda pair: (pair[1][0], pair[1][1]),
+                )
+                if worst_item[0] > priority:
+                    dropped = raw_queue[worst_idx]
+                    del raw_queue[worst_idx]
+                    heapq.heapify(raw_queue)
+                    self._queue.task_done()
+                    self._dropped_by_topic[dropped[2]] += 1
+                    self._queue.put_nowait(item)
+                    logger.warning(
+                        f"[EventBus] Queue full; dropped lower-priority "
+                        f"'{dropped[2]}' for '{topic}'"
+                    )
+                    return
+
+        await self._queue.put(item)
+
     async def _safe_call(self, handler: EventHandler, topic: str, payload: dict) -> None:
         """
         Call a single handler, catching and logging any exception.
@@ -173,3 +325,8 @@ class EventBus:
     def subscriber_count(self) -> int:
         """Total number of registered handler functions across all topics."""
         return sum(len(v) for v in self._subscribers.values())
+
+    @property
+    def dropped_counts(self) -> dict[str, int]:
+        """Events dropped by rate limit or priority eviction, keyed by topic."""
+        return dict(self._dropped_by_topic)

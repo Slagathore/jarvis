@@ -60,6 +60,11 @@ scipy>=1.11.0
 # K-means in modules/world_model/cluster_builder.py — Phase 4 cold-start
 # protocol. Light usage; sklearn's other modules aren't imported.
 scikit-learn>=1.4.0
+# Optional-but-configured object tracking: CLIP embeddings + OWLv2 open-vocab
+# detection. These are lazy-loaded and degrade to Null* fallbacks if disabled
+# in config, but config.yaml enables tracked_objects.open_vocabulary by default.
+open-clip-torch>=2.26.1
+transformers>=4.46.0
 
 # ── Audio Classification ───────────────────────────────────────────────────
 tensorflow==2.17.0
