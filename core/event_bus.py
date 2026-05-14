@@ -91,18 +91,41 @@ _DEFAULT_TOPIC_RATE_LIMITS: dict[str, tuple[float, int]] = {
 
 
 class _SubscriptionHandle:
-    """No-op awaitable returned by subscribe().
+    """Handle returned by subscribe(). Two shapes for two callers:
 
-    Most of the codebase correctly treats EventBus.subscribe() as a synchronous
-    registration call. A few newer modules used `await bus.subscribe(...)`.
-    Returning an already-completed awaitable keeps both call styles valid
-    without delaying registration or forcing every older caller to change.
+    1. Old call sites that ignore the return value still work — the
+       handler is already registered before the handle is returned.
+    2. `await bus.subscribe(...)` still works — the handle is an
+       already-completed awaitable.
+    3. New: callers that need to unregister (plugins, selfedit reloads,
+       per-request handlers) can hold the handle and call `.unsubscribe()`
+       later.
     """
+
+    def __init__(
+        self,
+        bus: Optional["EventBus"] = None,
+        topic: Optional[str] = None,
+        handler: Optional["EventHandler"] = None,
+    ) -> None:
+        self._bus = bus
+        self._topic = topic
+        self._handler = handler
+        self._active = bus is not None
 
     def __await__(self):
         if False:
             yield None
         return None
+
+    def unsubscribe(self) -> bool:
+        """Idempotent removal. Returns True iff the handler was still
+        registered when the call arrived."""
+        if not self._active or self._bus is None or self._topic is None \
+                or self._handler is None:
+            return False
+        self._active = False
+        return self._bus._unsubscribe(self._topic, self._handler)
 
 
 class EventBus:
@@ -154,10 +177,36 @@ class EventBus:
         Register an async handler for the given topic.
         Multiple handlers per topic are all called concurrently.
         Calling this after run() has started is safe — changes take effect immediately.
+
+        Returns a SubscriptionHandle. Callers that need to remove the
+        handler later (plugins, selfedit reloads, dashboard hot-reload)
+        can hold the handle and call `.unsubscribe()` — older callers
+        that ignore the return value or `await` it still work unchanged.
         """
         self._subscribers[topic].append(handler)
         logger.debug(f"[EventBus] '{topic}' ← {handler.__qualname__}")
-        return _SubscriptionHandle()
+        return _SubscriptionHandle(bus=self, topic=topic, handler=handler)
+
+    def unsubscribe(self, topic: str, handler: EventHandler) -> bool:
+        """Remove a previously-registered handler. Idempotent — returns
+        True if the handler was registered and got removed, False if
+        either the topic or the handler had no matching entry."""
+        return self._unsubscribe(topic, handler)
+
+    def _unsubscribe(self, topic: str, handler: EventHandler) -> bool:
+        handlers = self._subscribers.get(topic)
+        if not handlers:
+            return False
+        try:
+            handlers.remove(handler)
+        except ValueError:
+            return False
+        if not handlers:
+            # Drop the empty list so subscriber_count / dispatch lookup
+            # don't see a phantom topic.
+            del self._subscribers[topic]
+        logger.debug(f"[EventBus] '{topic}' ✗ {handler.__qualname__}")
+        return True
 
     async def publish(
         self,
