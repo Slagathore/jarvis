@@ -290,7 +290,12 @@ class MQTTClient:
                 except json.JSONDecodeError:
                     data = text
 
-            # Dispatch to registered handlers
+            # Dispatch to registered handlers. NodeManager owns the
+            # node.status event lifecycle — it subscribes here for the
+            # raw heartbeat and publishes node.status to the bus *only*
+            # on real online/offline (or metadata) transitions, not on
+            # every 15s heartbeat. Generic transports shouldn't invent
+            # app-level events when a domain manager already exists.
             for pattern, handler in self._subscriptions.items():
                 if self._topic_matches(pattern, topic):
                     try:
@@ -299,19 +304,6 @@ class MQTTClient:
                         logger.warning(
                             f"[MQTT] Handler error for '{topic}': {e}"
                         )
-
-            # Forward node status messages to the event bus. Audio chunks
-            # are NOT forwarded — the dedicated Esp32MqttMicSource subscribes
-            # to its own audio/in topic via the direct handler dispatch above
-            # and consumes the bytes there. Re-publishing on the event bus
-            # would just spam "no subscribers" warnings ~50 times/sec since
-            # nothing else listens for raw PCM frames.
-            if "/status" in topic:
-                room = self._extract_room(topic)
-                await self._event_bus.publish(
-                    "node.status",
-                    {"room": room, "topic": topic, "data": data},
-                )
 
         except Exception as e:
             logger.debug(f"[MQTT] Dispatch error for '{topic}': {e}")

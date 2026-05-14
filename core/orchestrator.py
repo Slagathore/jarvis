@@ -709,7 +709,9 @@ class Orchestrator:
         # BUG FIX: NodeManager takes (config, mqtt_client) — was using wrong param name "mqtt"
         self.mqtt = MQTTClient(config=self.config, event_bus=self.bus)
         await self.mqtt.connect()
-        self.nodes = NodeManager(config=self.config, mqtt_client=self.mqtt)
+        self.nodes = NodeManager(
+            config=self.config, mqtt_client=self.mqtt, event_bus=self.bus,
+        )
         await self.nodes.load()
         # Late-bind MQTT into voice managers so esp32_* mic/speaker sources
         # can subscribe/publish. Mic/speaker managers were constructed in
@@ -3927,10 +3929,21 @@ class Orchestrator:
             await self._speak(text, priority=priority)
 
     async def _on_node_status(self, event: dict) -> None:
-        """Handle ESP32 node coming online or going offline."""
+        """Handle ESP32 node online/offline TRANSITIONS.
+
+        NodeManager only fires this event on real transitions (offline→
+        online, online→offline, or IP/fw change) so the log line below
+        is meaningful — it used to fire every 15s per node.
+        """
         room = event.get("room")
         data = event.get("data")
-        if isinstance(data, str):
+        # Prefer the new top-level "online" field (set by NodeManager).
+        # Fall back to legacy payload shapes so older producers (tests,
+        # other transports) still work.
+        if "online" in event:
+            online = bool(event.get("online"))
+            ip = event.get("ip")
+        elif isinstance(data, str):
             online = data.strip().lower() == "online"
             ip = event.get("ip")
         elif isinstance(data, dict):
@@ -3938,14 +3951,10 @@ class Orchestrator:
             online = bool(data.get("online", status == "online"))
             ip = data.get("ip", event.get("ip"))
         else:
-            online = bool(event.get("online", False))
+            online = False
             ip = event.get("ip")
 
         logger.info(f"[Node] {room} → {'online' if online else 'offline'}")
-
-        if self.nodes:
-            # NodeManager handles its own state; just broadcast to dashboard
-            pass
 
         await self._broadcast({
             "type": "node_status",

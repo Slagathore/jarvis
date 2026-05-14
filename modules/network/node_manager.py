@@ -72,9 +72,14 @@ class NodeManager:
     If a node goes silent for NODE_STALE_SECONDS, it's marked offline.
     """
 
-    def __init__(self, config: dict, mqtt_client) -> None:
+    def __init__(self, config: dict, mqtt_client, event_bus=None) -> None:
         self._config = config
         self._mqtt = mqtt_client
+        # Optional bus reference — kept optional so unit tests that
+        # construct a bare NodeManager without a full orchestrator
+        # don't have to invent one. When present, transition publishes
+        # go here; when absent, transitions only update local state.
+        self._event_bus = event_bus
         self._stale_seconds: float = NODE_STALE_SECONDS
 
         # Initialize node records from rooms config. Under the new toggle
@@ -204,7 +209,11 @@ class NodeManager:
     async def _on_status(self, topic: str, data: dict) -> None:
         """
         Handle incoming node status message.
-        Updates the node's heartbeat time and online flag.
+        Updates the node's heartbeat time and online flag, and publishes
+        a node.status event ONLY on a real transition (offline→online,
+        or IP / firmware change). Heartbeats that confirm an already-
+        online node don't fire an event — that was the ~15s-per-node
+        log spam.
         """
         room = self._mqtt._extract_room(topic)
         now = datetime.now()
@@ -219,6 +228,8 @@ class NodeManager:
 
         node = self._nodes[room]
         was_online = node.online
+        prev_ip = node.ip_address
+        prev_fw = node.firmware_version
 
         node.online = True
         node.last_seen = now
@@ -230,30 +241,52 @@ class NodeManager:
             node.has_camera = data.get("cam", node.has_camera)
             node.has_microphone = data.get("mic", node.has_microphone)
 
-        if not was_online:
+        transition = not was_online
+        metadata_changed = (
+            node.ip_address != prev_ip
+            or node.firmware_version != prev_fw
+        )
+
+        if transition:
             logger.info(f"[NodeManager] Node '{room}' came online (IP: {node.ip_address})")
             # Push the configured idle FPS to the node so its camera frame rate
             # matches what's in config.yaml (firmware default is 1fps idle).
             fps_idle = self._room_fps_idle.get(room)
             if fps_idle:
-                topic = f"jarvis/nodes/{room}/camera/fps"
+                fps_topic = f"jarvis/nodes/{room}/camera/fps"
                 try:
-                    await self._mqtt.publish(topic, str(fps_idle), qos=0)
+                    await self._mqtt.publish(fps_topic, str(fps_idle), qos=0)
                     logger.info(
                         f"[NodeManager] Set '{room}' camera idle fps to {fps_idle}"
                     )
                 except Exception as e:
                     logger.debug(f"[NodeManager] FPS publish to '{room}' failed: {e}")
 
+        if (transition or metadata_changed) and self._event_bus is not None:
+            await self._event_bus.publish(
+                "node.status",
+                {
+                    "room": room,
+                    "topic": topic,
+                    "online": True,
+                    "ip": node.ip_address,
+                    "firmware_version": node.firmware_version,
+                    "data": data,
+                },
+            )
+
     async def monitor_heartbeats(self) -> None:
         """
         Background task that checks for stale nodes every 10 seconds.
-        Marks nodes offline if no heartbeat received within stale threshold.
+        Marks nodes offline if no heartbeat received within stale threshold,
+        and publishes a node.status transition so the dashboard and
+        orchestrator notice promptly.
         """
         while True:
             try:
                 await asyncio.sleep(10)
                 now = datetime.now()
+                stale_rooms: list[tuple[str, NodeInfo, float]] = []
                 for room, node in self._nodes.items():
                     if not node.online:
                         continue
@@ -262,9 +295,21 @@ class NodeManager:
                     age = (now - node.last_seen).total_seconds()
                     if age > self._stale_seconds:
                         node.online = False
+                        stale_rooms.append((room, node, age))
                         logger.warning(
                             f"[NodeManager] Node '{room}' went offline "
                             f"(no heartbeat for {age:.0f}s)"
+                        )
+                if stale_rooms and self._event_bus is not None:
+                    for room, node, _age in stale_rooms:
+                        await self._event_bus.publish(
+                            "node.status",
+                            {
+                                "room": room,
+                                "online": False,
+                                "ip": node.ip_address,
+                                "firmware_version": node.firmware_version,
+                            },
                         )
             except asyncio.CancelledError:
                 break
