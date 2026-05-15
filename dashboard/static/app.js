@@ -21,6 +21,7 @@
 
 // Keeps the latest room data so updateRooms always renders the full set
 let roomsCache = {};
+let activeTab = "home";
 
 // ── Visibility-aware polling ──────────────────────────────────────────────
 // All recurring dashboard polls go through safeInterval() so they:
@@ -668,6 +669,7 @@ function updateRooms(rooms) {
 // Poll-style refresh: cheaper than MJPEG long-poll, gracefully degrades when
 // the snapshot endpoint 404s (rooms without cameras hide the <img>).
 function refreshRoomFeeds() {
+  if (activeTab !== "home") return;
   const imgs = document.querySelectorAll("img.room-feed");
   const stamp = Date.now();
   imgs.forEach((img) => {
@@ -713,15 +715,14 @@ function refreshRoomFeeds() {
   });
 }
 
-// 500ms = 2 fps. The dashboard is a "what's happening in each room"
+// 2000ms = 0.5 fps. The dashboard is a "what's happening in each room"
 // status board, not a video player — humans can't perceive motion
-// smoothness much below ~10fps and we're nowhere near that anyway. The
-// 4fps we used to ship triggered cv2.imencode + a fresh camera read on
-// the server eight times per second total across rooms, even when the
-// tab was hidden. safeInterval pauses on document.hidden, the in-flight
-// guard above prevents stacking when the snapshot endpoint is slow, and
-// the orchestrator-side TTL cache deduplicates back-to-back requests.
-safeInterval(refreshRoomFeeds, 500);
+// smoothness much below ~10fps and we're nowhere near that anyway. Faster
+// polling triggers cv2.imencode + frame reads across every configured room.
+// safeInterval pauses on document.hidden, the active-tab guard above stops
+// camera polling while the dashboard is on Settings/Logs/Perf, and the
+// server-side preview cache deduplicates back-to-back requests.
+safeInterval(refreshRoomFeeds, 2000);
 
 function updateRoomVision(roomId, data) {
   // Vision events imply the room has a camera, so make sure has_camera sticks
@@ -2487,7 +2488,7 @@ async function openRoomSettingsModal(room) {
   // a filename to the save dialog.
   document.getElementById("rs-snapshot").onclick = () => {
     const a = document.createElement("a");
-    a.href = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?t=${Date.now()}`;
+    a.href = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?full=1&t=${Date.now()}`;
     a.download = `${room}_snapshot_${Date.now()}.jpg`;
     document.body.appendChild(a);
     a.click();
@@ -4247,6 +4248,7 @@ safeInterval(loadClownStatus, 8000);
   buttons.forEach((btn) => {
     btn.addEventListener("click", () => {
       const target = btn.dataset.tab;
+      activeTab = target || "home";
       buttons.forEach((b) => b.classList.toggle("active", b === btn));
       Object.entries(panes).forEach(([k, el]) => {
         if (!el) return;
@@ -4258,6 +4260,7 @@ safeInterval(loadClownStatus, 8000);
       if (target !== "logs") disconnectLogStream();
       if (target === "perf") startPerfRefresh();
       else stopPerfRefresh();
+      if (target === "home") refreshRoomFeeds();
     });
   });
   // Keep the tab badge in sync independent of which tab is open.

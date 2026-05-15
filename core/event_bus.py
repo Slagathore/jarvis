@@ -168,6 +168,8 @@ class EventBus:
             self._topic_rate_limits.update(topic_rate_limits)
         self._rate_buckets: dict[str, dict[str, float]] = {}
         self._dropped_by_topic: dict[str, int] = defaultdict(int)
+        self._drop_log_state: dict[str, dict[str, float]] = {}
+        self._drop_log_interval_s: float = 30.0
         self._running: bool = False
 
     # ── Public API ───────────────────────────────────────────────────────────
@@ -221,7 +223,7 @@ class EventBus:
         """
         if not self._allow_by_rate_limit(topic):
             self._dropped_by_topic[topic] += 1
-            logger.debug(f"[EventBus] Rate-limited '{topic}' — event dropped")
+            self._log_rate_limited_drop(topic)
             return
         event_priority = int(priority) if priority is not None else self._priority_for(topic)
         await self._put_event(event_priority, topic, payload)
@@ -315,6 +317,32 @@ class EventBus:
             bucket["tokens"] -= 1.0
             return True
         return False
+
+    def _log_rate_limited_drop(self, topic: str) -> None:
+        """Log rate-limit drops in batches instead of once per dropped event.
+
+        High-frequency telemetry topics can legitimately overflow their rate
+        bucket thousands of times per minute. Logging every rejected sample
+        turns the limiter into a disk/console spam source, which is exactly the
+        overload path the limiter is meant to prevent.
+        """
+        now = time.monotonic()
+        state = self._drop_log_state.get(topic)
+        if state is None:
+            self._drop_log_state[topic] = {"count": 1.0, "last_log": now}
+            return
+
+        state["count"] += 1.0
+        if now - state["last_log"] < self._drop_log_interval_s:
+            return
+
+        count = int(state["count"])
+        state["count"] = 0.0
+        state["last_log"] = now
+        logger.debug(
+            f"[EventBus] Rate-limited '{topic}' — dropped {count} event(s) "
+            f"in the last {self._drop_log_interval_s:.0f}s"
+        )
 
     async def _put_event(self, priority: int, topic: str, payload: dict) -> None:
         item = (priority, next(self._sequence), topic, payload)

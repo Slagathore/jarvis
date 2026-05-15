@@ -345,7 +345,7 @@ Routes used:
       }
       currentRoom = roomId;
       setStatus(`Loading ${roomId}…`, "info");
-      frame.src = `/api/camera/${encodeURIComponent(roomId)}/snapshot.jpg?t=${Date.now()}`;
+      frame.src = `/api/camera/${encodeURIComponent(roomId)}/snapshot.jpg?full=1&t=${Date.now()}`;
       try {
         const data = await fetchJson(
           `/api/world_model/rooms/${encodeURIComponent(roomId)}/polygons`,
@@ -694,7 +694,7 @@ Routes used:
 
     roomSelect.addEventListener("change", () => loadRoom(roomSelect.value));
     refreshBtn.addEventListener("click", () => {
-      frame.src = `/api/camera/${encodeURIComponent(currentRoom)}/snapshot.jpg?t=${Date.now()}`;
+      frame.src = `/api/camera/${encodeURIComponent(currentRoom)}/snapshot.jpg?full=1&t=${Date.now()}`;
     });
     reloadBtn.addEventListener("click", () => loadRoom(currentRoom));
     saveBtn.addEventListener("click", async () => {

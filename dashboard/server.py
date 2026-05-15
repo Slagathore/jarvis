@@ -83,6 +83,8 @@ class DashboardServer:
         self._active_voice: str = ""
         self._camera_manager = None  # Set by orchestrator via register_camera_manager()
         self._camera_jpeg_quality = 70
+        self._camera_preview_jpeg_quality = 55
+        self._camera_preview_max_width = 640
         # Short-lived JPEG cache for /api/camera/{room}/snapshot.jpg. When
         # multiple browser tabs poll the same room (or one tab polls
         # faster than the camera produces new frames), this short-circuits
@@ -91,6 +93,7 @@ class DashboardServer:
         # latency is unchanged.
         self._snapshot_cache: dict[str, tuple[float, bytes]] = {}
         self._snapshot_cache_ttl_s: float = 0.15
+        self._snapshot_preview_cache_ttl_s: float = 0.75
         self._mic_manager = None     # Set by orchestrator via register_mic_manager()
         self._speaker_manager = None # Set by orchestrator via register_speaker_manager()
         self._room_settings = None   # Set by orchestrator via register_room_settings()
@@ -1694,8 +1697,12 @@ class DashboardServer:
             return JSONResponse({"active": True, "until": until.isoformat()})
 
         @app.get("/api/camera/{room}/snapshot.jpg")
-        async def camera_snapshot(room: str):
-            """Single-frame JPEG snapshot of a room's camera. Browser polls this."""
+        async def camera_snapshot(room: str, request: Request):
+            """Single-frame JPEG snapshot of a room's camera. Browser polls this.
+
+            Default responses are resized preview JPEGs for the room cards. Add
+            `full=1` or `lb=...` for full-resolution lightbox/download views.
+            """
             if not _CV2_AVAILABLE or cv2 is None:
                 raise HTTPException(status_code=503, detail="OpenCV not available")
             cm = self._camera_manager
@@ -1703,14 +1710,23 @@ class DashboardServer:
                 raise HTTPException(status_code=503, detail="Camera manager not registered")
             if room not in cm.get_available_rooms():
                 raise HTTPException(status_code=404, detail=f"No camera for '{room}'")
+            full_res = (
+                request.query_params.get("full") == "1"
+                or request.query_params.get("lb") is not None
+            )
+            cache_key = f"{room}:full" if full_res else f"{room}:preview"
+            ttl_s = (
+                self._snapshot_cache_ttl_s
+                if full_res else self._snapshot_preview_cache_ttl_s
+            )
             # Short-TTL cache: dedupes back-to-back polls (multiple tabs,
             # fast clients) without re-running capture+encode for each.
             import time as _t
             now = _t.monotonic()
-            cached = self._snapshot_cache.get(room)
+            cached = self._snapshot_cache.get(cache_key)
             if cached is not None:
                 cached_at, jpeg_bytes = cached
-                if now - cached_at < self._snapshot_cache_ttl_s:
+                if now - cached_at < ttl_s:
                     return Response(
                         content=jpeg_bytes,
                         media_type="image/jpeg",
@@ -1719,11 +1735,23 @@ class DashboardServer:
             frame = await cm.capture_frame_async(room)
             if frame is None:
                 raise HTTPException(status_code=502, detail="Frame capture failed")
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self._camera_jpeg_quality])
+            quality = self._camera_jpeg_quality
+            if not full_res:
+                h, w = frame.shape[:2]
+                max_w = max(1, int(self._camera_preview_max_width))
+                if w > max_w:
+                    new_h = max(1, int(h * (max_w / float(w))))
+                    frame = cv2.resize(
+                        frame,
+                        (max_w, new_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                quality = self._camera_preview_jpeg_quality
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
             if not ok:
                 raise HTTPException(status_code=500, detail="JPEG encode failed")
             jpeg_bytes = buf.tobytes()
-            self._snapshot_cache[room] = (now, jpeg_bytes)
+            self._snapshot_cache[cache_key] = (now, jpeg_bytes)
             return Response(
                 content=jpeg_bytes,
                 media_type="image/jpeg",
