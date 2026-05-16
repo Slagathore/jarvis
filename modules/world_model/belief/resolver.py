@@ -19,8 +19,12 @@ SHADOW MODE (D4a — current):
          observed against the running WorldModel before D4b flips the
          projection over to it.
 
-         D4a scope is PEOPLE (entities with a resolved person_id). Pets
-         and objects need the evidence-matching work in D4b.
+         SCOPE: people (keyed by resolved person_id) AND pets (cat/dog,
+         keyed coarsely by obj_class:room). Pet *identity* — which cat —
+         is deliberately NOT resolved here; that per-animal matching is
+         the D4b job. Shadow-mode pet ingest exists so belief_evidence
+         accumulates real pet sightings (with colour/size/bbox features)
+         for D4b to be built and tuned against. Objects are still D4b.
 
 Modules: modules/world_model/belief/resolver.py
 Classes: BeliefResolver
@@ -119,26 +123,48 @@ class BeliefResolver:
             ts = payload.get("ts") or _utcnow()
             observations = payload.get("observations") or []
 
-            # People sighted in this batch — D4a only resolves entities
-            # that already carry a person_id.
+            # Build evidence from each observation. People are keyed by their
+            # resolved person_id; pets (cat/dog) are keyed coarsely by
+            # obj_class:room. The coarse pet key means multi-animal identity
+            # is NOT resolved here — proper per-animal matching is the D4b
+            # job. What matters in shadow mode is that every pet sighting
+            # still lands a belief_evidence row carrying the colour / size /
+            # bbox features D4b will need, so one walk-around gathers data
+            # for people and pets alike.
             seen_keys: set[str] = set()
             async with self._lock:
                 for obs in observations:
                     pid = getattr(obs, "person_id", None)
-                    if pid is None:
+                    obj_class = getattr(obs, "obj_class", None)
+                    if pid is not None:
+                        key = f"person:{pid}"
+                        etype = "person"
+                        score = float(
+                            getattr(obs, "confidence", 0.0)
+                            * max(0.05,
+                                  getattr(obs, "person_match_confidence", 0.0))
+                        )
+                        meta: dict = {
+                            "person_name": getattr(obs, "person_name", None),
+                        }
+                    elif obj_class in ("cat", "dog"):
+                        key = f"{obj_class}:{room}"
+                        etype = obj_class
+                        score = float(getattr(obs, "confidence", 0.0))
+                        omd = getattr(obs, "metadata", {}) or {}
+                        meta = {
+                            "color_class": omd.get("color_class"),
+                            "size_normalized": omd.get("size_normalized"),
+                        }
+                    else:
                         continue
-                    key = f"person:{pid}"
                     seen_keys.add(key)
-                    score = float(
-                        getattr(obs, "confidence", 0.0)
-                        * max(0.05, getattr(obs, "person_match_confidence", 0.0))
-                    )
                     ev = EvidenceFrame(
-                        ts=ts, entity_key=key, entity_type="person",
+                        ts=ts, entity_key=key, entity_type=etype,
                         source="vision.observation", evidence_type="sighting",
                         room=room, camera=camera, score=score,
                         bbox=getattr(obs, "bbox", None),
-                        payload={"person_name": getattr(obs, "person_name", None)},
+                        payload=meta,
                     )
                     await self._ingest_sighting(ev)
 
