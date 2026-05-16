@@ -1747,6 +1747,7 @@ class DashboardServer:
             # Run them off the event loop so a snapshot poll doesn't stall
             # every other request for the duration.
             def _encode():
+                assert cv2 is not None  # guaranteed by the _CV2_AVAILABLE check above
                 f = frame
                 quality = self._camera_jpeg_quality
                 if not full_res:

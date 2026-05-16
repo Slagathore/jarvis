@@ -22,7 +22,7 @@ Classes: ToolsMixin
 import asyncio
 import base64
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import numpy as np
 from loguru import logger
@@ -113,6 +113,23 @@ class ToolsMixin:
     Mixed into Orchestrator — all `self.*` attributes resolve
     against the concrete Orchestrator instance at runtime.
     """
+
+    # ── Host attributes ──────────────────────────────────────────────────────
+    # These live on the concrete Orchestrator (set in its __init__, or a
+    # class constant). Declared here under TYPE_CHECKING so the type checker
+    # knows the mixin's `self.*` references resolve — no runtime effect.
+    if TYPE_CHECKING:
+        config: dict
+        calendar: Optional[Any]
+        memory: Optional[Any]
+        computer: Optional[Any]
+        selfedit: Optional[Any]
+        cameras: Optional[Any]
+        llm: Optional[Any]
+        world_query_tools: Optional[Any]
+        _claude_client: Optional[Any]
+        _CALENDAR_TOOLS: list[dict]
+        _broadcast: Callable[[dict], Any]
 
     async def _tool_calendar_list_events(
         self,
