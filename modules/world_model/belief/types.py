@@ -92,6 +92,13 @@ class BeliefHypothesis:
     last_confirmed_ts: Optional[datetime] = None
     last_evidence_ts: Optional[datetime] = None
     evidence_breakdown: dict = field(default_factory=dict)
+    # Hysteresis run-counters (in-memory only; not persisted). The discrete
+    # PRESENT_CONFIRMED <-> PRESENT_UNSEEN state flips on a *run* of
+    # consecutive misses / hits, not on a single noisy frame — so an
+    # intermittently-detected entity (white dog on a white blanket) holds
+    # a stable belief instead of flapping every detector cycle.
+    consecutive_misses: int = 0
+    consecutive_hits: int = 0
 
     def recompute_state_confidence(self) -> None:
         """state confidence is derived — the weakest-link of identity and

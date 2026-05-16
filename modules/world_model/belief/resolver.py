@@ -55,6 +55,13 @@ _DEFAULTS = {
     "absence_location_decay": 0.97,    # location barely moves on a missed frame
     "cross_room_move_margin": 0.30,    # new room must beat old location by this
     "present_unseen_threshold": 0.30,  # visibility below this → PRESENT_UNSEEN
+    # Hysteresis: the discrete CONFIRMED<->UNSEEN state flips only on a RUN
+    # of consecutive misses / hits, not a single noisy frame. A full flap
+    # now costs unseen_misses + confirmed_hits detector cycles, which keeps
+    # an intermittently-detected entity's belief stable instead of
+    # oscillating every cycle.
+    "present_unseen_misses": 6,        # consec. misses: CONFIRMED → UNSEEN
+    "present_confirmed_hits": 3,       # consec. hits:   UNSEEN → CONFIRMED
     "decay_interval_s": 30.0,
     "stale_location_decay": 0.92,      # per decay tick with no evidence
     "departed_threshold": 0.12,        # location below this → DEPARTED
@@ -198,13 +205,25 @@ class BeliefResolver:
         gain_vis = self._cfg["sighting_visibility_gain"]
 
         if hyp.room is None or hyp.room == ev.room:
-            # Same room (or first sighting) — reinforce.
+            # Same room (or first sighting) — reinforce. Confidences track
+            # every frame; the discrete STATE is hysteretic (run-counters).
             hyp.room, hyp.camera = ev.room, ev.camera
             hyp.confidence_location = _lift(hyp.confidence_location,
                                             ev.score * gain_loc)
             hyp.confidence_visibility = _lift(hyp.confidence_visibility,
                                               ev.score * gain_vis)
-            hyp.state = BeliefState.PRESENT_CONFIRMED
+            hyp.consecutive_hits += 1
+            hyp.consecutive_misses = 0
+            if hyp.state == BeliefState.PRESENT_UNSEEN:
+                # Re-confirm only after a run of hits — one stray frame in
+                # a quiet gap should not flip the label back to confirmed.
+                if hyp.consecutive_hits >= self._cfg["present_confirmed_hits"]:
+                    hyp.state = BeliefState.PRESENT_CONFIRMED
+            elif hyp.state != BeliefState.PRESENT_CONFIRMED:
+                # UNKNOWN / DEPARTED / SUSPECTED_ELSEWHERE / TRANSITIONING —
+                # a same-room sighting is an unambiguous (re)acquisition.
+                hyp.state = BeliefState.PRESENT_CONFIRMED
+            # else already PRESENT_CONFIRMED — hold.
         else:
             # Different room — only move if this sighting beats the old
             # location confidence by the move margin. Otherwise the old
@@ -238,6 +257,8 @@ class BeliefResolver:
 
     async def _ingest_absence(self, ev: EvidenceFrame, hyp: BeliefHypothesis) -> None:
         prev_state, prev_room = hyp.state, hyp.room
+        hyp.consecutive_misses += 1
+        hyp.consecutive_hits = 0
         hyp.confidence_visibility = round(
             hyp.confidence_visibility * self._cfg["absence_visibility_decay"], 4
         )
@@ -255,11 +276,15 @@ class BeliefResolver:
             # absence spam: the _on_observation absence loop only feeds
             # hypotheses still in a PRESENT_* state.
             hyp.state = BeliefState.DEPARTED
-        elif (hyp.confidence_visibility < self._cfg["present_unseen_threshold"]
-                and hyp.state == BeliefState.PRESENT_CONFIRMED):
-            # Not detected, but location confidence is still high — believed
-            # present, just not currently observable. (Door-disappearance /
-            # white-dog-on-white-blanket rule.)
+        elif (hyp.state == BeliefState.PRESENT_CONFIRMED
+                and hyp.consecutive_misses >= self._cfg["present_unseen_misses"]
+                and hyp.confidence_visibility
+                < self._cfg["present_unseen_threshold"]):
+            # Not detected for a sustained RUN of frames — believed still
+            # present (location confidence holds), just not currently
+            # observable. The miss-run gate is what stops the flapping: a
+            # 1-2 frame YOLO gap no longer flips the label. (Door-
+            # disappearance / white-dog-on-white-blanket rule.)
             hyp.state = BeliefState.PRESENT_UNSEEN
         hyp.last_evidence_ts = ev.ts
         hyp.recompute_state_confidence()
