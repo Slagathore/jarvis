@@ -5279,6 +5279,82 @@ class Orchestrator:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
 
+    # ── Smoke test ─────────────────────────────────────────────────────────
+
+    async def smoke_init(self) -> bool:
+        """Boot the safe subset and report health — used by `--smoke-init`.
+
+        Exercises the real boot path that matters for catching the bugs
+        this audit found (DB schema/migrations, notification dispatcher
+        construction, event bus, alarm-audio rendering) WITHOUT opening
+        camera/mic hardware or loading heavy ML weights. Returns True iff
+        every check passed.
+        """
+        ok = True
+
+        # DB init + schema migrations + dispatcher construction.
+        try:
+            await self._init_database()
+            logger.info("[Smoke] DB init + schema migrations: OK")
+        except Exception as e:
+            logger.error(f"[Smoke] DB init FAILED: {e}")
+            ok = False
+
+        # Notification dispatcher (constructed inside _init_database).
+        if self.notification_dispatcher is not None:
+            chans = self.notification_dispatcher.configured_channels
+            logger.info(
+                f"[Smoke] notification dispatcher: OK "
+                f"(channels={chans or 'none enabled'}, "
+                f"fire→{self.notification_dispatcher.routes_for('fire')})"
+            )
+        else:
+            logger.error("[Smoke] notification dispatcher NOT constructed")
+            ok = False
+
+        # Event bus.
+        logger.info(
+            f"[Smoke] event bus: OK "
+            f"(queue_depth={self.bus.queue_depth}, "
+            f"subscribers={self.bus.subscriber_count})"
+        )
+
+        # Alarm-audio TTS render — the C1 regression guard. A fake TTS
+        # returns the same np.ndarray shape PiperTTS does.
+        try:
+            import numpy as _np
+
+            from modules.safety.alarms.audio import AlarmAudio
+
+            class _FakeTTS:
+                _sample_rate = 22050
+
+                def synthesize(self, text: str):
+                    return _np.zeros(2205, dtype=_np.float32)
+
+            aa = AlarmAudio.__new__(AlarmAudio)
+            aa._tts = _FakeTTS()  # type: ignore[attr-defined]
+            pcm, rate = await aa._render_tts("smoke test")
+            if pcm:
+                logger.info(
+                    f"[Smoke] alarm TTS render: OK ({len(pcm)} bytes @ {rate}Hz)"
+                )
+            else:
+                logger.error("[Smoke] alarm TTS render produced EMPTY audio")
+                ok = False
+        except Exception as e:
+            logger.error(f"[Smoke] alarm TTS render FAILED: {e}")
+            ok = False
+
+        # Clean up the DB connection we opened.
+        if self.db is not None:
+            try:
+                await self.db.close()
+            except Exception as e:
+                logger.debug(f"[Smoke] DB close failed: {e}")
+
+        return ok
+
     # ── Main Entry Point ───────────────────────────────────────────────────
 
     async def run(self) -> None:

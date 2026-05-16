@@ -204,6 +204,13 @@ def parse_args() -> argparse.Namespace:
         help="Load config + import modules but exit before starting the event loop.",
     )
     parser.add_argument(
+        "--smoke-init",
+        action="store_true",
+        help="Boot the safe subset (DB + migrations + notification dispatcher "
+             "+ event bus + alarm-audio render) and exit. No camera/mic "
+             "hardware, no heavy model loading. CI-style health gate.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Skip the process-lock check (use only if you know no other instance is running).",
@@ -317,6 +324,16 @@ async def main(args: argparse.Namespace) -> None:
 
     from core.orchestrator import Orchestrator
     orchestrator = Orchestrator(config)
+
+    if args.smoke_init:
+        logger.info("[Main] --smoke-init: running safe-subset boot checks.")
+        ok = await orchestrator.smoke_init()
+        if ok:
+            logger.info("[Main] Smoke-init PASSED — core boot path is healthy.")
+        else:
+            logger.error("[Main] Smoke-init FAILED — see errors above.")
+            sys.exit(1)
+        return
 
     _install_unix_signal_handlers()
 
