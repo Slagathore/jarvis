@@ -3688,15 +3688,15 @@ async function openLivePetTagModal(room) {
   if (saveBtn) {
     saveBtn.addEventListener("click", async () => {
       if (!selectedDet) return;
-      // Person boxes are display-only — there's no animal to tag
-      // here. The Pending Reviews tab handles identity assignment.
-      if (selectedDet.entity_type === "person") {
-        statusEl.textContent = "person boxes are display-only — use the Pending Reviews tab to assign identity.";
-        statusEl.className = "live-pet-status err";
-        return;
-      }
+      // A "person" box here is usually a pet YOLO misclassified — that is
+      // exactly the case the user needs to correct, so tagging it as a pet
+      // is allowed and goes through the same tag_in_frame path. The backend
+      // matches person-typed event rows too and flips them to the pet.
       const target = overlay.querySelector("#live-pet-select").value;
       if (!target) return;
+      if (selectedDet.entity_type === "person") {
+        statusEl.textContent = `correcting person → ${target}…`;
+      }
       const idx = _selectedIdx();
       statusEl.textContent = "saving…";
       statusEl.className = "live-pet-status";

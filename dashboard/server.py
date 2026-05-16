@@ -2377,15 +2377,15 @@ class DashboardServer:
                 )
             from datetime import datetime as _dt, timezone as _tz, timedelta as _td
             cutoff = (_dt.now(_tz.utc) - _td(seconds=seconds)).isoformat()
-            # Query BOTH cat and dog rows — the user may be correcting a
-            # cross-species misattribution (e.g. clicking the cat on the
-            # table that the cost function tagged as Dalila the dog).
-            # The frontend now lets the user pick any pet regardless of
-            # the detected species, so the backend must follow suit.
+            # Query cat, dog AND person rows. The user may be correcting a
+            # cross-species misattribution (cat tagged as Dalila the dog) OR
+            # — the common annoyance — a pet that YOLO misdetected as a
+            # person. A pet-logged-as-person has entity_type='person' rows,
+            # so they must be in scope for the IoU relabel to catch them.
             rows = await ws.db.fetchall(
                 "SELECT id, bbox, entity_type FROM world_entity_events "
                 "WHERE room = ? AND ts >= ? "
-                "AND entity_type IN ('cat', 'dog') "
+                "AND entity_type IN ('cat', 'dog', 'person') "
                 "AND bbox IS NOT NULL",
                 (room, cutoff),
             )
@@ -2416,13 +2416,15 @@ class DashboardServer:
                     if r["entity_type"] != target.entity_type:
                         cross_species += 1
             for evt_id in relabeled:
-                # Also update entity_type so cross-species corrections
-                # (Dalila/dog -> Spooky/cat) flip the row's species.
-                # Otherwise downstream filters like list_pets / care
-                # summaries would still see the old class.
+                # Update entity_type so cross-species (Dalila/dog -> Spooky/
+                # cat) and person->pet corrections flip the row's class —
+                # otherwise list_pets / care summaries still see the old one.
+                # person_id is cleared: a row flipped from a person mis-
+                # detection to a pet must not keep a stale person link.
                 await ws.db.execute(
                     "UPDATE world_entity_events SET entity_id = ?, "
-                    "entity_name = ?, entity_type = ? WHERE id = ?",
+                    "entity_name = ?, entity_type = ?, person_id = NULL "
+                    "WHERE id = ?",
                     (target.id, target.display_name,
                      target.entity_type, evt_id),
                 )
