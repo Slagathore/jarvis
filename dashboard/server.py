@@ -3223,6 +3223,45 @@ class DashboardServer:
             })
             return JSONResponse({"ok": True, "event_id": event_id})
 
+        @app.post("/api/world_model/cluster/reset")
+        async def cluster_reset(payload: dict):
+            """Wipe the unattributed detection events for a species so
+            clustering starts from a clean slate. Used when the current
+            cluster set is junk (bad lighting run, a misconfigured cam)
+            and re-tuning from scratch beats hand-deleting rows.
+
+            Only UNATTRIBUTED events are touched — anything already
+            labelled as a known pet is left alone. Body: {species}.
+            """
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            if ws is None:
+                raise HTTPException(
+                    status_code=503, detail="World store unavailable")
+            species = str(payload.get("species") or "cat")
+            where = (
+                "entity_type = ? "
+                "AND event_type IN ('first_seen', 'moved_within_room', "
+                "'reappeared', 'moved_to') "
+                "AND (entity_name IS NULL OR entity_name LIKE 'unknown_%')"
+            )
+            row = await ws.db.fetchone(
+                f"SELECT COUNT(*) AS n FROM world_entity_events WHERE {where}",
+                (species,),
+            )
+            n = int(row["n"]) if row else 0
+            if n:
+                await ws.db.execute(
+                    f"DELETE FROM world_entity_events WHERE {where}",
+                    (species,),
+                )
+            logger.info(
+                f"[cluster/reset] cleared {n} unattributed '{species}' event(s)")
+            await self.broadcast({
+                "type": "cluster_reset", "species": species, "deleted": n,
+            })
+            return JSONResponse({"ok": True, "species": species, "deleted": n})
+
         @app.post("/api/world_model/cluster/apply")
         async def cluster_apply(payload: dict):
             """Submit cluster labels — body shape:
