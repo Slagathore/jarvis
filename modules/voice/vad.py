@@ -98,7 +98,7 @@ class VoiceActivityDetector:
         # Prefer the pip package (fully offline); fall back to torch.hub
         # (downloads once from GitHub, then cached locally).
         try:
-            from silero_vad import load_silero_vad
+            from silero_vad import load_silero_vad  # type: ignore[import-not-found]
             self._silero = load_silero_vad()
         except Exception:
             loaded = torch.hub.load(
@@ -144,7 +144,7 @@ class VoiceActivityDetector:
         with self._torch.no_grad():
             for i in range(n_windows):
                 window = buf[i * _SILERO_WINDOW:(i + 1) * _SILERO_WINDOW]
-                t = self._torch.from_numpy(window).float()
+                t = self._torch.from_numpy(window).float()  # type: ignore[reportPrivateImportUsage]
                 probs.append(float(self._silero(t, VAD_SAMPLE_RATE).item()))
         return max(probs) if probs else 0.0
 

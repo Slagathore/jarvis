@@ -78,7 +78,7 @@ class KokoroTTS:
         Blocking — call once at startup. Never raises: on failure
         loaded stays False and the voice layer keeps using Piper."""
         try:
-            from kokoro import KPipeline
+            from kokoro import KPipeline  # type: ignore[import-not-found]
         except ImportError:
             logger.warning(
                 "[KokoroTTS] 'kokoro' package not installed — "

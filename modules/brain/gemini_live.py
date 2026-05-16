@@ -168,7 +168,7 @@ class GeminiLiveSession:
         """Open the WebSocket and complete the setup handshake.
         Returns False (rather than raising) on any failure so the caller
         can fall straight through to the backup route."""
-        if not self.available:
+        if not self.available or websockets is None:
             logger.warning(
                 "[GeminiLive] unavailable — "
                 f"websockets={'ok' if websockets else 'MISSING'}, "
