@@ -65,6 +65,12 @@ _DEFAULTS = {
     "decay_interval_s": 30.0,
     "stale_location_decay": 0.92,      # per decay tick with no evidence
     "departed_threshold": 0.12,        # location below this → DEPARTED
+    # belief_evidence write throttle. The table is D4b tuning data, not a
+    # per-frame audit log — persisting every absence frame grew it to 90k
+    # rows/day. Transitions always persist; otherwise a sighting persists
+    # at most once per this interval per entity, non-transition absences
+    # never do.
+    "evidence_min_interval_s": 15.0,
 }
 
 
@@ -84,9 +90,13 @@ class BeliefResolver:
             cfg.update({k: v for k, v in config.items() if k in _DEFAULTS})
         self._cfg = cfg
         self.shadow: bool = bool(cfg["shadow"])
+        self._evidence_min_interval_s = float(cfg["evidence_min_interval_s"])
         # entity_key → primary hypothesis. (D4a tracks one per entity;
         # competing secondaries arrive in D4b.)
         self._hyp: dict[str, BeliefHypothesis] = {}
+        # entity_key → ts of its last persisted belief_evidence row, for
+        # the non-transition write throttle.
+        self._last_evidence_persist: dict[str, datetime] = {}
         self._sub = None
         self._decay_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
@@ -251,7 +261,9 @@ class BeliefResolver:
         hyp.last_evidence_ts = ev.ts
         hyp.recompute_state_confidence()
         hyp.evidence_breakdown = {"last": "sighting", "score": round(ev.score, 3)}
-        await self._persist_evidence(ev)
+        transitioned = (hyp.state != prev_state or hyp.room != prev_room)
+        if self._should_persist_evidence(ev, transitioned):
+            await self._persist_evidence(ev)
         await self._persist_belief(hyp)
         await self._on_transition(hyp, prev_state, prev_room)
 
@@ -289,7 +301,9 @@ class BeliefResolver:
         hyp.last_evidence_ts = ev.ts
         hyp.recompute_state_confidence()
         hyp.evidence_breakdown = {"last": "absence"}
-        await self._persist_evidence(ev)
+        transitioned = (hyp.state != prev_state or hyp.room != prev_room)
+        if self._should_persist_evidence(ev, transitioned):
+            await self._persist_evidence(ev)
         await self._persist_belief(hyp)
         await self._on_transition(hyp, prev_state, prev_room)
 
@@ -331,6 +345,33 @@ class BeliefResolver:
                 logger.exception("[BeliefResolver] decay loop iteration failed")
 
     # ── Persistence ──────────────────────────────────────────────────────────
+
+    def _should_persist_evidence(
+        self, ev: EvidenceFrame, transitioned: bool
+    ) -> bool:
+        """Gate belief_evidence writes. The table is D4b tuning data, not
+        a per-frame audit log — persisting every absence frame grew it to
+        ~90k rows/day. Rules:
+          - a state transition always persists (the moment of change is
+            the most valuable row);
+          - otherwise a *sighting* persists at most once per
+            evidence_min_interval_s per entity (sightings carry the
+            colour / size / bbox features D4b needs to be tuned against);
+          - a non-transition *absence* never persists (a 'still not
+            seen' frame carries no signal worth a row).
+        """
+        if transitioned:
+            self._last_evidence_persist[ev.entity_key] = ev.ts
+            return True
+        if ev.evidence_type != "sighting":
+            return False
+        last = self._last_evidence_persist.get(ev.entity_key)
+        if last is not None:
+            elapsed = (_aware(ev.ts) - _aware(last)).total_seconds()
+            if elapsed < self._evidence_min_interval_s:
+                return False
+        self._last_evidence_persist[ev.entity_key] = ev.ts
+        return True
 
     async def _persist_evidence(self, ev: EvidenceFrame) -> None:
         try:

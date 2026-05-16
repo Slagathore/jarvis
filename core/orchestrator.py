@@ -1198,16 +1198,31 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            # Shutdown order matters. Cancel only the top-level loop gather
+            # first, then run _shutdown() *while subsystem tasks still
+            # exist* — so each subsystem's own stop() can wind its loops
+            # (ObservationBuilder room loops, WorldModel/BeliefResolver
+            # loops, dashboard, MQTT, reminders) down cleanly. Cancelling
+            # every task up front would yank those loops out from under
+            # their owners and leave half-stopped subsystems for _shutdown
+            # to close. Only after _shutdown do we sweep orphan tasks.
             gather.cancel()
+            # Bound _shutdown — if a Wyze cap.release() or mic worker.join()
+            # wedges, fall through rather than hang Ctrl-C.
+            try:
+                await asyncio.wait_for(self._shutdown(), timeout=8.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Shutdown] resource teardown exceeded 8s budget")
+            # Last-resort sweep: anything the subsystems' own stop() did not
+            # already finish gets cancelled now.
             running = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
             for t in running:
                 t.cancel()
             if running:
-                # Hard ceiling on cancellation so a stuck to_thread (cv2
-                # FFmpeg release, mic worker.join, ssh teardown) can't
-                # hang Ctrl-C indefinitely. Past this window, tasks
-                # become daemon-thread garbage and the process exits
-                # via _shutdown's resource closes.
+                # Hard ceiling so a stuck to_thread (cv2 FFmpeg release,
+                # ssh teardown) can't hang Ctrl-C indefinitely. Past this
+                # window, tasks become daemon-thread garbage and the
+                # process exits anyway.
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*running, return_exceptions=True),
@@ -1216,13 +1231,7 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
                 except asyncio.TimeoutError:
                     stuck = [t for t in running if not t.done()]
                     logger.warning(
-                        f"[Shutdown] {len(stuck)} task(s) didn't cancel "
-                        f"within 5s — proceeding with resource teardown"
+                        f"[Shutdown] {len(stuck)} orphan task(s) didn't "
+                        f"cancel within 5s — exiting anyway"
                     )
-            # Bound _shutdown the same way — if a Wyze cap.release() or
-            # mic worker.join() wedges, fall through rather than hang.
-            try:
-                await asyncio.wait_for(self._shutdown(), timeout=8.0)
-            except asyncio.TimeoutError:
-                logger.warning("[Shutdown] resource teardown exceeded 8s budget")
             logger.info("[Orchestrator] All tasks cancelled. Goodbye.")
