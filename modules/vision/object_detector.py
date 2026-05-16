@@ -51,6 +51,14 @@ except ImportError:
     _YOLO_AVAILABLE = False
     logger.warning("[ObjectDetector] ultralytics not available — object detection disabled")
 
+# Resolve the inference device once at import time instead of calling
+# torch.cuda.is_available() on every frame inside _detect_inner.
+try:
+    import torch as _torch
+    _YOLO_DEVICE: Any = 0 if _torch.cuda.is_available() else "cpu"
+except Exception:
+    _YOLO_DEVICE = "cpu"
+
 
 # Objects Jarvis particularly cares about summarizing
 NOTABLE_CLASSES: set[str] = {
@@ -149,22 +157,19 @@ class ObjectDetector:
         # call.
         from modules.context.perf_tracker import perf
         with perf().timeit(f"yolo.{self._model_name.replace('.pt','')}"):
-            return self._detect_inner(frame, model)
+            return self._detect_inner(frame, model, self._conf_threshold)
 
-    def _detect_inner(self, frame: np.ndarray, model: Any) -> list[dict]:
+    def _detect_inner(
+        self, frame: np.ndarray, model: Any, conf: float,
+    ) -> list[dict]:
+        # `conf` is passed in rather than read from self._conf_threshold so
+        # detect() and detect_with_threshold() can run concurrently in the
+        # asyncio.to_thread pool without one corrupting the other's
+        # threshold (they previously shared a mutated instance attribute).
         try:
-            # Pass device=0 explicitly — without it, ultralytics may
-            # silently fall back to CPU for individual frames if the
-            # model wasn't pinned. We pin in load() too, but doubling
-            # up here is cheap insurance.
-            try:
-                import torch as _torch
-                _device = 0 if _torch.cuda.is_available() else "cpu"
-            except Exception:
-                _device = "cpu"
             results = model(
-                frame, conf=self._conf_threshold, verbose=False,
-                device=_device,
+                frame, conf=conf, verbose=False,
+                device=_YOLO_DEVICE,
             )
             detections = []
 
@@ -215,16 +220,11 @@ class ObjectDetector:
         model = self._model
         if frame is None or model is None:
             return []
-        saved = self._conf_threshold
-        try:
-            self._conf_threshold = float(conf)
-            from modules.context.perf_tracker import perf
-            with perf().timeit(
-                f"yolo_roi.{self._model_name.replace('.pt','')}"
-            ):
-                return self._detect_inner(frame, model)
-        finally:
-            self._conf_threshold = saved
+        from modules.context.perf_tracker import perf
+        with perf().timeit(
+            f"yolo_roi.{self._model_name.replace('.pt','')}"
+        ):
+            return self._detect_inner(frame, model, float(conf))
 
     async def detect_with_threshold_async(
         self,

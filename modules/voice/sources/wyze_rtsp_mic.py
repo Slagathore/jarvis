@@ -98,6 +98,10 @@ class WyzeRtspMicSource(MicSource):
         # than accumulating one asyncio Task per 80 ms audio chunk forever.
         self._callback_tasks_inflight: int = 0
         self._max_callback_tasks_inflight: int = 16
+        # Strong refs to in-flight callback tasks. asyncio only weak-refs
+        # running tasks, so a bare create_task() can be GC'd mid-flight;
+        # the done-callback discards from this set.
+        self._cb_tasks: set[asyncio.Task] = set()
 
     @property
     def room(self) -> str:
@@ -314,7 +318,13 @@ class WyzeRtspMicSource(MicSource):
         self._callback_tasks_inflight += 1
         try:
             task = asyncio.create_task(self._safe_invoke(cb, chunk))
-            task.add_done_callback(lambda _t: self._callback_task_done())
+            self._cb_tasks.add(task)
+
+            def _on_done(t: asyncio.Task) -> None:
+                self._cb_tasks.discard(t)
+                self._callback_task_done()
+
+            task.add_done_callback(_on_done)
         except RuntimeError:
             self._callback_task_done()
             pass  # loop closing

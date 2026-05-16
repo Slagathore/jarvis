@@ -368,6 +368,12 @@ class Orchestrator:
         # them against GC, logs their exceptions, and gets them cancelled
         # cleanly in _shutdown.
         self._bg_tasks = TrackedTaskSet(label="Orchestrator")
+        # Per-room singleton guards. The vision loop and _speak both spawn
+        # background work per room; without a guard a slow LLM scene call
+        # or a piled-up follow-up listener accumulates one task per cycle.
+        # Keyed by room id → the most recent task for that room.
+        self._scene_tasks: dict[str, asyncio.Task] = {}
+        self._followup_tasks: dict[str, asyncio.Task] = {}
         # Continuous-conversation follow-up listener: after each TTS reply,
         # we open a window where the user can speak again without re-saying
         # the wake word. The depth counter tracks how nested we are; we don't
@@ -3485,7 +3491,8 @@ class Orchestrator:
                         # to a human and totally worth the unblocked pipeline.
                         prior_state = self._scene_state.get(room_id) or {}
                         last_desc = prior_state.get("description")
-                        self._bg_tasks.spawn(
+                        self._spawn_scene_task(
+                            room_id,
                             self._run_scene_pipeline_bg(
                                 room_id=room_id,
                                 frame=frame,
@@ -3493,7 +3500,6 @@ class Orchestrator:
                                 scene_persons=scene_persons,
                                 scene_person_states=scene_person_states,
                             ),
-                            name=f"scene_bg:{room_id}",
                         )
 
                         # Broadcast vision state — use lights_on bool directly
@@ -4831,10 +4837,15 @@ class Orchestrator:
             else:
                 wants_followup = bool(expects_response)
             if wants_followup:
-                # Fire-and-forget — _listen_followup acquires the wake lock
-                # internally so it serializes with normal wake captures and
-                # any other follow-up that's already running.
-                self._bg_tasks.spawn(
+                # One follow-up listener per room — the newest speech owns
+                # the listen window. Without this, two TTS replies in the
+                # same room stack two listeners that then queue behind the
+                # wake lock. _listen_followup acquires the wake lock
+                # internally so it still serializes with wake captures.
+                prev = self._followup_tasks.get(room)
+                if prev is not None and not prev.done():
+                    prev.cancel()
+                self._followup_tasks[room] = self._bg_tasks.spawn(
                     self._listen_followup(room),
                     name=f"listen_followup:{room}",
                 )
@@ -4857,6 +4868,24 @@ class Orchestrator:
         self._active_user_room = room
         self._active_user_room_ts = _time.monotonic()
 
+    def _spawn_scene_task(self, room_id: str, coro) -> None:
+        """Spawn the scene pipeline for a room, at most one at a time.
+
+        The vision loop reaches every room every cycle; the scene
+        pipeline does 3-6s LLM calls. Without this guard a slow room
+        accumulates one background task per cycle. If the previous
+        task for this room is still running we drop this cycle's coro
+        (one frame's lag on scene narration is invisible).
+        """
+        prev = self._scene_tasks.get(room_id)
+        if prev is not None and not prev.done():
+            coro.close()  # never-awaited coroutine — close to silence the warning
+            logger.debug(f"[SceneBg] '{room_id}' still running — skipping cycle")
+            return
+        self._scene_tasks[room_id] = self._bg_tasks.spawn(
+            coro, name=f"scene_bg:{room_id}",
+        )
+
     async def _run_scene_pipeline_bg(
         self,
         room_id: str,
@@ -4874,10 +4903,15 @@ class Orchestrator:
         if not self.scene_analyzer:
             return
         try:
-            last_desc = await self.scene_analyzer.describe_async(
-                frame, room=room_id, objects=detections,
-                persons=scene_persons,
-                person_states=scene_person_states,
+            # Hard timeout so a wedged Ollama call can't pin this room's
+            # singleton slot (see _spawn_scene_task) indefinitely.
+            last_desc = await asyncio.wait_for(
+                self.scene_analyzer.describe_async(
+                    frame, room=room_id, objects=detections,
+                    persons=scene_persons,
+                    person_states=scene_person_states,
+                ),
+                timeout=20.0,
             )
         except Exception as e:
             logger.debug(
@@ -5222,6 +5256,32 @@ class Orchestrator:
                 await self.db.close()
             except Exception as e:
                 logger.debug(f"[Shutdown] DB close failed: {e}")
+
+    async def _supervised(self, name: str, factory) -> None:
+        """Run a loop coroutine, restarting it with exponential backoff if
+        it crashes at the outer level.
+
+        Each loop already has an inner try/except that survives transient
+        per-cycle errors; this catches the rarer case where an exception
+        escapes the loop body entirely (the coroutine would otherwise just
+        end, and gather(return_exceptions=True) would never restart it).
+        A clean return is treated as intentional. CancelledError
+        propagates so shutdown still works.
+        """
+        backoff = 1.0
+        while True:
+            try:
+                await factory()
+                return  # clean exit — intentional, stop supervising
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    f"[Supervisor] loop '{name}' crashed — "
+                    f"restarting in {backoff:.0f}s"
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
 
     # ── Main Entry Point ───────────────────────────────────────────────────
 
@@ -5593,18 +5653,21 @@ class Orchestrator:
         if wake is None or sessions is None:
             raise JarvisError("Core voice modules failed to initialize")
 
-        # Build task list
+        # Build task list. The orchestrator's own loops are wrapped in
+        # _supervised so an outer-level crash (one that escapes the loop's
+        # inner try/except) restarts the loop with backoff instead of
+        # silently leaving the system degraded until a full restart.
         tasks = [
             self.bus.run(),
             wake.listen_forever(),
             sessions.cleanup_expired(),
-            self._context_loop(),
-            self._vision_loop(),
-            self._curiosity_loop(),
-            self._health_broadcast_loop(),
-            self._eod_summary_loop(),
-            self._calendar_alert_loop(),
-            self._self_thought_loop(),
+            self._supervised("context_loop", self._context_loop),
+            self._supervised("vision_loop", self._vision_loop),
+            self._supervised("curiosity_loop", self._curiosity_loop),
+            self._supervised("health_broadcast_loop", self._health_broadcast_loop),
+            self._supervised("eod_summary_loop", self._eod_summary_loop),
+            self._supervised("calendar_alert_loop", self._calendar_alert_loop),
+            self._supervised("self_thought_loop", self._self_thought_loop),
         ]
 
         # MQTT monitoring

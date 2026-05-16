@@ -1742,22 +1742,28 @@ class DashboardServer:
             frame = await cm.capture_frame_async(room)
             if frame is None:
                 raise HTTPException(status_code=502, detail="Frame capture failed")
-            quality = self._camera_jpeg_quality
-            if not full_res:
-                h, w = frame.shape[:2]
-                max_w = max(1, int(self._camera_preview_max_width))
-                if w > max_w:
-                    new_h = max(1, int(h * (max_w / float(w))))
-                    frame = cv2.resize(
-                        frame,
-                        (max_w, new_h),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                quality = self._camera_preview_jpeg_quality
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+
+            # resize + JPEG encode are CPU-bound (~10-30ms on a full frame).
+            # Run them off the event loop so a snapshot poll doesn't stall
+            # every other request for the duration.
+            def _encode():
+                f = frame
+                quality = self._camera_jpeg_quality
+                if not full_res:
+                    h, w = f.shape[:2]
+                    max_w = max(1, int(self._camera_preview_max_width))
+                    if w > max_w:
+                        new_h = max(1, int(h * (max_w / float(w))))
+                        f = cv2.resize(f, (max_w, new_h),
+                                       interpolation=cv2.INTER_AREA)
+                    quality = self._camera_preview_jpeg_quality
+                ok, buf = cv2.imencode(
+                    ".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                return ok, (buf.tobytes() if ok else b"")
+
+            ok, jpeg_bytes = await asyncio.to_thread(_encode)
             if not ok:
                 raise HTTPException(status_code=500, detail="JPEG encode failed")
-            jpeg_bytes = buf.tobytes()
             self._snapshot_cache[cache_key] = (now, jpeg_bytes)
             return Response(
                 content=jpeg_bytes,
@@ -3651,20 +3657,25 @@ class DashboardServer:
             if len(self._conversation) > self._max_conversation:
                 self._conversation = self._conversation[-self._max_conversation:]
 
-        # Push to all connected clients
-        dead = []
-        for client in list(self._clients):
+        # Push to all connected clients concurrently — a single slow
+        # client must not delay the event reaching the others. Each send
+        # is independently bounded at 2s; failures mark the client dead.
+        async def _send(client):
             try:
                 await asyncio.wait_for(
                     client.send_json({"type": "event", "event": event}),
                     timeout=2.0,
                 )
+                return None
             except Exception:
-                dead.append(client)
+                return client
 
-        for d in dead:
-            if d in self._clients:
-                self._clients.remove(d)
+        clients = list(self._clients)
+        if clients:
+            results = await asyncio.gather(*(_send(c) for c in clients))
+            for d in (c for c in results if c is not None):
+                if d in self._clients:
+                    self._clients.remove(d)
 
     def _update_state(self, event: dict):
         """Update the internal state cache based on incoming event."""
