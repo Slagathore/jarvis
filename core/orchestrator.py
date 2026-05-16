@@ -82,7 +82,7 @@ from typing import Any, Optional
 import numpy as np
 from loguru import logger
 
-from core.async_utils import TrackedTaskSet
+from core.task_supervisor import TaskPolicy, TaskSupervisor
 from core.event_bus import EventBus
 from core.exceptions import JarvisError
 from dashboard.server import DashboardServer
@@ -367,13 +367,11 @@ class Orchestrator:
         # (memory extraction, listen-followup, scene-narration). Anchors
         # them against GC, logs their exceptions, and gets them cancelled
         # cleanly in _shutdown.
-        self._bg_tasks = TrackedTaskSet(label="Orchestrator")
-        # Per-room singleton guards. The vision loop and _speak both spawn
-        # background work per room; without a guard a slow LLM scene call
-        # or a piled-up follow-up listener accumulates one task per cycle.
-        # Keyed by room id → the most recent task for that room.
-        self._scene_tasks: dict[str, asyncio.Task] = {}
-        self._followup_tasks: dict[str, asyncio.Task] = {}
+        # Policy-bearing task supervisor. Per-room singleton guards for the
+        # scene pipeline and follow-up listeners are expressed via
+        # TaskPolicy(singleton_key=...) at the spawn sites rather than
+        # hand-rolled dicts.
+        self._bg_tasks = TaskSupervisor(label="Orchestrator")
         # Continuous-conversation follow-up listener: after each TTS reply,
         # we open a window where the user can speak again without re-saying
         # the wake word. The depth counter tracks how nested we are; we don't
@@ -4838,16 +4836,18 @@ class Orchestrator:
                 wants_followup = bool(expects_response)
             if wants_followup:
                 # One follow-up listener per room — the newest speech owns
-                # the listen window. Without this, two TTS replies in the
-                # same room stack two listeners that then queue behind the
-                # wake lock. _listen_followup acquires the wake lock
-                # internally so it still serializes with wake captures.
-                prev = self._followup_tasks.get(room)
-                if prev is not None and not prev.done():
-                    prev.cancel()
-                self._followup_tasks[room] = self._bg_tasks.spawn(
+                # the listen window (cancel_previous). Without this, two TTS
+                # replies in the same room stack two listeners that then
+                # queue behind the wake lock. _listen_followup acquires the
+                # wake lock internally so it still serializes with wake
+                # captures.
+                self._bg_tasks.spawn(
                     self._listen_followup(room),
                     name=f"listen_followup:{room}",
+                    policy=TaskPolicy(
+                        singleton_key=f"followup:{room}",
+                        cancel_previous=True,
+                    ),
                 )
 
         except Exception as e:
@@ -4872,18 +4872,14 @@ class Orchestrator:
         """Spawn the scene pipeline for a room, at most one at a time.
 
         The vision loop reaches every room every cycle; the scene
-        pipeline does 3-6s LLM calls. Without this guard a slow room
-        accumulates one background task per cycle. If the previous
-        task for this room is still running we drop this cycle's coro
+        pipeline does 3-6s LLM calls. The singleton policy drops this
+        cycle's coro if the prior one for the room is still running
         (one frame's lag on scene narration is invisible).
         """
-        prev = self._scene_tasks.get(room_id)
-        if prev is not None and not prev.done():
-            coro.close()  # never-awaited coroutine — close to silence the warning
-            logger.debug(f"[SceneBg] '{room_id}' still running — skipping cycle")
-            return
-        self._scene_tasks[room_id] = self._bg_tasks.spawn(
-            coro, name=f"scene_bg:{room_id}",
+        self._bg_tasks.spawn(
+            coro,
+            name=f"scene_bg:{room_id}",
+            policy=TaskPolicy(singleton_key=f"scene:{room_id}"),
         )
 
     async def _run_scene_pipeline_bg(
