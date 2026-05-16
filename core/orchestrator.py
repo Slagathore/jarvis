@@ -556,6 +556,36 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
             except Exception as e:
                 logger.debug(f"[Shutdown] DB close failed: {e}")
 
+    async def _stop_flag_watcher(self) -> None:
+        """Poll for data/stop.flag and trigger a graceful shutdown when it
+        appears. stop.ps1 writes the flag; this turns it into the same
+        KeyboardInterrupt path Ctrl+C uses, so _shutdown actually runs
+        (cameras released, DB closed) instead of a hard kill — and the
+        supervisor sees a clean exit and stops respawning."""
+        from pathlib import Path as _Path
+        data_dir = _Path(
+            (self.config.get("system") or {}).get("data_dir", "data")
+        )
+        flag = data_dir / "stop.flag"
+        while True:
+            await asyncio.sleep(1.0)
+            if flag.exists():
+                logger.info(
+                    "[Orchestrator] stop.flag detected — graceful shutdown"
+                )
+                try:
+                    flag.unlink()
+                except OSError:
+                    pass
+                # Cancel the top-level gather. `await gather` in run() then
+                # raises CancelledError, its except/finally run _shutdown.
+                # We cancel the gather (not this task / not the main task)
+                # so run()'s finally-block awaits still work.
+                gather = getattr(self, "_gather", None)
+                if gather is not None:
+                    gather.cancel()
+                return
+
     async def _supervised(self, name: str, factory) -> None:
         """Run a loop coroutine, restarting it with exponential backoff if
         it crashes at the outer level.
@@ -1054,6 +1084,10 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
             self.bus.run(),
             wake.listen_forever(),
             sessions.cleanup_expired(),
+            # Watches for data/stop.flag (written by stop.ps1) and turns an
+            # external "stop" into a real graceful shutdown. NOT supervised —
+            # it is meant to end the process.
+            self._stop_flag_watcher(),
             self._supervised("context_loop", self._context_loop),
             self._supervised("vision_loop", self._vision_loop),
             self._supervised("curiosity_loop", self._curiosity_loop),
@@ -1134,8 +1168,10 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
             label = getattr(getattr(c, "cr_code", None), "co_qualname", None) or repr(c)
             labeled_tasks.append(_logged(label, c))
 
-        # Run forever — cancel all tasks cleanly on exit
+        # Run forever — cancel all tasks cleanly on exit. `_gather` is
+        # stashed so _stop_flag_watcher can cancel it (graceful stop path).
         gather = asyncio.gather(*labeled_tasks, return_exceptions=True)
+        self._gather = gather
         try:
             await gather
         except (KeyboardInterrupt, asyncio.CancelledError):

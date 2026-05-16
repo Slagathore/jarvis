@@ -65,6 +65,8 @@ from loguru import logger
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 LOG_DIR             = Path(__file__).parent / "data"
 PID_FILE            = Path(__file__).parent / "data" / "jarvis.pid"
+# Written by stop.ps1, consumed by the orchestrator's stop-flag watcher.
+STOP_FLAG           = Path(__file__).parent / "data" / "stop.flag"
 
 # Modules whose DEBUG output is one-per-frame and would otherwise drown
 # the console. The rotating file log stays unfiltered (the dashboard
@@ -257,6 +259,9 @@ def _acquire_lock(force: bool) -> None:
             sys.exit(2)
         # Stale lock — overwrite it
     PID_FILE.write_text(str(os.getpid()))
+    # Clear any stale stop.flag so a leftover from a previous stop doesn't
+    # make this fresh instance shut itself straight back down.
+    STOP_FLAG.unlink(missing_ok=True)
 
 
 def _install_unix_signal_handlers() -> None:

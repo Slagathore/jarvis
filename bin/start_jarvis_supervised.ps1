@@ -22,6 +22,7 @@ $root = Resolve-Path "$PSScriptRoot/.."
 $heartbeat = Join-Path $root "data\heartbeat.txt"
 $safeSha   = Join-Path $root "data\last_safe_sha.txt"
 $restartPending = Join-Path $root "data\restart_pending.txt"
+$stopFlag  = Join-Path $root "data\stop.flag"
 
 # Outer-loop state. $justSelfEdited is the ONLY signal that gates the
 # heartbeat-or-revert dance. Set true only when Jarvis exits with code 42.
@@ -94,6 +95,16 @@ while ($true) {
     # Wait for the process to finish, no matter how long that takes.
     Wait-Process -Id $process.Id
     $exitCode = $process.ExitCode
+
+    # An explicit stop (stop.ps1 wrote data/stop.flag) overrides every
+    # restart path below — including a non-zero exit from a force-kill.
+    # On a graceful stop the orchestrator already removed the flag and the
+    # exit code is 0; this check is the belt for the force-kill fallback.
+    if (Test-Path $stopFlag) {
+        Write-Host "[Supervisor] stop.flag present — explicit stop, not respawning." -ForegroundColor Yellow
+        Remove-Item $stopFlag -Force -ErrorAction SilentlyContinue
+        break
+    }
 
     if ($exitCode -eq 42) {
         # Self-edit's restart_self — engage the heartbeat-or-revert dance.
