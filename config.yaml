@@ -43,7 +43,13 @@ ollama:
     \ just say what you see.\nKeep responses short unless asked for detail.\n"
 voice:
   whisper:
-    model_size: medium
+    # distil-large-v3: near-large-v3 accuracy, ~6x faster than large-v3
+    # and faster AND more accurate than 'medium'. English-only (matches
+    # language: en). Auto-downloads Systran/faster-distil-whisper-large-v3
+    # (~1.5 GB) on first load. This IS the "insanely-fast-whisper" win —
+    # faster-whisper (CTranslate2) is already the fastest runtime; the
+    # real lever is the model, not swapping the package.
+    model_size: distil-large-v3
     device: cuda
     compute_type: float16
     language: en
