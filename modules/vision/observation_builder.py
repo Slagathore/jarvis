@@ -47,6 +47,7 @@ from loguru import logger
 from modules.vision.hand_detector import (
     bbox_overlaps_or_within as _bbox_overlaps_or_within,
 )
+from modules.vision.ignore_zones import filter_detections
 from modules.world_model.types import Observation
 
 
@@ -110,6 +111,7 @@ class ObservationBuilder:
         clip_encoder: Optional[Any] = None,
         openvocab_detector: Optional[Any] = None,
         tracked_objects_open_vocab: Optional[list[dict]] = None,
+        tracked_objects_closed_vocab: Optional[list[str]] = None,
         openvocab_interval_seconds: float = 30.0,
         entity_min_confidence: Optional[dict[str, float]] = None,
     ) -> None:
@@ -133,6 +135,12 @@ class ObservationBuilder:
         self.openvocab = openvocab_detector
         self.tracked_objects_open_vocab: list[dict] = list(
             tracked_objects_open_vocab or []
+        )
+        # Closed-vocab YOLO classes the entity layer tracks. Driven by
+        # config.tracked_objects.closed_vocabulary; falls back to the
+        # hard-coded TRACKED_OBJECT_CLASSES default when config omits it.
+        self.tracked_object_classes: set[str] = set(
+            tracked_objects_closed_vocab or self.TRACKED_OBJECT_CLASSES
         )
         self._openvocab_interval_s = float(openvocab_interval_seconds)
         self._entity_min_confidence: dict[str, float] = {
@@ -304,8 +312,11 @@ class ObservationBuilder:
     ) -> list[Observation]:
         observations: list[Observation] = []
 
-        # 1. Object detection (YOLO).
+        # 1. Object detection (YOLO). Detections inside a configured
+        # ignore zone for this room (a framed painting, a TV) are dropped
+        # before they can become entities.
         raw_dets = await self.detector.detect_async(frame)
+        raw_dets = filter_detections(raw_dets, room)
         detections = [
             d for d in (Detection.from_dict(raw) for raw in raw_dets)
             if d.confidence >= self._entity_min_confidence.get(
@@ -357,7 +368,7 @@ class ObservationBuilder:
                     obs = self._build_animal_obs(
                         cls, frame, det, room, ts, frame_w, frame_h
                     )
-                elif cls in self.TRACKED_OBJECT_CLASSES:
+                elif cls in self.tracked_object_classes:
                     obs = self._build_object_obs(
                         frame, det, room, ts, frame_w, frame_h
                     )

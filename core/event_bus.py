@@ -79,6 +79,20 @@ _DEFAULT_TOPIC_PRIORITIES: dict[str, int] = {
     "debug.": EventPriority.DEBUG,
 }
 
+# Topics whose queued events coalesce: when a new event arrives and an
+# older event for the same coalesce-key is still queued, the older one is
+# dropped. Consumers then never process a stale frame while a fresher one
+# is already waiting behind it. Maps topic (prefix-matched) → the payload
+# field used as the per-key discriminator.
+#
+# vision.observation is the motivating case: under queue pressure, an
+# observation from 3 frames ago is worthless once a newer one for the
+# same room exists. Identity/safety topics are NOT coalesced — every one
+# of those events matters.
+_DEFAULT_TOPIC_COALESCE: dict[str, str] = {
+    "vision.observation": "room",
+}
+
 _DEFAULT_TOPIC_RATE_LIMITS: dict[str, tuple[float, int]] = {
     # High-frequency dashboard meters. Fresh samples replace stale samples
     # visually, so dropping excess is better than making wake/safety wait.
@@ -150,6 +164,7 @@ class EventBus:
         *,
         topic_priorities: Optional[dict[str, int]] = None,
         topic_rate_limits: Optional[dict[str, tuple[float, int]]] = None,
+        topic_coalesce: Optional[dict[str, str]] = None,
     ) -> None:
         # topic string → list of registered async handlers
         self._subscribers: dict[str, list[EventHandler]] = defaultdict(list)
@@ -166,6 +181,9 @@ class EventBus:
         self._topic_rate_limits = dict(_DEFAULT_TOPIC_RATE_LIMITS)
         if topic_rate_limits:
             self._topic_rate_limits.update(topic_rate_limits)
+        self._topic_coalesce = dict(_DEFAULT_TOPIC_COALESCE)
+        if topic_coalesce:
+            self._topic_coalesce.update(topic_coalesce)
         self._rate_buckets: dict[str, dict[str, float]] = {}
         self._dropped_by_topic: dict[str, int] = defaultdict(int)
         self._drop_log_state: dict[str, dict[str, float]] = {}
@@ -298,6 +316,28 @@ class EventBus:
         rate, burst = best_limit
         return best_pattern, max(0.0, float(rate)), max(1, int(burst))
 
+    def _coalesce_key_for(self, topic: str, payload: dict) -> Optional[str]:
+        """Return a per-key coalesce identifier for this event, or None if
+        the topic is not coalescable / the payload lacks the key field.
+
+        The key is `{matched_pattern}\\x00{field_value}` so two events for
+        the same room on the same topic compare equal, but events on
+        different topics never collide.
+        """
+        best_pattern = ""
+        best_field: Optional[str] = None
+        for pattern, field in self._topic_coalesce.items():
+            if topic == pattern or topic.startswith(pattern):
+                if len(pattern) > len(best_pattern):
+                    best_pattern = pattern
+                    best_field = field
+        if best_field is None:
+            return None
+        value = payload.get(best_field)
+        if value is None:
+            return None
+        return f"{best_pattern}\x00{value}"
+
     def _allow_by_rate_limit(self, topic: str) -> bool:
         limit = self._rate_limit_for(topic)
         if limit is None:
@@ -346,6 +386,23 @@ class EventBus:
 
     async def _put_event(self, priority: int, topic: str, payload: dict) -> None:
         item = (priority, next(self._sequence), topic, payload)
+
+        # Coalesce: if a still-queued event shares this event's coalesce
+        # key (e.g. an older vision.observation for the same room), drop
+        # the stale one. Consumers should always see the freshest frame.
+        ckey = self._coalesce_key_for(topic, payload)
+        if ckey is not None:
+            raw_queue = self._queue._queue  # type: ignore[attr-defined]
+            for idx, queued in enumerate(raw_queue):
+                if self._coalesce_key_for(queued[2], queued[3]) == ckey:
+                    del raw_queue[idx]
+                    heapq.heapify(raw_queue)
+                    # The removed item was put() but never get()'d — balance
+                    # the unfinished-task count so queue.join() stays correct.
+                    self._queue.task_done()
+                    self._dropped_by_topic[queued[2]] += 1
+                    break
+
         try:
             self._queue.put_nowait(item)
             return

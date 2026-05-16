@@ -107,6 +107,8 @@ class WorldStore:
             "CREATE INDEX IF NOT EXISTS idx_world_events_room_ts ON world_entity_events(room, ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_world_events_type_ts ON world_entity_events(event_type, ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_world_events_person_ts ON world_entity_events(person_id, ts DESC)",
+            # Plain ts index — supports prune_world_events' `WHERE ts < ?`.
+            "CREATE INDEX IF NOT EXISTS idx_world_events_ts ON world_entity_events(ts)",
             """CREATE TABLE IF NOT EXISTS world_entity_embeddings (
                 entity_id TEXT PRIMARY KEY REFERENCES world_entities(id),
                 embedding BLOB NOT NULL,
@@ -400,6 +402,30 @@ class WorldStore:
         rows = await self.db.fetchall(q, tuple(params))
         return [dict(r) for r in rows]
 
+
+    # ── Event-log retention ─────────────────────────────────────────────────
+
+    async def prune_world_events(self, *, retain_days: int = 30) -> int:
+        """Delete `world_entity_events` rows older than `retain_days`.
+
+        The table is an append-only telemetry log — the durable world
+        state lives in `world_entities`. Left unbounded it grows forever
+        (it was the dominant share of a 160 MB DB at audit time). The
+        nightly maintenance pass calls this, then VACUUMs.
+
+        Returns the number of rows deleted.
+        """
+        cutoff = (_utcnow() - timedelta(days=int(retain_days))).isoformat()
+        row = await self.db.fetchone(
+            "SELECT COUNT(*) AS n FROM world_entity_events WHERE ts < ?",
+            (cutoff,),
+        )
+        n = int(row["n"]) if row else 0
+        if n:
+            await self.db.execute(
+                "DELETE FROM world_entity_events WHERE ts < ?", (cutoff,)
+            )
+        return n
 
     # ── Snapshot disk retention ─────────────────────────────────────────────
 

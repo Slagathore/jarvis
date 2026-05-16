@@ -241,6 +241,7 @@ Routes used:
       </select>
       <button id="build" class="primary">BUILD CLUSTERS</button>
       <button id="apply" disabled>SAVE LABELS</button>
+      <button id="reset" class="danger" title="Permanently delete every UNATTRIBUTED detection event for this species. Labelled known pets are untouched. Use when the current set is junk and you want to re-cluster from scratch.">RESET UNATTRIBUTED</button>
     </div>
     <div class="status" id="status">idle</div>
   </header>
@@ -664,6 +665,40 @@ Routes used:
 
     buildBtn.addEventListener("click", buildClusters);
     applyBtn.addEventListener("click", saveLabels);
+
+    async function resetUnattributed() {
+      const species = speciesSel.value;
+      if (!confirm(
+        `Permanently delete ALL unattributed ${species} detection events?\n\n` +
+        `Labelled known pets are NOT affected. This clears the slate so you ` +
+        `can re-cluster from scratch. This cannot be undone.`
+      )) return;
+      const resetBtn = $("reset");
+      resetBtn.disabled = true;
+      buildBtn.disabled = true;
+      status.textContent = `resetting ${species}…`;
+      try {
+        const res = await fetch("/api/world_model/cluster/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ species }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+        content.innerHTML = "";
+        applyBtn.disabled = true;
+        status.textContent =
+          `reset: deleted ${body.deleted} unattributed ${species} event(s)`;
+        showToast(`Cleared ${body.deleted} ${species} event(s).`);
+      } catch (err) {
+        showToast(`Reset failed: ${err.message || err}`, true);
+        status.textContent = "reset failed";
+      } finally {
+        resetBtn.disabled = false;
+        buildBtn.disabled = false;
+      }
+    }
+    $("reset").addEventListener("click", resetUnattributed);
   </script>
 </body>
 </html>

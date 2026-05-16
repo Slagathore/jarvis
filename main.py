@@ -65,6 +65,8 @@ from loguru import logger
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 LOG_DIR             = Path(__file__).parent / "data"
 PID_FILE            = Path(__file__).parent / "data" / "jarvis.pid"
+# Written by stop.ps1, consumed by the orchestrator's stop-flag watcher.
+STOP_FLAG           = Path(__file__).parent / "data" / "stop.flag"
 
 # Modules whose DEBUG output is one-per-frame and would otherwise drown
 # the console. The rotating file log stays unfiltered (the dashboard
@@ -84,10 +86,16 @@ def _configure_event_loop_policy() -> None:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
-def _setup_logging(log_level: str) -> None:
+def _setup_logging(log_level: str, file_log_level: str = "INFO") -> None:
     """
     Configure Loguru with console + rotating file output.
     Removes the default handler and replaces with our own.
+
+    `log_level` drives the console sink; `file_log_level` drives the
+    rotating file sink independently. The file sink used to be unfiltered
+    at the console level — with log_level=DEBUG that produced 200+ MB/day
+    log files because object_detector logs every frame. Now the file sink
+    has its own level AND the per-frame DEBUG blacklist applied.
     """
     logger.remove()  # Remove default stderr handler
 
@@ -119,13 +127,15 @@ def _setup_logging(log_level: str) -> None:
         filter=_console_filter,
     )
 
-    # Rotating file log — unfiltered, so the dashboard logs tab and
-    # post-mortem debugging see every line.
+    # Rotating file log. Has its own level (file_log_level) and the same
+    # per-frame DEBUG blacklist as the console — without the filter, a
+    # DEBUG file level turns object_detector into a 200+ MB/day disk sink.
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger.add(
         str(LOG_DIR / "jarvis_{time:YYYY-MM-DD}.log"),
         format=log_format,
-        level=log_level,
+        level=file_log_level,
+        filter=_console_filter,
         rotation="00:00",   # New file each midnight
         retention="14 days",
         compression="zip",
@@ -196,6 +206,13 @@ def parse_args() -> argparse.Namespace:
         help="Load config + import modules but exit before starting the event loop.",
     )
     parser.add_argument(
+        "--smoke-init",
+        action="store_true",
+        help="Boot the safe subset (DB + migrations + notification dispatcher "
+             "+ event bus + alarm-audio render) and exit. No camera/mic "
+             "hardware, no heavy model loading. CI-style health gate.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Skip the process-lock check (use only if you know no other instance is running).",
@@ -242,6 +259,9 @@ def _acquire_lock(force: bool) -> None:
             sys.exit(2)
         # Stale lock — overwrite it
     PID_FILE.write_text(str(os.getpid()))
+    # Clear any stale stop.flag so a leftover from a previous stop doesn't
+    # make this fresh instance shut itself straight back down.
+    STOP_FLAG.unlink(missing_ok=True)
 
 
 def _install_unix_signal_handlers() -> None:
@@ -287,7 +307,13 @@ async def main(args: argparse.Namespace) -> None:
         args.log_level
         or config.get("system", {}).get("log_level", "INFO")
     ).upper()
-    _setup_logging(log_level)
+    # File sink defaults to INFO independent of the console. A CLI
+    # --log-level override applies to both (debugging convenience).
+    file_log_level = (
+        args.log_level
+        or config.get("system", {}).get("file_log_level", "INFO")
+    ).upper()
+    _setup_logging(log_level, file_log_level)
 
     logger.info("=" * 60)
     logger.info(
@@ -303,6 +329,16 @@ async def main(args: argparse.Namespace) -> None:
 
     from core.orchestrator import Orchestrator
     orchestrator = Orchestrator(config)
+
+    if args.smoke_init:
+        logger.info("[Main] --smoke-init: running safe-subset boot checks.")
+        ok = await orchestrator.smoke_init()
+        if ok:
+            logger.info("[Main] Smoke-init PASSED — core boot path is healthy.")
+        else:
+            logger.error("[Main] Smoke-init FAILED — see errors above.")
+            sys.exit(1)
+        return
 
     _install_unix_signal_handlers()
 

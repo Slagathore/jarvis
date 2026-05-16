@@ -1,7 +1,15 @@
 system:
   name: Jarvis
   version: 1.0.0
-  log_level: DEBUG
+  # Console verbosity. DEBUG here floods the console; per-frame DEBUG from
+  # the vision modules is blacklisted from the console regardless (see
+  # main.py _CONSOLE_DEBUG_BLACKLIST).
+  log_level: INFO
+  # File-log verbosity, separate from the console. The rotating file log is
+  # what the dashboard Logs tab streams. Keep at INFO — DEBUG here produced
+  # 200+ MB/day log files (object_detector logs every frame). Bump to DEBUG
+  # only for a focused debugging session.
+  file_log_level: INFO
   data_dir: data/
   dashboard_enabled: true
   dashboard_port: 7070
@@ -21,6 +29,13 @@ ollama:
   action_model: gemini-3-flash-preview:cloud
   base_url: http://localhost:11434
   timeout_seconds: 30
+  # Models routed through Ollama's OpenAI-compatible /v1 endpoint instead of
+  # the native API. Workaround for ollama/ollama#14567 — the native API drops
+  # Gemini-3's thought_signature on tool-call round-trips, which 400s every
+  # multi-turn tool call. The /v1 surface round-trips it intact. Remove a
+  # model from this list once Ollama patches the native path (PR #14676).
+  openai_compat_models:
+    - gemini-3-flash-preview:cloud
   system_prompt: "You are Jarvis, an ambient home AI assistant.\nYou live in the house\
     \ and pay attention to what's going on around you.\nYou are observant, helpful,\
     \ and have a dry wit. You know when to stay quiet.\nYou speak like a smart friend,\
@@ -600,11 +615,30 @@ persona_revert:
 world_model:
   tracked_species: [cat, dog]
   visiting_animal_retention_minutes: 60
+  # D3 unified perception. true → _vision_loop consumes the perception
+  # ObservationBuilder already published (one source of truth) instead of
+  # re-running its own YOLO/face/posture. false → the verbatim legacy
+  # _vision_loop path — that is the instant revert if the unified path
+  # misbehaves.
+  unified_perception: true
   # Nightly behavioral profile rebuild (§22.6). Once per interval_hours.
   nightly:
     interval_hours: 24
     startup_grace_seconds: 60
     profile_days_back: 30
+    # DB retention for the nightly maintenance pass. world_entity_events is
+    # an append-only telemetry log; keep >= profile_days_back so behavioral
+    # profiles still have their rolling window.
+    event_retention_days: 30
+  # BeliefResolver (audit roadmap D4).
+  #   shadow: true  — observe-only: tracks hypotheses, persists to the
+  #                   belief_* tables, drives nothing.
+  #   shadow: false — LIVE (D4b): additionally publishes world.belief_changed
+  #                   events on the bus and the /api/world_model/beliefs
+  #                   endpoint reports it. This is the revert switch — flip
+  #                   back to true if the belief layer misbehaves.
+  belief_resolver:
+    shadow: false
 
 residents:
   - id: cole
@@ -773,3 +807,30 @@ tracked_objects:
   detection_interval_seconds:
     open_vocabulary: 30
     closed_vocabulary: 0
+
+# ── Notifications ────────────────────────────────────────────────────────────
+# Phone/push fan-out for the alarm subsystem (fire / cat_escape / door_open).
+# Every channel is disabled by default — flip `enabled: true` and fill in the
+# topic/token to go live. With all channels off, alarms still fire locally
+# (audio + dashboard) and delivery attempts are logged to the DB only.
+#
+# Secrets (Telegram/HA tokens) come from environment variables, never here.
+notifications:
+  ntfy:
+    enabled: false
+    server: "https://ntfy.sh"      # or your self-hosted http://localhost:8080
+    topic: ""                       # set a long, unguessable topic name
+  telegram:
+    enabled: false
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    alert_chat_id_env: TELEGRAM_ALERT_CHAT_ID
+  home_assistant:
+    enabled: false
+    base_url: "http://homeassistant.local:8123"
+    service: mobile_app_cole_phone
+    token_env: HOME_ASSISTANT_TOKEN
+  # alarm_type → [channel names]. Omit a type to fan it to every channel.
+  routing:
+    fire:       [ntfy]
+    cat_escape: [ntfy]
+    door_open:  [ntfy]

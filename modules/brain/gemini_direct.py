@@ -74,12 +74,19 @@ def _convert_messages_to_gemini(messages: list[dict[str, Any]]) -> tuple[list[di
             if content:
                 parts.append({"text": content})
             for call in function_calls:
-                parts.append({
+                part: dict = {
                     "functionCall": {
                         "name": call.get("name"),
                         "args": call.get("args") or {},
                     }
-                })
+                }
+                # Re-attach the thoughtSignature captured from the original
+                # response (_extract_function_calls). Gemini-3 rejects a
+                # functionCall part in history that lacks it.
+                sig = call.get("thought_signature")
+                if sig:
+                    part["thoughtSignature"] = sig
+                parts.append(part)
             contents.append({"role": "model", "parts": parts})
             continue
         # Merge consecutive same-role messages
@@ -365,7 +372,16 @@ class GeminiDirectClient:
             for p in parts:
                 fc = p.get("functionCall")
                 if fc:
-                    calls.append({"name": fc.get("name"), "args": fc.get("args") or {}})
+                    call = {"name": fc.get("name"), "args": fc.get("args") or {}}
+                    # Gemini-3 attaches a thoughtSignature to each functionCall
+                    # part. It is REQUIRED back on that part when the history
+                    # is re-sent for the tool round-trip — drop it and the
+                    # next request 400s "missing a thought_signature". Capture
+                    # it here; _convert_messages_to_gemini re-emits it.
+                    sig = p.get("thoughtSignature")
+                    if sig:
+                        call["thought_signature"] = sig
+                    calls.append(call)
         except Exception:
             pass
         return calls

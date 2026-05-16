@@ -1742,22 +1742,29 @@ class DashboardServer:
             frame = await cm.capture_frame_async(room)
             if frame is None:
                 raise HTTPException(status_code=502, detail="Frame capture failed")
-            quality = self._camera_jpeg_quality
-            if not full_res:
-                h, w = frame.shape[:2]
-                max_w = max(1, int(self._camera_preview_max_width))
-                if w > max_w:
-                    new_h = max(1, int(h * (max_w / float(w))))
-                    frame = cv2.resize(
-                        frame,
-                        (max_w, new_h),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                quality = self._camera_preview_jpeg_quality
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+
+            # resize + JPEG encode are CPU-bound (~10-30ms on a full frame).
+            # Run them off the event loop so a snapshot poll doesn't stall
+            # every other request for the duration.
+            def _encode():
+                assert cv2 is not None  # guaranteed by the _CV2_AVAILABLE check above
+                f = frame
+                quality = self._camera_jpeg_quality
+                if not full_res:
+                    h, w = f.shape[:2]
+                    max_w = max(1, int(self._camera_preview_max_width))
+                    if w > max_w:
+                        new_h = max(1, int(h * (max_w / float(w))))
+                        f = cv2.resize(f, (max_w, new_h),
+                                       interpolation=cv2.INTER_AREA)
+                    quality = self._camera_preview_jpeg_quality
+                ok, buf = cv2.imencode(
+                    ".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                return ok, (buf.tobytes() if ok else b"")
+
+            ok, jpeg_bytes = await asyncio.to_thread(_encode)
             if not ok:
                 raise HTTPException(status_code=500, detail="JPEG encode failed")
-            jpeg_bytes = buf.tobytes()
             self._snapshot_cache[cache_key] = (now, jpeg_bytes)
             return Response(
                 content=jpeg_bytes,
@@ -1824,6 +1831,7 @@ class DashboardServer:
                     "frame_height": int(cam.get("frame_height", 480)),
                     "exits": list(cam.get("exits", [])),
                     "landmarks": list(cam.get("landmarks", [])),
+                    "ignore_zones": list(cam.get("ignore_zones", [])),
                 })
             # Fall back to config.yaml read when the world model isn't
             # initialized yet (boot timing).
@@ -1839,6 +1847,7 @@ class DashboardServer:
                     "frame_height": int(wm.get("frame_height", 480)),
                     "exits": list(wm.get("exits", [])),
                     "landmarks": list(wm.get("landmarks", [])),
+                    "ignore_zones": list(wm.get("ignore_zones", [])),
                 })
             raise HTTPException(status_code=404, detail=f"No room '{room}' in config")
 
@@ -1892,12 +1901,17 @@ class DashboardServer:
                 return out
             exits = _validate(exits_raw)
             landmarks = _validate(landmarks_raw)
+            # Ignore zones — same {polygon: [[x,y],...]} shape as exits/
+            # landmarks, validated the same way. Masks static false
+            # positives (a framed painting) from the detector.
+            ignore_zones = _validate(body.get("ignore_zones") or [])
             overrides = _load_polygon_overrides()
             overrides[room] = {
                 "frame_width": fw,
                 "frame_height": fh,
                 "exits": exits,
                 "landmarks": landmarks,
+                "ignore_zones": ignore_zones,
             }
             save_polygon_overrides(overrides)
             # Live-reload so the world model picks up the edits without
@@ -1913,10 +1927,12 @@ class DashboardServer:
                 "room": room,
                 "exits": len(exits),
                 "landmarks": len(landmarks),
+                "ignore_zones": len(ignore_zones),
             })
             return JSONResponse({
                 "ok": True, "room": room,
                 "exits": len(exits), "landmarks": len(landmarks),
+                "ignore_zones": len(ignore_zones),
             })
 
         @app.get("/polygons", response_class=HTMLResponse)
@@ -2361,15 +2377,15 @@ class DashboardServer:
                 )
             from datetime import datetime as _dt, timezone as _tz, timedelta as _td
             cutoff = (_dt.now(_tz.utc) - _td(seconds=seconds)).isoformat()
-            # Query BOTH cat and dog rows — the user may be correcting a
-            # cross-species misattribution (e.g. clicking the cat on the
-            # table that the cost function tagged as Dalila the dog).
-            # The frontend now lets the user pick any pet regardless of
-            # the detected species, so the backend must follow suit.
+            # Query cat, dog AND person rows. The user may be correcting a
+            # cross-species misattribution (cat tagged as Dalila the dog) OR
+            # — the common annoyance — a pet that YOLO misdetected as a
+            # person. A pet-logged-as-person has entity_type='person' rows,
+            # so they must be in scope for the IoU relabel to catch them.
             rows = await ws.db.fetchall(
                 "SELECT id, bbox, entity_type FROM world_entity_events "
                 "WHERE room = ? AND ts >= ? "
-                "AND entity_type IN ('cat', 'dog') "
+                "AND entity_type IN ('cat', 'dog', 'person') "
                 "AND bbox IS NOT NULL",
                 (room, cutoff),
             )
@@ -2400,13 +2416,15 @@ class DashboardServer:
                     if r["entity_type"] != target.entity_type:
                         cross_species += 1
             for evt_id in relabeled:
-                # Also update entity_type so cross-species corrections
-                # (Dalila/dog -> Spooky/cat) flip the row's species.
-                # Otherwise downstream filters like list_pets / care
-                # summaries would still see the old class.
+                # Update entity_type so cross-species (Dalila/dog -> Spooky/
+                # cat) and person->pet corrections flip the row's class —
+                # otherwise list_pets / care summaries still see the old one.
+                # person_id is cleared: a row flipped from a person mis-
+                # detection to a pet must not keep a stale person link.
                 await ws.db.execute(
                     "UPDATE world_entity_events SET entity_id = ?, "
-                    "entity_name = ?, entity_type = ? WHERE id = ?",
+                    "entity_name = ?, entity_type = ?, person_id = NULL "
+                    "WHERE id = ?",
                     (target.id, target.display_name,
                      target.entity_type, evt_id),
                 )
@@ -3002,6 +3020,21 @@ class DashboardServer:
         #   POST /api/world_model/cluster/apply {species, clusters, labels}
         #   GET  /clusters                                       → SPA page
 
+        @app.get("/api/world_model/beliefs")
+        async def world_model_beliefs():
+            """Live snapshot of the BeliefResolver's hypotheses (audit D4).
+            `shadow` reports whether the resolver is merely observing or is
+            LIVE — publishing world.belief_changed events on the bus."""
+            orch = self._orchestrator
+            br = getattr(orch, "belief_resolver", None) if orch else None
+            if br is None:
+                return JSONResponse({"beliefs": [], "available": False})
+            return JSONResponse({
+                "beliefs": br.snapshot(),
+                "shadow": bool(getattr(br, "shadow", True)),
+                "available": True,
+            })
+
         @app.get("/api/world_model/cluster/known_pets")
         async def cluster_known_pets(species: str = "cat"):
             """List of resident pet display_names for `species`. Used by
@@ -3207,6 +3240,45 @@ class DashboardServer:
             })
             return JSONResponse({"ok": True, "event_id": event_id})
 
+        @app.post("/api/world_model/cluster/reset")
+        async def cluster_reset(payload: dict):
+            """Wipe the unattributed detection events for a species so
+            clustering starts from a clean slate. Used when the current
+            cluster set is junk (bad lighting run, a misconfigured cam)
+            and re-tuning from scratch beats hand-deleting rows.
+
+            Only UNATTRIBUTED events are touched — anything already
+            labelled as a known pet is left alone. Body: {species}.
+            """
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            if ws is None:
+                raise HTTPException(
+                    status_code=503, detail="World store unavailable")
+            species = str(payload.get("species") or "cat")
+            where = (
+                "entity_type = ? "
+                "AND event_type IN ('first_seen', 'moved_within_room', "
+                "'reappeared', 'moved_to') "
+                "AND (entity_name IS NULL OR entity_name LIKE 'unknown_%')"
+            )
+            row = await ws.db.fetchone(
+                f"SELECT COUNT(*) AS n FROM world_entity_events WHERE {where}",
+                (species,),
+            )
+            n = int(row["n"]) if row else 0
+            if n:
+                await ws.db.execute(
+                    f"DELETE FROM world_entity_events WHERE {where}",
+                    (species,),
+                )
+            logger.info(
+                f"[cluster/reset] cleared {n} unattributed '{species}' event(s)")
+            await self.broadcast({
+                "type": "cluster_reset", "species": species, "deleted": n,
+            })
+            return JSONResponse({"ok": True, "species": species, "deleted": n})
+
         @app.post("/api/world_model/cluster/apply")
         async def cluster_apply(payload: dict):
             """Submit cluster labels — body shape:
@@ -3281,6 +3353,108 @@ class DashboardServer:
                     status_code=404, detail="cluster_viewer.html missing"
                 )
             return HTMLResponse(page.read_text(encoding="utf-8"))
+
+        # ── Pet visual-sample management ─────────────────────────────────────
+        # Mirrors the human identity sample tools (/api/identity/face_samples)
+        # for the pet_visual_samples table — list, view crop, delete.
+
+        @app.get("/api/world_model/pets/{name}/samples")
+        async def pet_samples_list(name: str):
+            """List the confirmed visual samples for a named pet."""
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            wm = getattr(orch, "world_model", None) if orch else None
+            if ws is None or wm is None:
+                return JSONResponse({"samples": [], "available": False})
+            ent = wm.find_entity_by_name(name)
+            if ent is None:
+                return JSONResponse({"samples": [], "available": True})
+            rows = await ws.db.fetchall(
+                "SELECT id, created_at, room, source, crop_path "
+                "FROM pet_visual_samples WHERE pet_entity_id = ? "
+                "ORDER BY created_at DESC",
+                (ent.id,),
+            )
+            samples = [
+                {
+                    "id": r["id"],
+                    "created_at": r["created_at"],
+                    "room": r["room"],
+                    "source": r["source"],
+                    "has_image": bool(r["crop_path"]),
+                    "url": f"/api/world_model/pet_samples/{r['id']}/image.jpg",
+                }
+                for r in rows
+            ]
+            return JSONResponse({
+                "samples": samples, "available": True,
+                "pet_name": ent.display_name, "count": len(samples),
+            })
+
+        @app.get("/api/world_model/pet_samples/{sample_id}/image.jpg")
+        async def pet_sample_image(sample_id: int):
+            """Serve the crop JPEG for one pet visual sample."""
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            if ws is None:
+                raise HTTPException(status_code=503, detail="No world store")
+            row = await ws.db.fetchone(
+                "SELECT crop_path FROM pet_visual_samples WHERE id = ?",
+                (sample_id,),
+            )
+            if row is None or not row["crop_path"]:
+                raise HTTPException(status_code=404, detail="No crop")
+            assert orch is not None  # narrowed by the ws check above
+            from pathlib import Path as _Path
+            data_dir = _Path(
+                (orch.config.get("system") or {}).get("data_dir", "data")
+            ).resolve()
+            try:
+                path = _Path(row["crop_path"]).resolve()
+                if data_dir not in path.parents:
+                    raise HTTPException(
+                        status_code=403, detail="crop path outside data_dir")
+            except OSError as e:
+                raise HTTPException(status_code=404, detail=str(e)) from e
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="File missing")
+            return Response(
+                content=path.read_bytes(), media_type="image/jpeg",
+                headers={"Cache-Control": "max-age=3600"},
+            )
+
+        @app.delete("/api/world_model/pet_samples/{sample_id}")
+        async def pet_sample_delete(sample_id: int):
+            """Delete one pet visual sample (row + crop file). Used by the
+            pet sample editor to drop a bad/misattributed crop."""
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            if ws is None:
+                raise HTTPException(status_code=503, detail="No world store")
+            row = await ws.db.fetchone(
+                "SELECT crop_path FROM pet_visual_samples WHERE id = ?",
+                (sample_id,),
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="Sample not found")
+            await ws.db.execute(
+                "DELETE FROM pet_visual_samples WHERE id = ?", (sample_id,))
+            # Best-effort crop-file cleanup — constrained to data_dir.
+            if row["crop_path"] and orch is not None:
+                from pathlib import Path as _Path
+                try:
+                    data_dir = _Path(
+                        (orch.config.get("system") or {}).get("data_dir", "data")
+                    ).resolve()
+                    p = _Path(row["crop_path"]).resolve()
+                    if data_dir in p.parents and p.exists():
+                        p.unlink()
+                except Exception as e:
+                    logger.debug(f"[pet_samples] crop unlink failed: {e}")
+            await self.broadcast({
+                "type": "pet_sample_deleted", "sample_id": sample_id,
+            })
+            return JSONResponse({"ok": True, "sample_id": sample_id})
 
         @app.post("/api/camera/{room}/reconnect")
         async def camera_reconnect(room: str):
@@ -3651,20 +3825,25 @@ class DashboardServer:
             if len(self._conversation) > self._max_conversation:
                 self._conversation = self._conversation[-self._max_conversation:]
 
-        # Push to all connected clients
-        dead = []
-        for client in list(self._clients):
+        # Push to all connected clients concurrently — a single slow
+        # client must not delay the event reaching the others. Each send
+        # is independently bounded at 2s; failures mark the client dead.
+        async def _send(client):
             try:
                 await asyncio.wait_for(
                     client.send_json({"type": "event", "event": event}),
                     timeout=2.0,
                 )
+                return None
             except Exception:
-                dead.append(client)
+                return client
 
-        for d in dead:
-            if d in self._clients:
-                self._clients.remove(d)
+        clients = list(self._clients)
+        if clients:
+            results = await asyncio.gather(*(_send(c) for c in clients))
+            for d in (c for c in results if c is not None):
+                if d in self._clients:
+                    self._clients.remove(d)
 
     def _update_state(self, event: dict):
         """Update the internal state cache based on incoming event."""

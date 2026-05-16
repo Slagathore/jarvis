@@ -248,6 +248,15 @@ Routes used:
         </button>
       </div>
 
+      <div class="sidebar-title">Ignore zones (masked from detection)</div>
+      <div class="poly-list" id="ignore-list"></div>
+      <div class="add-buttons">
+        <button id="add-ignore" title="Mask a static false positive — a framed painting, a TV, a poster — that YOLO keeps detecting as a person or pet. Any detection whose box-center falls inside an ignore zone is dropped before it reaches the entity layer.">
+          <span class="swatch" style="background:#d24dff"></span>
+          + Ignore zone
+        </button>
+      </div>
+
       <div class="sidebar-title">Selected polygon</div>
       <div id="selected-form">
         <div class="info">Click a polygon to edit.</div>
@@ -271,6 +280,7 @@ Routes used:
         <span><span class="swatch" style="background:#ff8a3a"></span>to_unmonitored_zone</span>
         <span><span class="swatch" style="background:#ff4d4d"></span>exterior_exit</span>
         <span><span class="swatch" style="background:#7dd87d"></span>landmark</span>
+        <span><span class="swatch" style="background:#d24dff"></span>ignore zone</span>
       </div>
     </div>
   </main>
@@ -283,6 +293,7 @@ Routes used:
       "exterior_exit":        "#ff4d4d",
     };
     const LANDMARK_COLOR = "#7dd87d";
+    const IGNORE_COLOR = "#d24dff";
 
     // Editor state.
     let currentRoom = null;
@@ -290,7 +301,8 @@ Routes used:
     let frameHeight = 480;
     let exits = [];
     let landmarks = [];
-    let selected = null;   // {type: 'exit'|'landmark', index: int}
+    let ignoreZones = [];
+    let selected = null;   // {type: 'exit'|'landmark'|'ignore', index: int}
     let dirty = false;
     let knownRooms = [];
 
@@ -354,12 +366,14 @@ Routes used:
         frameHeight = data.frame_height || 480;
         exits = (data.exits || []).map(deepClone);
         landmarks = (data.landmarks || []).map(deepClone);
+        ignoreZones = (data.ignore_zones || []).map(deepClone);
         selected = null;
         setDirty(false);
         overlay.setAttribute("viewBox", `0 0 ${frameWidth} ${frameHeight}`);
         renderAll();
         setStatus(
-          `${roomId}: ${exits.length} exits, ${landmarks.length} landmarks (${frameWidth}×${frameHeight})`,
+          `${roomId}: ${exits.length} exits, ${landmarks.length} landmarks, ` +
+          `${ignoreZones.length} ignore zones (${frameWidth}×${frameHeight})`,
         );
       } catch (e) {
         setStatus(`Load failed: ${e.message}`, "err");
@@ -377,26 +391,43 @@ Routes used:
     function renderSidebar() {
       const exitsList = document.getElementById("exits-list");
       const lmList = document.getElementById("landmarks-list");
+      const ignoreList = document.getElementById("ignore-list");
       exitsList.innerHTML = "";
       lmList.innerHTML = "";
+      ignoreList.innerHTML = "";
       exits.forEach((ex, i) => {
         exitsList.appendChild(_polyItem("exit", i, ex));
       });
       landmarks.forEach((lm, i) => {
         lmList.appendChild(_polyItem("landmark", i, lm));
       });
+      ignoreZones.forEach((iz, i) => {
+        ignoreList.appendChild(_polyItem("ignore", i, iz));
+      });
+    }
+
+    // Resolve the working array for a polygon type.
+    function _arrFor(type) {
+      if (type === "exit") return exits;
+      if (type === "landmark") return landmarks;
+      return ignoreZones;
+    }
+    function _colorFor(type, obj) {
+      if (type === "exit") return KIND_COLOR[obj.kind] || "#888";
+      if (type === "landmark") return LANDMARK_COLOR;
+      return IGNORE_COLOR;
+    }
+    function _labelFor(type, obj) {
+      if (type === "exit") return `${obj.kind || "?"}: ${obj.name || obj.to || "?"}`;
+      return obj.name || (type === "ignore" ? "ignore zone" : "?");
     }
 
     function _polyItem(type, i, obj) {
       const div = document.createElement("div");
       const isSelected = selected && selected.type === type && selected.index === i;
       div.className = "poly-item" + (isSelected ? " active" : "");
-      const color = type === "exit"
-        ? (KIND_COLOR[obj.kind] || "#888")
-        : LANDMARK_COLOR;
-      const label = type === "exit"
-        ? `${obj.kind || "?"}: ${obj.name || obj.to || "?"}`
-        : (obj.name || "?");
+      const color = _colorFor(type, obj);
+      const label = _labelFor(type, obj);
       div.innerHTML = `
         <div>
           <span class="poly-swatch" style="background:${color}"></span>
@@ -414,8 +445,7 @@ Routes used:
       div.querySelector('[data-act="delete"]').addEventListener("click", (e) => {
         e.stopPropagation();
         if (!confirm(`Delete ${label}?`)) return;
-        if (type === "exit") exits.splice(i, 1);
-        else landmarks.splice(i, 1);
+        _arrFor(type).splice(i, 1);
         if (selected && selected.type === type && selected.index === i) {
           selected = null;
         }
@@ -430,13 +460,12 @@ Routes used:
       const all = [
         ...exits.map((ex, i) => ({ type: "exit", index: i, obj: ex })),
         ...landmarks.map((lm, i) => ({ type: "landmark", index: i, obj: lm })),
+        ...ignoreZones.map((iz, i) => ({ type: "ignore", index: i, obj: iz })),
       ];
       for (const it of all) {
         const isSelected =
           selected && selected.type === it.type && selected.index === it.index;
-        const color = it.type === "exit"
-          ? (KIND_COLOR[it.obj.kind] || "#888")
-          : LANDMARK_COLOR;
+        const color = _colorFor(it.type, it.obj);
         const points = it.obj.polygon || [];
         if (points.length < 3) continue;
         const poly = document.createElementNS(SVGNS, "polygon");
@@ -456,9 +485,7 @@ Routes used:
         overlay.appendChild(poly);
 
         // Label.
-        const labelText = it.type === "exit"
-          ? `${it.obj.kind || "?"}: ${it.obj.name || it.obj.to || "?"}`
-          : (it.obj.name || "?");
+        const labelText = _labelFor(it.type, it.obj);
         const [tx, ty] = points[0];
         const t = document.createElementNS(SVGNS, "text");
         t.setAttribute("x", tx + 6);
@@ -593,9 +620,7 @@ Routes used:
         el.innerHTML = '<div class="info">Click a polygon to edit.</div>';
         return;
       }
-      const obj = selected.type === "exit"
-        ? exits[selected.index]
-        : landmarks[selected.index];
+      const obj = _arrFor(selected.type)[selected.index];
       if (!obj) {
         el.innerHTML = '<div class="info">Selection lost.</div>';
         return;
@@ -672,13 +697,9 @@ Routes used:
         [cx + w, cy + h], [cx - w, cy + h],
       ];
       const obj = { ...defaults, polygon: poly };
-      if (type === "exit") {
-        exits.push(obj);
-        selected = { type, index: exits.length - 1 };
-      } else {
-        landmarks.push(obj);
-        selected = { type, index: landmarks.length - 1 };
-      }
+      const arr = _arrFor(type);
+      arr.push(obj);
+      selected = { type, index: arr.length - 1 };
       setDirty(true);
       renderAll();
     }
@@ -691,6 +712,8 @@ Routes used:
       _addPolygon("exit", { kind: "exterior_exit", name: "new_door" }));
     document.getElementById("add-landmark").addEventListener("click", () =>
       _addPolygon("landmark", { name: "new_landmark" }));
+    document.getElementById("add-ignore").addEventListener("click", () =>
+      _addPolygon("ignore", { name: "" }));
 
     roomSelect.addEventListener("change", () => loadRoom(roomSelect.value));
     refreshBtn.addEventListener("click", () => {
@@ -707,6 +730,7 @@ Routes used:
           frame_height: frameHeight,
           exits,
           landmarks,
+          ignore_zones: ignoreZones,
         };
         const r = await fetch(
           `/api/world_model/rooms/${encodeURIComponent(currentRoom)}/polygons`,
@@ -723,7 +747,8 @@ Routes used:
         const result = await r.json();
         setDirty(false);
         setStatus(
-          `Saved: ${result.exits} exits, ${result.landmarks} landmarks.`,
+          `Saved: ${result.exits} exits, ${result.landmarks} landmarks, ` +
+          `${result.ignore_zones} ignore zones.`,
           "ok",
         );
       } catch (e) {

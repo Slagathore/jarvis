@@ -80,6 +80,16 @@ class OllamaLLM:
         # the ':gapi' suffix gets selected — keeps the import + httpx pool out
         # of the boot path for users who never use the direct API.
         self._gemini_direct: Optional[Any] = None
+        # OpenAI-compat side-route. Models listed here are routed through
+        # Ollama's /v1 endpoint instead of the native API — a per-model
+        # workaround for the native API dropping Gemini-3's thought_signature
+        # on tool-call round-trips (ollama/ollama#14567). See
+        # modules/brain/openai_compat.py. Empty the config list once Ollama
+        # patches it upstream and this route goes dormant.
+        self._openai_compat_models: set[str] = {
+            str(m) for m in (cfg.get("openai_compat_models") or [])
+        }
+        self._openai_compat: Optional[Any] = None
         # Shared httpx client for the async health check — avoids paying TLS
         # / connection setup on every probe of /api/tags. Sync is_available()
         # is one-shot at boot, so it stays plain httpx.get.
@@ -108,13 +118,14 @@ class OllamaLLM:
 
     @staticmethod
     def _needs_no_think_for_tools(model_name: str) -> bool:
-        """True for models known to break tool-call round-trips when thinking
-        is enabled. Currently: Gemini-3 variants routed through Ollama-cloud
-        — Ollama-cloud strips Gemini's thought_signature field on response
-        deserialization, then Gemini 400s the next request claiming the
-        prior assistant tool_call is missing its signature. There's no way
-        to repair the offending message after the fact, so we force
-        think=False from the first request to keep the history clean.
+        """Legacy hook, kept only for the startup pre-population path.
+
+        NOTE: forcing think=False does NOT prevent the Gemini-via-Ollama-cloud
+        tool-call 400. A probe confirmed think=omitted / False / True all 400
+        identically on the round-trip — the `thought_signature` requirement is
+        on the functionCall part itself, independent of thinking mode. The 400
+        is an Ollama-cloud limitation (it strips the signature); the real fix
+        is routing Gemini through its direct API. See chat_with_tools.
         """
         n = (model_name or "").lower()
         return n.startswith("gemini-3") and ":cloud" in n
@@ -157,6 +168,19 @@ class OllamaLLM:
                 pass
             self._gemini_direct = GeminiDirectClient(timeout=self._timeout)
         return self._gemini_direct
+
+    def _uses_openai_compat(self, model_name: str) -> bool:
+        """True for models routed through Ollama's /v1 OpenAI-compatible
+        endpoint instead of the native API (config.ollama.openai_compat_models)."""
+        return (model_name or "") in self._openai_compat_models
+
+    def _get_openai_compat(self) -> Any:
+        if self._openai_compat is None:
+            from modules.brain.openai_compat import OpenAICompatClient
+            self._openai_compat = OpenAICompatClient(
+                base_url=self._base_url, timeout=self._timeout,
+            )
+        return self._openai_compat
 
     @property
     def model(self) -> str:
@@ -210,6 +234,12 @@ class OllamaLLM:
             except Exception:
                 pass
             self._gemini_direct = None
+        if self._openai_compat is not None:
+            try:
+                await self._openai_compat.aclose()
+            except Exception:
+                pass
+            self._openai_compat = None
 
     async def _build_options_and_think(self, model_name: str) -> tuple[dict, Optional[bool]]:
         """Translate stored model_settings into Ollama's options dict + think
@@ -259,6 +289,9 @@ class OllamaLLM:
         # Dispatch: ':gapi' models go through Google's direct API instead of Ollama.
         if self._is_gemini_direct(self._model):
             return await self._get_gemini_direct().chat(messages, model=self._model)
+        # Dispatch: openai-compat models go through Ollama's /v1 endpoint.
+        if self._uses_openai_compat(self._model):
+            return await self._get_openai_compat().chat(messages, self._model)
 
         options, think = await self._build_options_and_think(self._model)
         chat_kwargs: dict = {"model": self._model, "messages": messages}
@@ -329,6 +362,21 @@ class OllamaLLM:
         # it's faster and we don't need swapping anyway.
         if self._is_gemini_direct(self._model) and not self._action_model:
             return await self._get_gemini_direct().chat_with_tools(
+                messages=messages,
+                tools=tools,
+                model=self._model,
+                tool_dispatcher=tool_handlers,
+                max_iterations=max_iterations,
+            )
+        # OpenAI-compat side-route — runs the whole tool loop through Ollama's
+        # /v1 endpoint. Taken when the chat model is openai-compat AND the
+        # action model is unset or also openai-compat (no cross-transport
+        # Pattern-D swap needed). A mixed local action_model falls through to
+        # the native per-iteration loop below.
+        if (self._uses_openai_compat(self._model)
+                and (not self._action_model
+                     or self._uses_openai_compat(self._action_model))):
+            return await self._get_openai_compat().chat_with_tools(
                 messages=messages,
                 tools=tools,
                 model=self._model,
@@ -597,6 +645,11 @@ class OllamaLLM:
         # Dispatch: ':gapi' models go to Gemini direct API
         if self._is_gemini_direct(self._vision_model):
             return await self._get_gemini_direct().vision_query(
+                buf.tobytes(), prompt, model=self._vision_model
+            )
+        # Dispatch: openai-compat models go through Ollama's /v1 endpoint.
+        if self._uses_openai_compat(self._vision_model):
+            return await self._get_openai_compat().vision_query(
                 buf.tobytes(), prompt, model=self._vision_model
             )
 

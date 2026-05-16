@@ -285,6 +285,11 @@ class DatabaseManager:
             await cursor.close()
             cursor = await conn.execute("PRAGMA foreign_keys=ON")
             await cursor.close()
+            # NORMAL is safe under WAL (a crash can lose the last txn but
+            # never corrupts the DB) and materially faster than the FULL
+            # default for our per-write commit pattern.
+            cursor = await conn.execute("PRAGMA synchronous=NORMAL")
+            await cursor.close()
 
             # Apply schema
             await conn.executescript(SCHEMA_SQL)
@@ -317,6 +322,13 @@ class DatabaseManager:
 
             await conn.commit()
             self._conn = conn
+
+            # Forward-only schema migrations. Runs after the legacy schema
+            # (SCHEMA_SQL + ALTERs) so migration SQL can rely on the core
+            # tables existing. self._conn is set above so the migrator's
+            # executescript/fetchall calls resolve.
+            from modules.storage import SchemaMigrator
+            await SchemaMigrator(self).run()
 
             logger.info(f"[DB] Ready: {self._db_path}")
 
@@ -391,6 +403,34 @@ class DatabaseManager:
         finally:
             if cursor is not None:
                 await cursor.close()
+
+    async def executescript(self, sql: str) -> None:
+        """Run a multi-statement SQL script (used by the schema migrator).
+
+        Raises:
+            DatabaseError: On SQL error.
+        """
+        conn = self._get_connection()
+        try:
+            await conn.executescript(sql)
+            await conn.commit()
+        except aiosqlite.Error as e:
+            raise DatabaseError(f"executescript failed: {e}") from e
+
+    async def vacuum(self) -> None:
+        """Compact the database file, returning freed pages to the OS.
+
+        DELETE statements never shrink the .db file on their own — only
+        VACUUM does. Run after a bulk prune (see the nightly maintenance
+        pass). Cannot run inside a transaction; we commit first.
+        """
+        conn = self._get_connection()
+        try:
+            await conn.commit()
+            await conn.execute("VACUUM")
+            logger.info("[DB] VACUUM complete")
+        except aiosqlite.Error as e:
+            raise DatabaseError(f"VACUUM failed: {e}") from e
 
     async def close(self) -> None:
         """Close the database connection gracefully."""
