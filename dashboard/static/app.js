@@ -3085,6 +3085,75 @@ function _renderPetThumbnailStrip(thumbs, petName) {
     `</div>`;
 }
 
+async function _fetchPetSamples(name) {
+  try {
+    const res = await fetch(
+      `/api/world_model/pets/${encodeURIComponent(name)}/samples`,
+    );
+    if (!res.ok) return [];
+    const body = await res.json();
+    return Array.isArray(body.samples) ? body.samples : [];
+  } catch (e) {
+    console.warn("[fetchPetSamples] failed:", e);
+    return [];
+  }
+}
+
+function _renderPetSamples(samples, petName) {
+  if (!samples || samples.length === 0) {
+    return '<div class="who-empty">No confirmed visual samples yet. '
+      + 'Samples are saved when you tag this pet in the cluster labeler.</div>';
+  }
+  return `<div class="lore-thumbs">` +
+    samples.map((s) => {
+      const ts = s.created_at ? new Date(s.created_at).toLocaleString() : "";
+      const room = escapeHtml(s.room || "?");
+      return `
+        <div class="lore-thumb" data-sample-id="${s.id}"
+             style="position:relative;"
+             title="${escapeHtml(petName)} · ${room} · ${escapeHtml(ts)} · ${escapeHtml(s.source || "")}">
+          <button class="sample-del" data-sample-id="${s.id}"
+                  title="Delete this sample"
+                  style="position:absolute;top:2px;right:2px;z-index:2;
+                         background:rgba(132,58,58,0.92);color:#fff;border:none;
+                         border-radius:3px;cursor:pointer;font-size:11px;
+                         line-height:1;padding:3px 6px;">×</button>
+          <img src="${s.url}" alt="${escapeHtml(petName)}" loading="lazy"
+               onerror="this.parentElement.classList.add('lore-thumb-broken');" />
+          <div class="lore-thumb-meta">
+            <span class="lore-thumb-room">${room}</span>
+            <span class="lore-thumb-ago">${escapeHtml(s.source || "")}</span>
+          </div>
+        </div>`;
+    }).join("") +
+    `</div>`;
+}
+
+// Wire the delete buttons in the pet-samples slot. Re-renders the slot
+// after a successful delete.
+function _wirePetSampleDeletes(slot, petName) {
+  slot.querySelectorAll(".sample-del").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.sampleId;
+      if (!id || !confirm("Delete this visual sample? This is permanent.")) return;
+      btn.disabled = true;
+      try {
+        const r = await fetch(`/api/world_model/pet_samples/${id}`,
+                              { method: "DELETE" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const fresh = await _fetchPetSamples(petName);
+        slot.innerHTML = _renderPetSamples(fresh, petName);
+        _wirePetSampleDeletes(slot, petName);
+      } catch (err) {
+        console.warn("[petSampleDelete] failed:", err);
+        btn.disabled = false;
+        alert("Delete failed: " + err.message);
+      }
+    });
+  });
+}
+
 function _renderPetEventList(events) {
   if (!events || events.length === 0) {
     return '<div class="who-empty">No events in the last week.</div>';
@@ -3158,6 +3227,12 @@ async function openPetLoreModal(pet) {
           </div>
         </div>
         <div class="modal-section">
+          <div class="modal-section-label">VISUAL SAMPLES</div>
+          <div class="lore-thumbs-slot" id="pet-samples-slot">
+            <div class="who-empty">Loading…</div>
+          </div>
+        </div>
+        <div class="modal-section">
           <div class="modal-section-label">LORE</div>
           <div class="lore-rows">${_kvRows(seed) ||
             '<div class="who-empty">No seed metadata in config.yaml for this pet.</div>'
@@ -3183,12 +3258,18 @@ async function openPetLoreModal(pet) {
 
   // Fire both fetches in parallel — the events list is the longer
   // wait (DB scan); thumbnails come back fast.
-  const [events, thumbs] = await Promise.all([
+  const [events, thumbs, samples] = await Promise.all([
     _fetchPetEvents(pet.name),
     _fetchPetThumbnails(pet.name),
+    _fetchPetSamples(pet.name),
   ]);
   const eventsSlot = overlay.querySelector("#lore-events-list");
   if (eventsSlot) eventsSlot.innerHTML = _renderPetEventList(events);
+  const samplesSlot = overlay.querySelector("#pet-samples-slot");
+  if (samplesSlot) {
+    samplesSlot.innerHTML = _renderPetSamples(samples, pet.name);
+    _wirePetSampleDeletes(samplesSlot, pet.name);
+  }
   const thumbsSlot = overlay.querySelector("#lore-thumbs-slot");
   if (thumbsSlot) {
     thumbsSlot.innerHTML = _renderPetThumbnailStrip(thumbs, pet.name);

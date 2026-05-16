@@ -3298,6 +3298,108 @@ class DashboardServer:
                 )
             return HTMLResponse(page.read_text(encoding="utf-8"))
 
+        # ── Pet visual-sample management ─────────────────────────────────────
+        # Mirrors the human identity sample tools (/api/identity/face_samples)
+        # for the pet_visual_samples table — list, view crop, delete.
+
+        @app.get("/api/world_model/pets/{name}/samples")
+        async def pet_samples_list(name: str):
+            """List the confirmed visual samples for a named pet."""
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            wm = getattr(orch, "world_model", None) if orch else None
+            if ws is None or wm is None:
+                return JSONResponse({"samples": [], "available": False})
+            ent = wm.find_entity_by_name(name)
+            if ent is None:
+                return JSONResponse({"samples": [], "available": True})
+            rows = await ws.db.fetchall(
+                "SELECT id, created_at, room, source, crop_path "
+                "FROM pet_visual_samples WHERE pet_entity_id = ? "
+                "ORDER BY created_at DESC",
+                (ent.id,),
+            )
+            samples = [
+                {
+                    "id": r["id"],
+                    "created_at": r["created_at"],
+                    "room": r["room"],
+                    "source": r["source"],
+                    "has_image": bool(r["crop_path"]),
+                    "url": f"/api/world_model/pet_samples/{r['id']}/image.jpg",
+                }
+                for r in rows
+            ]
+            return JSONResponse({
+                "samples": samples, "available": True,
+                "pet_name": ent.display_name, "count": len(samples),
+            })
+
+        @app.get("/api/world_model/pet_samples/{sample_id}/image.jpg")
+        async def pet_sample_image(sample_id: int):
+            """Serve the crop JPEG for one pet visual sample."""
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            if ws is None:
+                raise HTTPException(status_code=503, detail="No world store")
+            row = await ws.db.fetchone(
+                "SELECT crop_path FROM pet_visual_samples WHERE id = ?",
+                (sample_id,),
+            )
+            if row is None or not row["crop_path"]:
+                raise HTTPException(status_code=404, detail="No crop")
+            assert orch is not None  # narrowed by the ws check above
+            from pathlib import Path as _Path
+            data_dir = _Path(
+                (orch.config.get("system") or {}).get("data_dir", "data")
+            ).resolve()
+            try:
+                path = _Path(row["crop_path"]).resolve()
+                if data_dir not in path.parents:
+                    raise HTTPException(
+                        status_code=403, detail="crop path outside data_dir")
+            except OSError as e:
+                raise HTTPException(status_code=404, detail=str(e)) from e
+            if not path.exists():
+                raise HTTPException(status_code=404, detail="File missing")
+            return Response(
+                content=path.read_bytes(), media_type="image/jpeg",
+                headers={"Cache-Control": "max-age=3600"},
+            )
+
+        @app.delete("/api/world_model/pet_samples/{sample_id}")
+        async def pet_sample_delete(sample_id: int):
+            """Delete one pet visual sample (row + crop file). Used by the
+            pet sample editor to drop a bad/misattributed crop."""
+            orch = self._orchestrator
+            ws = getattr(orch, "world_store", None) if orch else None
+            if ws is None:
+                raise HTTPException(status_code=503, detail="No world store")
+            row = await ws.db.fetchone(
+                "SELECT crop_path FROM pet_visual_samples WHERE id = ?",
+                (sample_id,),
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="Sample not found")
+            await ws.db.execute(
+                "DELETE FROM pet_visual_samples WHERE id = ?", (sample_id,))
+            # Best-effort crop-file cleanup — constrained to data_dir.
+            if row["crop_path"] and orch is not None:
+                from pathlib import Path as _Path
+                try:
+                    data_dir = _Path(
+                        (orch.config.get("system") or {}).get("data_dir", "data")
+                    ).resolve()
+                    p = _Path(row["crop_path"]).resolve()
+                    if data_dir in p.parents and p.exists():
+                        p.unlink()
+                except Exception as e:
+                    logger.debug(f"[pet_samples] crop unlink failed: {e}")
+            await self.broadcast({
+                "type": "pet_sample_deleted", "sample_id": sample_id,
+            })
+            return JSONResponse({"ok": True, "sample_id": sample_id})
+
         @app.post("/api/camera/{room}/reconnect")
         async def camera_reconnect(room: str):
             """Force-reopen a room's RTSP capture. The orchestrator's
