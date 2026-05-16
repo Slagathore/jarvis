@@ -22,11 +22,12 @@ Classes: ToolsMixin
 import asyncio
 import base64
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Optional
 
 import numpy as np
 from loguru import logger
 
+from core.orchestrator_base import OrchestratorMixin
 from core.task_supervisor import TaskPolicy, TaskSupervisor
 from core.event_bus import EventBus
 from core.exceptions import JarvisError
@@ -107,31 +108,12 @@ from modules.voice.wake_source import WakeSourceManager
 _ECHO_SUPPRESSION_TAIL_S: float = 1.5
 
 
-class ToolsMixin:
+class ToolsMixin(OrchestratorMixin):
     """LLM tool implementations + tool-registry assembly.
 
-    Mixed into Orchestrator — all `self.*` attributes resolve
-    against the concrete Orchestrator instance at runtime.
+    Mixed into Orchestrator — all `self.*` attributes resolve against the
+    concrete Orchestrator instance at runtime; see core/orchestrator_base.py.
     """
-
-    # ── Host attributes ──────────────────────────────────────────────────────
-    # These live on the concrete Orchestrator (set in its __init__, or a
-    # class constant). Declared here under TYPE_CHECKING so the type checker
-    # knows the mixin's `self.*` references resolve — no runtime effect.
-    if TYPE_CHECKING:
-        config: dict
-        calendar: Optional[Any]
-        memory: Optional[Any]
-        computer: Optional[Any]
-        selfedit: Optional[Any]
-        cameras: Optional[Any]
-        llm: Optional[Any]
-        world_query_tools: Optional[Any]
-        _claude_client: Optional[Any]
-        _CALENDAR_TOOLS: list[dict]
-
-        # method stub — real impl is Orchestrator._broadcast
-        async def _broadcast(self, event: dict) -> None: ...
 
     async def _tool_calendar_list_events(
         self,
