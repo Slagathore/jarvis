@@ -30,6 +30,7 @@ data/*.sqlite
 data/*.sqlite3
 data/debug/
 data/world_snapshots/
+data/pet_visual_samples/
 data/google_token.json
 data/google_credentials.json
 data/test_frame_*.jpg
