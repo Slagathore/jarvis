@@ -121,6 +121,20 @@ class WorldStore:
                 PRIMARY KEY (pet_entity_id, person_id)
             )""",
             "CREATE INDEX IF NOT EXISTS idx_pet_affinities_pet ON pet_affinities(pet_entity_id)",
+            """CREATE TABLE IF NOT EXISTS pet_visual_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pet_entity_id TEXT NOT NULL REFERENCES world_entities(id) ON DELETE CASCADE,
+                pet_name TEXT NOT NULL,
+                species TEXT NOT NULL CHECK (species IN ('cat','dog')),
+                created_at TEXT NOT NULL,
+                room TEXT,
+                bbox TEXT,
+                crop_path TEXT,
+                descriptor_json TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual_tag'
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_pet_visual_samples_pet_time ON pet_visual_samples(pet_entity_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_pet_visual_samples_species_time ON pet_visual_samples(species, created_at DESC)",
             # ── §32 v4 schema — alarm + door tables ─────────────────────────
             # Created here for now because WorldStore is the only module with
             # a deterministic ensure_schema entry-point. When the §29.3 door

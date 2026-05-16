@@ -5316,6 +5316,11 @@ class Orchestrator:
                     openvocab_detector=openvocab_detector,
                     tracked_objects_open_vocab=tracked_open_vocab,
                     openvocab_interval_seconds=openvocab_interval,
+                    entity_min_confidence=(
+                        (self.config.get("vision", {}) or {}).get(
+                            "entity_min_confidence", {}
+                        ) or {}
+                    ),
                 )
                 # Wire the camera-health publisher so WorldModel can
                 # suspend its state machine for offline rooms.

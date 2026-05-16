@@ -3315,33 +3315,24 @@ async function openLivePetTagModal(room) {
     alert("No resident pets configured in config.yaml.");
     return;
   }
-  // YOLO runs on EVERY open. Three parallel queries:
-  //   (1) live YOLO for cat/dog (what's in the frame right now —
-  //       useful even if the pet hasn't moved enough to log a recent
-  //       event)
-  //   (2) live YOLO for person (display-only, so Cole can sanity-check
-  //       "is that thing a person or one of the cats?" without leaving
-  //       the modal)
-  //   (3) recent event log (gives us the system's current attributed
-  //       entity_name for boxes that match historical events).
+  // YOLO runs on EVERY open. Use ONE live detector pass for cats,
+  // dogs, and display-only people so all boxes come from the same
+  // captured frame. Separate pet/person calls made repeated clicks look
+  // inconsistent because each call grabbed a fresh camera frame.
   const stamp = Date.now();
   const snapUrl = `/api/camera/${encodeURIComponent(room)}/snapshot.jpg?lb=${stamp}`;
-  let [liveBody, peopleBody, recentBody] = await Promise.all([
+  let [liveBody, recentBody] = await Promise.all([
     fetch("/api/world_model/yolo_now", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ room, species: ["cat", "dog"] }),
-    }).then(r => r.ok ? r.json() : { detections: [] }).catch(() => ({ detections: [] })),
-    fetch("/api/world_model/yolo_now", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ room, species: ["person"] }),
+      body: JSON.stringify({ room, species: ["cat", "dog", "person"] }),
     }).then(r => r.ok ? r.json() : { detections: [] }).catch(() => ({ detections: [] })),
     fetch(`/api/world_model/recent_animal_detections?room=${encodeURIComponent(room)}&seconds=30`)
       .then(r => r.ok ? r.json() : { detections: [] }).catch(() => ({ detections: [] })),
   ]);
-  const liveDets = Array.isArray(liveBody.detections) ? liveBody.detections : [];
-  const personDets = Array.isArray(peopleBody.detections) ? peopleBody.detections : [];
+  const allLiveDets = Array.isArray(liveBody.detections) ? liveBody.detections : [];
+  const liveDets = allLiveDets.filter((d) => d.species === "cat" || d.species === "dog");
+  const personDets = allLiveDets.filter((d) => d.species === "person");
   const recentDets = Array.isArray(recentBody.detections) ? recentBody.detections : [];
 
   // Merge: live detections first (they're the actual current frame),
@@ -3369,15 +3360,20 @@ async function openLivePetTagModal(room) {
       const i = _iou(live.bbox, r.bbox);
       if (i > bestIou) { bestIou = i; bestMatch = r; }
     }
+    const hasRecentName = bestIou > 0.3 && bestMatch;
+    const suggestedName = live.suggested_name || (live.pet_match && live.pet_match.accepted ? live.pet_match.pet_name : null);
     unique.push({
       bbox: live.bbox,
       entity_type: live.species,
-      entity_name: (bestIou > 0.3 && bestMatch)
+      entity_name: hasRecentName
         ? bestMatch.entity_name
+        : suggestedName
+          ? suggestedName
         : `(new ${live.species})`,
-      entity_id: bestMatch ? bestMatch.entity_id : null,
-      ts: bestMatch ? bestMatch.ts : new Date().toISOString(),
+      entity_id: hasRecentName ? bestMatch.entity_id : (live.suggested_entity_id || null),
+      ts: hasRecentName ? bestMatch.ts : new Date().toISOString(),
       confidence: live.confidence,
+      pet_match: live.pet_match || null,
       source: "yolo_live",
     });
   }

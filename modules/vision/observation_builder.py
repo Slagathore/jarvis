@@ -111,6 +111,7 @@ class ObservationBuilder:
         openvocab_detector: Optional[Any] = None,
         tracked_objects_open_vocab: Optional[list[dict]] = None,
         openvocab_interval_seconds: float = 30.0,
+        entity_min_confidence: Optional[dict[str, float]] = None,
     ) -> None:
         self.bus = bus
         self.cm = camera_manager
@@ -134,6 +135,16 @@ class ObservationBuilder:
             tracked_objects_open_vocab or []
         )
         self._openvocab_interval_s = float(openvocab_interval_seconds)
+        self._entity_min_confidence: dict[str, float] = {
+            # Keep the world model from turning low-confidence furniture /
+            # shadow detections into persistent people. Pet defaults stay
+            # looser because partial cats/dogs are common and are corrected
+            # via the tag-in-frame workflow.
+            "person": 0.55,
+            "cat": 0.20,
+            "dog": 0.20,
+            **(entity_min_confidence or {}),
+        }
         # Per-room open-vocab loop tasks; cancelled in stop().
         self._openvocab_tasks: dict[str, asyncio.Task] = {}
         # Index rooms by id for fast `_loop_for_room` lookups; preserve
@@ -295,7 +306,12 @@ class ObservationBuilder:
 
         # 1. Object detection (YOLO).
         raw_dets = await self.detector.detect_async(frame)
-        detections = [Detection.from_dict(d) for d in raw_dets]
+        detections = [
+            d for d in (Detection.from_dict(raw) for raw in raw_dets)
+            if d.confidence >= self._entity_min_confidence.get(
+                d.class_name, 0.0
+            )
+        ]
 
         # 2. Hand detection (§24.1) — once per frame, attached per-person
         # below. Cheap to skip when no detector is wired.

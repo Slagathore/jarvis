@@ -399,10 +399,17 @@ class DashboardServer:
             "loaded" if getattr(orch, "speaker_id", None) is not None else "disabled",
         ))
         ob = getattr(orch, "observation_builder", None)
-        openvocab = getattr(ob, "openvocab_detector", None)
+        openvocab = getattr(ob, "openvocab", None)
+        openvocab_status = "disabled"
+        if openvocab is not None:
+            openvocab_status = (
+                "disabled"
+                if openvocab.__class__.__name__ == "NullOpenVocabDetector"
+                else "loaded"
+            )
         items.append(_item(
             "open-vocab objects",
-            "loaded" if openvocab is not None else "disabled",
+            openvocab_status,
         ))
         integrations = getattr(orch, "integrations", None)
         for plugin in integrations.status() if integrations is not None else []:
@@ -2006,6 +2013,7 @@ class DashboardServer:
             orch = self._orchestrator
             if orch is None:
                 raise HTTPException(status_code=503, detail="No orchestrator")
+            ws = getattr(orch, "world_store", None)
             body = await request.json()
             room = (body.get("room") or "").strip()
             species = body.get("species") or ["cat", "dog"]
@@ -2026,20 +2034,54 @@ class DashboardServer:
                 )
             detections = await detector.detect_async(frame)
             wanted = set(species)
+            min_conf_by_class = {
+                # The live pet-tagging modal is a correction tool, not a
+                # recall benchmark. Keep low-confidence boxes out so repeated
+                # clicks on a static frame do not surface chairs/shadows as
+                # pets or people.
+                "cat": 0.25,
+                "dog": 0.25,
+                "person": 0.55,
+            }
             out: list[dict] = []
             for d in detections:
                 cls = d.get("class")
                 if cls not in wanted:
                     continue
+                conf = float(d.get("confidence", 0.0) or 0.0)
+                if conf < min_conf_by_class.get(str(cls), 0.25):
+                    continue
                 box = d.get("box") or []
                 if len(box) != 4:
                     continue
-                out.append({
+                item = {
                     "species": cls,
                     "bbox": box,
-                    "confidence": d.get("confidence", 0.0),
+                    "confidence": conf,
                     "label": d.get("label"),
-                })
+                }
+                if cls in ("cat", "dog") and ws is not None:
+                    try:
+                        from modules.world_model.pet_identity import (
+                            match_pet_from_crop,
+                        )
+                        match = await match_pet_from_crop(
+                            db=ws.db,
+                            species=str(cls),
+                            frame=frame,
+                            room=room,
+                            bbox=box,
+                        )
+                        if match is not None:
+                            item["pet_match"] = match
+                            if match.get("accepted"):
+                                item["suggested_name"] = match.get("pet_name")
+                                item["suggested_entity_id"] = match.get(
+                                    "entity_id"
+                                )
+                    except Exception as e:
+                        logger.debug(f"[PetID] live pet match failed: {e}")
+                out.append(item)
             return JSONResponse({
                 "detections": out,
                 "frame_width": int(frame.shape[1]),
@@ -2368,6 +2410,60 @@ class DashboardServer:
                     (target.id, target.display_name,
                      target.entity_type, evt_id),
                 )
+            sample_saved = False
+            try:
+                cm = getattr(orch, "cameras", None)
+                frame = (
+                    await cm.capture_frame_async(room)
+                    if cm is not None
+                    else None
+                )
+                if frame is not None:
+                    from modules.world_model.pet_identity import (
+                        save_confirmed_pet_sample,
+                    )
+                    data_dir = Path(
+                        (getattr(orch, "config", {}) or {})
+                        .get("system", {})
+                        .get("data_dir", "data")
+                    )
+                    sample_id = await save_confirmed_pet_sample(
+                        db=ws.db,
+                        pet_entity=target,
+                        frame=frame,
+                        room=room,
+                        bbox=click_bbox,
+                        sample_dir=data_dir / "pet_visual_samples",
+                        source="manual_tag",
+                    )
+                    sample_saved = sample_id is not None
+            except Exception as e:
+                logger.debug(f"[PetID] confirmed sample save failed: {e}")
+            # Manual tagging should also anchor the live resident entity,
+            # not only historical event rows. Otherwise the next frame can
+            # immediately rediscover the same stationary pet as a fresh
+            # unknown because the named entity's last_seen fields stayed stale.
+            try:
+                from datetime import timezone as _tz
+                from modules.world_model.types import EntityState
+                now = _dt.now(_tz.utc)
+                target.state = EntityState.PRESENT
+                target.last_seen_ts = now
+                target.last_seen_room = room
+                target.last_seen_camera = room
+                target.last_seen_bbox = tuple(int(v) for v in click_bbox)
+                target.last_state_change_ts = now
+                target.confidence = 1.0
+                target.last_attribution_confidence = 1.0
+                target.is_resident = True
+                target.metadata["last_manual_tag_at"] = now.isoformat()
+                target.metadata["last_manual_tag_bbox"] = [
+                    int(v) for v in click_bbox
+                ]
+                wq.world.entities[target.id] = target
+                await ws.upsert_entity(target)
+            except Exception as e:
+                logger.debug(f"[Tag] live entity anchor failed: {e}")
             if cross_species:
                 logger.info(
                     f"[Tag] {cross_species} cross-species correction(s) "
@@ -2384,6 +2480,7 @@ class DashboardServer:
                 "ok": True,
                 "relabeled": len(relabeled),
                 "pet_name": target.display_name,
+                "sample_saved": sample_saved,
             })
 
         @app.post("/api/world_model/events/{event_id}/relabel")
@@ -2967,17 +3064,15 @@ class DashboardServer:
                     "cluster_min_observations", 200,
                 ))
                 # Give the UI useful telemetry on the gate.
-                rows = await ws.search_events(
-                    event_types=["first_seen", "moved_within_room",
-                                 "reappeared", "moved_to"],
-                    limit=threshold,
+                row = await ws.db.fetchone(
+                    "SELECT COUNT(*) AS n FROM world_entity_events "
+                    "WHERE entity_type = ? "
+                    "AND event_type IN ('first_seen', 'moved_within_room', "
+                    "'reappeared', 'moved_to') "
+                    "AND (entity_name IS NULL OR entity_name LIKE 'unknown_%')",
+                    (species,),
                 )
-                count_unattrib = sum(
-                    1 for r in rows
-                    if r.get("entity_type") == species
-                    and (r.get("entity_name") is None
-                         or str(r.get("entity_name", "")).startswith("unknown_"))
-                )
+                count_unattrib = int(row["n"] or 0) if row else 0
                 return JSONResponse({
                     "ready": False,
                     "species": species,

@@ -369,6 +369,13 @@ vision:
   scene_change_threshold: 12.0
   scene_change_threshold_per_room:
     office: 25.0
+  # Minimum detector confidence before a YOLO hit is allowed to become
+  # a world-model entity. Person is deliberately higher to stop static
+  # furniture/shadows from becoming "unknown_person_*" event storms.
+  entity_min_confidence:
+    person: 0.55
+    cat: 0.20
+    dog: 0.20
 anomaly:
   alert_threshold: 6.0
   cooldown_seconds: 600

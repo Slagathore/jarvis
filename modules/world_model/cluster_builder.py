@@ -87,18 +87,17 @@ class AnimalClusterBuilder:
         dashboard can pass an override if it wants a different K.
         """
         cutoff = _utcnow() - timedelta(days=days_back)
-        events = await self.store.search_events(
-            event_types=["first_seen", "moved_within_room", "reappeared",
-                         "moved_to"],
-            since=cutoff,
-            limit=20000,
+        rows = await self.store.db.fetchall(
+            "SELECT * FROM world_entity_events "
+            "WHERE entity_type = ? "
+            "AND ts >= ? "
+            "AND event_type IN ('first_seen', 'moved_within_room', "
+            "'reappeared', 'moved_to') "
+            "AND (entity_name IS NULL OR entity_name LIKE 'unknown_%') "
+            "ORDER BY ts DESC LIMIT ?",
+            (species, cutoff.isoformat(), 20000),
         )
-        unattrib = [
-            e for e in events
-            if e.get("entity_type") == species
-            and (e.get("entity_name") is None
-                 or str(e.get("entity_name", "")).startswith("unknown_"))
-        ]
+        unattrib = [dict(r) for r in rows]
         threshold = int(self.cfg.get("cluster_min_observations", 200))
         if len(unattrib) < threshold:
             logger.info(

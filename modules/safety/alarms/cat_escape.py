@@ -2,9 +2,9 @@
 JARVIS — Safety
 ===============
 Mission: Cat-escape alarm. Concrete subclass of Alarm that subscribes
-         to `vision.observation` and fires when an `entity_type='cat'`
-         observation has its bbox center inside an `exterior_exit`
-         polygon.
+         to `vision.observation` and `door.state`, then fires when an
+         `entity_type='cat'` observation has its bbox center inside an
+         `exterior_exit` polygon whose matching exterior door is open.
 
          Auto-resolve (primary): the same cat is observed in any
          monitored interior room. Implementation: subscribe to
@@ -57,6 +57,7 @@ class CatEscapeAlarm(Alarm):
         notifier: Optional[Any] = None,
         store: Optional[Any] = None,
         armed: bool = True,
+        require_door_open: bool = True,
         mute_seconds: float = 300.0,           # 5 min default
     ) -> None:
         super().__init__(
@@ -66,6 +67,12 @@ class CatEscapeAlarm(Alarm):
         # Per-room exterior_exit polygons. Indexed by room id; each
         # entry is a list of {name, polygon} dicts.
         self._exits_by_room = self._index_exits(rooms_config)
+        self._door_state: dict[str, str] = {
+            ex.get("name", "exterior door"): "unknown"
+            for exits in self._exits_by_room.values()
+            for ex in exits
+        }
+        self._require_door_open = bool(require_door_open)
         self._armed = bool(armed)
         # Per-cat suppression window: {cat_name: until_ts_monotonic}.
         # Used for "I'm taking Sneaky out for 20 minutes."
@@ -134,11 +141,26 @@ class CatEscapeAlarm(Alarm):
 
     async def start(self) -> None:
         await self.bus.subscribe("vision.observation", self._on_observation_batch)
+        await self.bus.subscribe("door.state", self._on_door_state)
         await self.bus.subscribe("world.entity_event", self._on_entity_event)
         logger.info(
             f"[CatEscape] watching {len(self._exits_by_room)} room(s) "
             f"with exterior_exit polygons"
+            + ("; requiring matching door.state=open"
+               if self._require_door_open else "")
         )
+
+    async def _on_door_state(self, payload: dict) -> None:
+        """Track {door_id, state} from the same publisher DoorOpenAlarm
+        uses. Unknown/closed doors do not allow a cat escape fire when
+        `_require_door_open` is enabled."""
+        door_id = payload.get("door_id")
+        state = payload.get("state")
+        if not door_id or state not in ("open", "closed", "unknown"):
+            return
+        if door_id not in self._door_state:
+            return
+        self._door_state[str(door_id)] = str(state)
 
     async def _on_observation_batch(self, payload: dict) -> None:
         """Per-frame trigger check. Walks the observation list; if any
@@ -165,6 +187,8 @@ class CatEscapeAlarm(Alarm):
             cx, cy = bbox_center(bbox)
             for ex in exits:
                 if point_in_polygon(cx, cy, ex.get("polygon") or []):
+                    if not self._door_allows_fire(ex):
+                        continue
                     cat_name = self._cat_name_from_obs(obs)
                     if self._is_cat_suppressed(cat_name):
                         logger.info(
@@ -173,6 +197,19 @@ class CatEscapeAlarm(Alarm):
                         continue
                     await self._fire_for_cat(cat_name, ex, room)
                     return
+
+    def _door_allows_fire(self, exit_def: dict) -> bool:
+        if not self._require_door_open:
+            return True
+        door_id = exit_def.get("name", "exterior door")
+        state = self._door_state.get(door_id, "unknown")
+        if state == "open":
+            return True
+        logger.debug(
+            f"[CatEscape] cat in exterior_exit '{door_id}' but door "
+            f"state is {state}; suppressing"
+        )
+        return False
 
     async def _on_entity_event(self, payload: dict) -> None:
         """Auto-resolve listener: a cat reappearing in an interior
