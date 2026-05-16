@@ -3514,6 +3514,13 @@ async function openLivePetTagModal(room) {
           <img id="live-pet-snapshot" src="${snapUrl}" alt="snapshot" />
           <div id="live-pet-overlays"></div>
         </div>
+        <div class="live-pet-tools">
+          <button class="dev-btn" id="live-pet-draw"
+                  title="Drag a box over a pet YOLO missed in the full-frame pass. JARVIS crops that region, upscales it, and re-runs detection at a low threshold — it can recover small or low-contrast pets the normal pass skipped.">
+            ✏ Draw region to recheck
+          </button>
+          <span class="live-pet-status" id="live-pet-draw-status"></span>
+        </div>
         ${unique.length === 0
           ? `<div class="who-empty">No cat/dog detections in the last 30s. The frame is shown but there's nothing to relabel — try again when a pet is visible.</div>`
           : `<div class="live-pet-detections">
@@ -3750,70 +3757,154 @@ async function openLivePetTagModal(room) {
       }
     });
   }
-  if (recheckBtn) {
-    recheckBtn.addEventListener("click", async () => {
-      if (!selectedDet) return;
-      statusEl.textContent = "rechecking region at lower threshold…";
-      statusEl.className = "live-pet-status";
-      try {
-        const res = await fetch("/api/world_model/yolo_region", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            room,
-            bbox: selectedDet.bbox,
-            conf: 0.08,
-            padding: 0.20,
-          }),
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.detail || `HTTP ${res.status}`);
-        }
-        const body = await res.json();
-        const found = (body.detections || []).filter(
-          (d) => d.class === "cat" || d.class === "dog" || d.class === "person",
-        );
-        if (found.length === 0) {
-          statusEl.textContent = "no cat/dog/person found even at low threshold.";
-          statusEl.classList.add("err");
-          return;
-        }
-        // Inject the new detections into `unique` and re-render overlays.
-        for (const d of found) {
-          unique.push({
-            bbox: d.box,
-            entity_type: d.class,
-            entity_name: d.class === "person" ? "(person)" : `(rechecked ${d.class})`,
-            entity_id: null,
-            ts: new Date().toISOString(),
-            confidence: d.confidence,
-            source: "yolo_recheck",
-          });
-        }
-        renderOverlays();
-        // Rebuild the side list too.
-        if (detListSlot) {
-          detListSlot.innerHTML = unique
-            .map((d, i) => `
-              <div class="live-pet-det-row" data-idx="${i}">
-                <span class="live-pet-det-name">${escapeHtml(d.entity_name || `?_${d.entity_type}`)}</span>
-                <span class="live-pet-det-species">${escapeHtml(d.entity_type)}</span>
-                <span class="live-pet-det-ago">${formatRelativeTs(d.ts)}</span>
-              </div>`)
-            .join("");
-          detListSlot.querySelectorAll(".live-pet-det-row").forEach((row) => {
-            row.addEventListener("click", () => _selectDet(Number(row.dataset.idx)));
-          });
-        }
-        statusEl.textContent = `found ${found.length} new detection(s) ✓ — click to tag.`;
-        statusEl.classList.add("ok");
-      } catch (e) {
-        statusEl.textContent = `recheck failed: ${e.message || e}`;
-        statusEl.classList.add("err");
+  // Re-run YOLO on one region — cropped, upscaled by YOLO's own
+  // letterbox, at a low confidence threshold. The backend takes any
+  // bbox, so this serves both the per-detection "Recheck region"
+  // button and the freehand "Draw region" tool below.
+  // `statusTarget` is whichever status span the caller wants updated.
+  async function _recheckRegion(bbox, statusTarget) {
+    const st = statusTarget || statusEl;
+    st.textContent = "rechecking region at lower threshold…";
+    st.className = st.id === "live-pet-draw-status"
+      ? "live-pet-status" : "live-pet-status";
+    try {
+      const res = await fetch("/api/world_model/yolo_region", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ room, bbox, conf: 0.08, padding: 0.20 }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
       }
+      const body = await res.json();
+      const found = (body.detections || []).filter(
+        (d) => d.class === "cat" || d.class === "dog" || d.class === "person",
+      );
+      if (found.length === 0) {
+        st.textContent = "no cat/dog/person found even at low threshold.";
+        st.classList.add("err");
+        return 0;
+      }
+      // Inject the new detections into `unique` and re-render overlays.
+      for (const d of found) {
+        unique.push({
+          bbox: d.box,
+          entity_type: d.class,
+          entity_name: d.class === "person" ? "(person)" : `(rechecked ${d.class})`,
+          entity_id: null,
+          ts: new Date().toISOString(),
+          confidence: d.confidence,
+          source: "yolo_recheck",
+        });
+      }
+      renderOverlays();
+      if (detListSlot) {
+        detListSlot.innerHTML = unique
+          .map((d, i) => `
+            <div class="live-pet-det-row" data-idx="${i}">
+              <span class="live-pet-det-name">${escapeHtml(d.entity_name || `?_${d.entity_type}`)}</span>
+              <span class="live-pet-det-species">${escapeHtml(d.entity_type)}</span>
+              <span class="live-pet-det-ago">${formatRelativeTs(d.ts)}</span>
+            </div>`)
+          .join("");
+        detListSlot.querySelectorAll(".live-pet-det-row").forEach((row) => {
+          row.addEventListener("click", () => _selectDet(Number(row.dataset.idx)));
+        });
+      }
+      st.textContent = `found ${found.length} new detection(s) ✓ — click to tag.`;
+      st.classList.add("ok");
+      return found.length;
+    } catch (e) {
+      st.textContent = `recheck failed: ${e.message || e}`;
+      st.classList.add("err");
+      return 0;
+    }
+  }
+
+  if (recheckBtn) {
+    recheckBtn.addEventListener("click", () => {
+      if (!selectedDet) return;
+      _recheckRegion(selectedDet.bbox, statusEl);
     });
   }
+
+  // ── Freehand "draw a region" recheck ─────────────────────────────────────
+  // YOLO's full-frame pass misses small / low-contrast / partially-hidden
+  // pets. This lets the user drag a box over WHERE they know a pet is so
+  // the detector looks there specifically. Works even with zero existing
+  // detections (the exact case the per-detection Recheck button can't
+  // handle — there's no box to select).
+  const drawBtn = overlay.querySelector("#live-pet-draw");
+  const drawStatus = overlay.querySelector("#live-pet-draw-status");
+  let drawArmed = false;
+
+  function _setDrawArmed(on) {
+    drawArmed = on;
+    if (drawBtn) drawBtn.classList.toggle("armed", on);
+    overlaysSlot.style.cursor = on ? "crosshair" : "";
+    if (drawStatus) {
+      drawStatus.textContent = on
+        ? "drag a box over the pet, then release"
+        : "";
+      drawStatus.className = "live-pet-status";
+    }
+  }
+
+  if (drawBtn) {
+    drawBtn.addEventListener("click", () => _setDrawArmed(!drawArmed));
+  }
+
+  overlaysSlot.addEventListener("pointerdown", (ev) => {
+    if (!drawArmed || !img.naturalWidth) return;
+    ev.preventDefault();
+    const oRect = overlaysSlot.getBoundingClientRect();
+    const iRect = img.getBoundingClientRect();
+    const scale = Math.min(
+      iRect.width / img.naturalWidth, iRect.height / img.naturalHeight);
+    const renderW = img.naturalWidth * scale, renderH = img.naturalHeight * scale;
+    const offX = (iRect.width - renderW) / 2 + (iRect.left - oRect.left);
+    const offY = (iRect.height - renderH) / 2 + (iRect.top - oRect.top);
+    const startX = ev.clientX - oRect.left;
+    const startY = ev.clientY - oRect.top;
+
+    const rectEl = document.createElement("div");
+    rectEl.className = "live-pet-draw-rect";
+    rectEl.style.cssText =
+      "position:absolute;border:2px dashed #ffd24d;" +
+      "background:rgba(255,210,77,0.12);pointer-events:none;z-index:5;";
+    overlaysSlot.appendChild(rectEl);
+
+    let curX = startX, curY = startY;
+    const onMove = (mv) => {
+      curX = mv.clientX - oRect.left;
+      curY = mv.clientY - oRect.top;
+      rectEl.style.left = `${Math.min(startX, curX)}px`;
+      rectEl.style.top = `${Math.min(startY, curY)}px`;
+      rectEl.style.width = `${Math.abs(curX - startX)}px`;
+      rectEl.style.height = `${Math.abs(curY - startY)}px`;
+    };
+    const onUp = async () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      rectEl.remove();
+      _setDrawArmed(false);
+      // Overlay-local rect → source-pixel bbox (inverse of renderOverlays).
+      const toSrc = (lx, ly) => [
+        Math.max(0, Math.min(img.naturalWidth, Math.round((lx - offX) / scale))),
+        Math.max(0, Math.min(img.naturalHeight, Math.round((ly - offY) / scale))),
+      ];
+      const [sx1, sy1] = toSrc(Math.min(startX, curX), Math.min(startY, curY));
+      const [sx2, sy2] = toSrc(Math.max(startX, curX), Math.max(startY, curY));
+      if (sx2 - sx1 < 8 || sy2 - sy1 < 8) {
+        if (drawStatus) drawStatus.textContent = "region too small — try again.";
+        return;
+      }
+      await _recheckRegion([sx1, sy1, sx2, sy2], drawStatus);
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  });
   if (cancelBtn) {
     cancelBtn.addEventListener("click", () => {
       selectedDet = null;
