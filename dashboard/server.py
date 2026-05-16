@@ -3020,6 +3020,21 @@ class DashboardServer:
         #   POST /api/world_model/cluster/apply {species, clusters, labels}
         #   GET  /clusters                                       → SPA page
 
+        @app.get("/api/world_model/beliefs")
+        async def world_model_beliefs():
+            """Live snapshot of the BeliefResolver's hypotheses (audit D4).
+            `shadow` reports whether the resolver is merely observing or is
+            LIVE — publishing world.belief_changed events on the bus."""
+            orch = self._orchestrator
+            br = getattr(orch, "belief_resolver", None) if orch else None
+            if br is None:
+                return JSONResponse({"beliefs": [], "available": False})
+            return JSONResponse({
+                "beliefs": br.snapshot(),
+                "shadow": bool(getattr(br, "shadow", True)),
+                "available": True,
+            })
+
         @app.get("/api/world_model/cluster/known_pets")
         async def cluster_known_pets(species: str = "cat"):
             """List of resident pet display_names for `species`. Used by

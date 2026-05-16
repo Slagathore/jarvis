@@ -253,7 +253,7 @@ class BeliefResolver:
         hyp.evidence_breakdown = {"last": "sighting", "score": round(ev.score, 3)}
         await self._persist_evidence(ev)
         await self._persist_belief(hyp)
-        self._log_transition(hyp, prev_state, prev_room)
+        await self._on_transition(hyp, prev_state, prev_room)
 
     async def _ingest_absence(self, ev: EvidenceFrame, hyp: BeliefHypothesis) -> None:
         prev_state, prev_room = hyp.state, hyp.room
@@ -291,7 +291,7 @@ class BeliefResolver:
         hyp.evidence_breakdown = {"last": "absence"}
         await self._persist_evidence(ev)
         await self._persist_belief(hyp)
-        self._log_transition(hyp, prev_state, prev_room)
+        await self._on_transition(hyp, prev_state, prev_room)
 
     # ── Decay ────────────────────────────────────────────────────────────────
 
@@ -324,7 +324,7 @@ class BeliefResolver:
                             hyp.state = BeliefState.PRESENT_UNSEEN
                         hyp.recompute_state_confidence()
                         await self._persist_belief(hyp)
-                        self._log_transition(hyp, prev_state, prev_room)
+                        await self._on_transition(hyp, prev_state, prev_room)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -397,17 +397,38 @@ class BeliefResolver:
             for h in self._hyp.values()
         ]
 
-    def _log_transition(
+    async def _on_transition(
         self, hyp: BeliefHypothesis, prev_state: str, prev_room: Optional[str],
     ) -> None:
-        if hyp.state != prev_state or hyp.room != prev_room:
-            logger.info(
-                f"[BeliefResolver]{' (shadow)' if self.shadow else ''} "
-                f"{hyp.entity_key}: {prev_state}@{prev_room} → "
-                f"{hyp.state}@{hyp.room} "
-                f"(loc={hyp.confidence_location:.2f} "
-                f"vis={hyp.confidence_visibility:.2f})"
-            )
+        """Handle a belief change: always log it; when LIVE (not shadow),
+        also publish a world.belief_changed event so consumers (dashboard,
+        and eventually presence) can react. In shadow mode nothing is
+        published — the resolver stays observe-only."""
+        if hyp.state == prev_state and hyp.room == prev_room:
+            return
+        logger.info(
+            f"[BeliefResolver]{' (shadow)' if self.shadow else ' (live)'} "
+            f"{hyp.entity_key}: {prev_state}@{prev_room} → "
+            f"{hyp.state}@{hyp.room} "
+            f"(loc={hyp.confidence_location:.2f} "
+            f"vis={hyp.confidence_visibility:.2f})"
+        )
+        if self.shadow:
+            return
+        try:
+            await self._bus.publish("world.belief_changed", {
+                "entity_key": hyp.entity_key,
+                "entity_type": hyp.entity_type,
+                "state": hyp.state,
+                "room": hyp.room,
+                "prev_state": prev_state,
+                "prev_room": prev_room,
+                "confidence_state": hyp.confidence_state,
+                "confidence_location": hyp.confidence_location,
+                "ts": _iso(hyp.last_evidence_ts),
+            })
+        except Exception as e:
+            logger.debug(f"[BeliefResolver] belief_changed publish failed: {e}")
 
 
 def _lift(current: float, gain: float) -> float:

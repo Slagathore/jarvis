@@ -624,11 +624,15 @@ world_model:
     # an append-only telemetry log; keep >= profile_days_back so behavioral
     # profiles still have their rolling window.
     event_retention_days: 30
-  # BeliefResolver (audit roadmap D4). shadow: true means it tracks belief
-  # hypotheses and persists them to the belief_* tables but drives nothing
-  # live — leave it true until D4b flips the projection over.
+  # BeliefResolver (audit roadmap D4).
+  #   shadow: true  — observe-only: tracks hypotheses, persists to the
+  #                   belief_* tables, drives nothing.
+  #   shadow: false — LIVE (D4b): additionally publishes world.belief_changed
+  #                   events on the bus and the /api/world_model/beliefs
+  #                   endpoint reports it. This is the revert switch — flip
+  #                   back to true if the belief layer misbehaves.
   belief_resolver:
-    shadow: true
+    shadow: false
 
 residents:
   - id: cole
