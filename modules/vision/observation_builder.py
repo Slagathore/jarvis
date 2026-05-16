@@ -47,6 +47,7 @@ from loguru import logger
 from modules.vision.hand_detector import (
     bbox_overlaps_or_within as _bbox_overlaps_or_within,
 )
+from modules.vision.ignore_zones import filter_detections
 from modules.world_model.types import Observation
 
 
@@ -311,8 +312,11 @@ class ObservationBuilder:
     ) -> list[Observation]:
         observations: list[Observation] = []
 
-        # 1. Object detection (YOLO).
+        # 1. Object detection (YOLO). Detections inside a configured
+        # ignore zone for this room (a framed painting, a TV) are dropped
+        # before they can become entities.
         raw_dets = await self.detector.detect_async(frame)
+        raw_dets = filter_detections(raw_dets, room)
         detections = [
             d for d in (Detection.from_dict(raw) for raw in raw_dets)
             if d.confidence >= self._entity_min_confidence.get(

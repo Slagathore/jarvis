@@ -1831,6 +1831,7 @@ class DashboardServer:
                     "frame_height": int(cam.get("frame_height", 480)),
                     "exits": list(cam.get("exits", [])),
                     "landmarks": list(cam.get("landmarks", [])),
+                    "ignore_zones": list(cam.get("ignore_zones", [])),
                 })
             # Fall back to config.yaml read when the world model isn't
             # initialized yet (boot timing).
@@ -1846,6 +1847,7 @@ class DashboardServer:
                     "frame_height": int(wm.get("frame_height", 480)),
                     "exits": list(wm.get("exits", [])),
                     "landmarks": list(wm.get("landmarks", [])),
+                    "ignore_zones": list(wm.get("ignore_zones", [])),
                 })
             raise HTTPException(status_code=404, detail=f"No room '{room}' in config")
 
@@ -1899,12 +1901,17 @@ class DashboardServer:
                 return out
             exits = _validate(exits_raw)
             landmarks = _validate(landmarks_raw)
+            # Ignore zones — same {polygon: [[x,y],...]} shape as exits/
+            # landmarks, validated the same way. Masks static false
+            # positives (a framed painting) from the detector.
+            ignore_zones = _validate(body.get("ignore_zones") or [])
             overrides = _load_polygon_overrides()
             overrides[room] = {
                 "frame_width": fw,
                 "frame_height": fh,
                 "exits": exits,
                 "landmarks": landmarks,
+                "ignore_zones": ignore_zones,
             }
             save_polygon_overrides(overrides)
             # Live-reload so the world model picks up the edits without
@@ -1920,10 +1927,12 @@ class DashboardServer:
                 "room": room,
                 "exits": len(exits),
                 "landmarks": len(landmarks),
+                "ignore_zones": len(ignore_zones),
             })
             return JSONResponse({
                 "ok": True, "room": room,
                 "exits": len(exits), "landmarks": len(landmarks),
+                "ignore_zones": len(ignore_zones),
             })
 
         @app.get("/polygons", response_class=HTMLResponse)

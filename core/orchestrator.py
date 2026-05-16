@@ -117,6 +117,7 @@ from modules.reminders import ReminderScheduler, RemindersStore, parse_reminder
 from modules.vision.anomaly_detector import AnomalyDetector
 from modules.vision.camera_manager import CameraManager
 from modules.vision.face_recognizer import FaceRecognizer
+from modules.vision.ignore_zones import filter_detections
 from modules.vision.light_detector import LightDetector
 from modules.vision.mess_detector import MessDetector
 from modules.vision.object_detector import ObjectDetector
@@ -2192,6 +2193,10 @@ class Orchestrator(ToolsMixin):
                         if not self.object_detector:
                             continue
                         detections = await self.object_detector.detect_async(frame)
+                        # Drop detections inside a configured ignore zone
+                        # (a framed painting, a TV, etc). See
+                        # modules/vision/ignore_zones.py + the polygon editor.
+                        detections = filter_detections(detections, room_id)
                         object_summary = self.object_detector.summarize(detections)
                         person_present = self.object_detector.has_person(detections)
 

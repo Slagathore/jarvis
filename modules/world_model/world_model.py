@@ -265,6 +265,12 @@ class WorldModel:
                 "landmarks": override.get(
                     "landmarks", wm.get("landmarks", [])
                 ),
+                # Per-camera ignore zones — polygons over static false
+                # positives (a framed painting, a TV). Consumed by
+                # modules/vision/ignore_zones.py at detection time.
+                "ignore_zones": override.get(
+                    "ignore_zones", wm.get("ignore_zones", [])
+                ),
             }
         return topology
 
