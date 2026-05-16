@@ -615,6 +615,12 @@ persona_revert:
 world_model:
   tracked_species: [cat, dog]
   visiting_animal_retention_minutes: 60
+  # D3 unified perception. true → _vision_loop consumes the perception
+  # ObservationBuilder already published (one source of truth) instead of
+  # re-running its own YOLO/face/posture. false → the verbatim legacy
+  # _vision_loop path — that is the instant revert if the unified path
+  # misbehaves.
+  unified_perception: true
   # Nightly behavioral profile rebuild (§22.6). Once per interval_hours.
   nightly:
     interval_hours: 24

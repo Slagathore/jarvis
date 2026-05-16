@@ -366,6 +366,15 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # are room ids; each value is a dict of the most recent
         # observations (lights, person, posture, last description, ts).
         self._scene_state: dict[str, dict] = {}
+        # D3 unified perception. When enabled, _vision_loop stops re-running
+        # its own YOLO/face/posture and consumes the latest vision.observation
+        # ObservationBuilder already published — one perception source. The
+        # cache is the most recent batch per room; the flag selects the
+        # _vision_loop path (false → the verbatim legacy path).
+        self._latest_observation: dict[str, dict] = {}
+        self._unified_perception: bool = bool(
+            (config.get("world_model", {}) or {}).get("unified_perception", True)
+        )
         # Wake-event coalescer: when multiple mics hear the same wake word
         # at nearly the same time (Cole says "Hey Jarvis" between the
         # bedroom and kitchen cams), each MicWakeRunner fires its own
@@ -421,6 +430,18 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         self.bus.subscribe("node.status", self._on_node_status)
         self.bus.subscribe("audio.level", self._on_audio_level)
         self.bus.subscribe("reminder.due", self._on_reminder_due)
+        # D3: cache the latest perception batch per room so _vision_loop's
+        # unified path can consume it instead of re-detecting.
+        self.bus.subscribe("vision.observation", self._on_vision_observation)
+
+    async def _on_vision_observation(self, payload: dict) -> None:
+        """Cache the most recent vision.observation batch per room (D3).
+        ObservationBuilder is the single perception source; _vision_loop's
+        unified path reads this cache rather than running its own
+        detectors."""
+        room = payload.get("room")
+        if room:
+            self._latest_observation[room] = payload
 
     async def _shutdown(self) -> None:
         """Release long-lived resources cleanly during shutdown."""

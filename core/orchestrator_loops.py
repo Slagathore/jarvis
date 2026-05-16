@@ -294,6 +294,12 @@ class LoopsMixin(OrchestratorMixin):
 
                 for room_id in self.cameras.get_available_rooms():
                     try:
+                        # D3: unified path consumes ObservationBuilder's
+                        # perception; the verbatim legacy body below runs
+                        # only when world_model.unified_perception is false.
+                        if self._unified_perception:
+                            await self._vision_room_unified(room_id)
+                            continue
                         frame = await self.cameras.capture_frame_async(room_id)
                         if frame is None:
                             continue
@@ -602,6 +608,187 @@ class LoopsMixin(OrchestratorMixin):
                 logger.error(f"[Vision] Loop error: {e}")
 
             await asyncio.sleep(interval_seconds)
+
+    async def _vision_room_unified(self, room_id: str) -> None:
+        """D3 unified-perception vision pass.
+
+        Instead of independently re-running YOLO / face / posture, this
+        consumes the latest vision.observation ObservationBuilder already
+        published (cached by Orchestrator._on_vision_observation), then
+        feeds the SAME downstream consumers as the legacy path — pet
+        broadcast, presence/active-room, persona, scene narration,
+        dashboard broadcast, state-fusion, sleep tracking. One perception
+        source; no parallel truth-maker.
+
+        Selected by config.world_model.unified_perception. The verbatim
+        legacy path in _vision_loop runs when that flag is false — that is
+        the instant revert.
+        """
+        obs_payload = self._latest_observation.get(room_id)
+        if not obs_payload:
+            return  # ObservationBuilder has not reported this room yet
+        observations = obs_payload.get("observations") or []
+
+        # A frame is still needed for light detection (unique to this
+        # loop), the scene pipeline and drift-verify — but NOT for
+        # detection; that already happened in ObservationBuilder.
+        frame = None
+        if self.cameras is not None:
+            frame = await self.cameras.capture_frame_async(room_id)
+
+        lights_on: Optional[bool] = None
+        if self.light_detector is not None and frame is not None:
+            lights_on = await self.light_detector.analyze_async(
+                frame, room=room_id)
+
+        # ── Derive perception from the shared observation batch ──────────
+        persons = [o for o in observations
+                   if getattr(o, "obj_class", None) == "person"]
+        pets = [o for o in observations
+                if getattr(o, "obj_class", None) in ("cat", "dog")]
+        person_present = bool(persons)
+        recognized_name: Optional[str] = None
+        recognized_pid: Optional[int] = None
+        posture_label: Optional[str] = None
+        for o in persons:
+            pid = getattr(o, "person_id", None)
+            if pid is not None and recognized_pid is None:
+                recognized_pid = pid
+                recognized_name = getattr(o, "person_name", None)
+            md = getattr(o, "metadata", {}) or {}
+            if posture_label is None and md.get("posture"):
+                posture_label = md.get("posture")
+
+        # detection-shaped list for the scene LLM's object grounding
+        detections = [
+            {"class": getattr(o, "obj_class", "?"),
+             "box": list(getattr(o, "bbox", ()) or ()),
+             "confidence": float(getattr(o, "confidence", 0.0))}
+            for o in observations
+        ]
+        object_summary = (
+            self.object_detector.summarize(detections)
+            if self.object_detector is not None else ""
+        )
+
+        # ── Pet-seen broadcast (deduped — same as legacy) ────────────────
+        pet_classes_now = sorted({getattr(o, "obj_class", "") for o in pets})
+        if pet_classes_now != self._last_pets_per_room.get(room_id, []):
+            self._last_pets_per_room[room_id] = pet_classes_now
+            if pet_classes_now:
+                await self._broadcast({
+                    "type": "pet_seen", "room": room_id,
+                    "pets": pet_classes_now,
+                })
+                logger.info(f"[Vision] '{room_id}' pets: "
+                            f"{', '.join(pet_classes_now)}")
+
+        # ── Presence / active-room ───────────────────────────────────────
+        if recognized_name is not None:
+            await self._broadcast({
+                "type": "person_recognized", "room": room_id,
+                "name": recognized_name, "ambiguous": False,
+            })
+            if room_id != self._active_user_room:
+                logger.info(f"[Presence] active room: "
+                            f"{self._active_user_room} → {room_id} "
+                            f"(face: {recognized_name})")
+                self._set_active_user_room(room_id)
+
+        # ── Persona hooks ────────────────────────────────────────────────
+        if self.persona is not None:
+            self.persona.notify_room_occupancy(
+                room=room_id,
+                person_count=1 if person_present else 0,
+                cole_present=(recognized_name == "Cole"),
+            )
+            if person_present:
+                try:
+                    await self.persona.notify_face_identified(
+                        room=room_id, identity=recognized_name)
+                except Exception as e:
+                    logger.debug(f"[Persona] face notify failed: {e}")
+
+        # ── Drift verify (passive face/voice sample refresh) ─────────────
+        if self.identity is not None and frame is not None:
+            for pid_to_verify, modality in list(
+                    self.identity._verify_pending.items()):
+                if modality != "face":
+                    continue
+                if room_id != self._active_user_room or not person_present:
+                    continue
+                try:
+                    outcome = await self.identity.verify_face(
+                        pid_to_verify, frame)
+                    self.identity._verify_pending.pop(pid_to_verify, None)
+                    if outcome in ("pending_drift", "pending_conflict"):
+                        await self._broadcast({
+                            "type": "identity_pending_added",
+                            "modality": "face", "outcome": outcome,
+                        })
+                except Exception as e:
+                    logger.debug(f"[Identity/drift] verify_face failed: {e}")
+        if (recognized_pid is not None and self.identity is not None
+                and self._last_wake_audio is not None
+                and self.identity._verify_pending.get(recognized_pid) == "voice"):
+            try:
+                outcome = await self.identity.verify_voice(
+                    recognized_pid, self._last_wake_audio)
+                self.identity._verify_pending.pop(recognized_pid, None)
+                self._last_wake_audio = None
+                if outcome in ("pending_drift", "pending_conflict"):
+                    await self._broadcast({
+                        "type": "identity_pending_added",
+                        "modality": "voice", "outcome": outcome,
+                    })
+            except Exception as e:
+                logger.debug(f"[Identity/drift] verify_voice failed: {e}")
+
+        # ── Scene pipeline (cached desc; bg LLM) ─────────────────────────
+        scene_persons = [recognized_name] if recognized_name else None
+        scene_person_states: Optional[list[dict[str, Any]]] = None
+        if person_present and posture_label:
+            ps: dict[str, Any] = {"posture": posture_label}
+            if recognized_name:
+                ps["name"] = recognized_name
+            scene_person_states = [ps]
+        prior_state = self._scene_state.get(room_id) or {}
+        last_desc = prior_state.get("description")
+        if self.scene_analyzer is not None and frame is not None:
+            self._spawn_scene_task(
+                room_id,
+                self._run_scene_pipeline_bg(
+                    room_id=room_id, frame=frame, detections=detections,
+                    scene_persons=scene_persons,
+                    scene_person_states=scene_person_states,
+                ),
+            )
+
+        # ── Dashboard broadcast + scene cache ────────────────────────────
+        await self._broadcast({
+            "type": "vision", "room": room_id, "lights_on": lights_on,
+            "person_present": person_present, "person_name": recognized_name,
+            "objects": object_summary, "description": last_desc,
+        })
+        self._scene_state[room_id] = {
+            "lights_on": lights_on, "person_present": person_present,
+            "person_name": recognized_name, "person_id": recognized_pid,
+            "posture": posture_label, "objects": object_summary,
+            "description": last_desc,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # ── State fusion + sleep tracking ────────────────────────────────
+        if self.state_fusion is not None:
+            self.state_fusion.inject_vision(room_id, {
+                "lights_on": lights_on, "person_present": person_present,
+                "posture": posture_label,
+            })
+        if self.sleep_tracker is not None and person_present:
+            self.sleep_tracker.update(
+                room=room_id, posture=posture_label, lights_on=lights_on,
+                person_id=recognized_pid, person_name=recognized_name,
+            )
 
     async def _curiosity_loop(self) -> None:
         """
