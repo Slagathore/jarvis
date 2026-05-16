@@ -131,6 +131,7 @@ from modules.world_model import (
     WorldStore,
     bootstrap_pets_from_config,
 )
+from modules.world_model.belief import BeliefResolver
 from modules.vision.scene_analyzer import SceneAnalyzer
 from modules.vision.wyze_cam_control import WyzeCamControl
 from core.room_settings import RoomSettings
@@ -288,6 +289,10 @@ class Orchestrator:
         self.world_model: Optional[WorldModel] = None
         self.observation_builder: Optional[ObservationBuilder] = None
         self.interaction_monitor: Optional[InteractionMonitor] = None
+        # Belief-state tracker (audit roadmap D4). Runs in shadow mode —
+        # ingests vision.observation, maintains hypotheses, persists to the
+        # belief_* tables, affects nothing live. None when world model is off.
+        self.belief_resolver: Optional[BeliefResolver] = None
         self.alarm_dispatcher: Optional[Any] = None
         # LLM-facing query layer — built alongside WorldModel. The four
         # tools (get_entity_status, list_entities_in_room, who_is_home,
@@ -5165,6 +5170,11 @@ class Orchestrator:
                 await self.alarm_dispatcher.stop()
             except Exception as e:
                 logger.debug(f"[Shutdown] alarm_dispatcher stop failed: {e}")
+        if self.belief_resolver is not None:
+            try:
+                await self.belief_resolver.stop()
+            except Exception as e:
+                logger.debug(f"[Shutdown] belief_resolver stop failed: {e}")
         if self.interaction_monitor is not None:
             try:
                 await self.interaction_monitor.stop()
@@ -5542,6 +5552,24 @@ class Orchestrator:
                     ).get("interactions", {}),
                 )
                 await self.interaction_monitor.start()
+                # BeliefResolver (audit roadmap D4a) — subscribes to
+                # vision.observation and tracks belief hypotheses in
+                # shadow mode. Wrapped in its own try so a belief-layer
+                # failure never takes down perception.
+                try:
+                    belief_cfg = (
+                        self.config.get("world_model", {}) or {}
+                    ).get("belief_resolver", {}) or {}
+                    self.belief_resolver = BeliefResolver(
+                        bus=self.bus, db=self.db, config=belief_cfg,
+                    )
+                    await self.belief_resolver.start()
+                except Exception as e:
+                    logger.warning(
+                        f"[Init] BeliefResolver init failed (continuing "
+                        f"without): {e}"
+                    )
+                    self.belief_resolver = None
                 # §29 alarm subsystem — KlaxonLibrary loads per-alarm
                 # audio assets, AlarmAudio fans out via the existing
                 # speaker manager, AlarmStore persists fires/state.

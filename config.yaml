@@ -613,6 +613,15 @@ world_model:
     interval_hours: 24
     startup_grace_seconds: 60
     profile_days_back: 30
+    # DB retention for the nightly maintenance pass. world_entity_events is
+    # an append-only telemetry log; keep >= profile_days_back so behavioral
+    # profiles still have their rolling window.
+    event_retention_days: 30
+  # BeliefResolver (audit roadmap D4). shadow: true means it tracks belief
+  # hypotheses and persists them to the belief_* tables but drives nothing
+  # live — leave it true until D4b flips the projection over.
+  belief_resolver:
+    shadow: true
 
 residents:
   - id: cole
