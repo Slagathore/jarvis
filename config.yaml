@@ -29,6 +29,13 @@ ollama:
   action_model: gemini-3-flash-preview:cloud
   base_url: http://localhost:11434
   timeout_seconds: 30
+  # Models routed through Ollama's OpenAI-compatible /v1 endpoint instead of
+  # the native API. Workaround for ollama/ollama#14567 — the native API drops
+  # Gemini-3's thought_signature on tool-call round-trips, which 400s every
+  # multi-turn tool call. The /v1 surface round-trips it intact. Remove a
+  # model from this list once Ollama patches the native path (PR #14676).
+  openai_compat_models:
+    - gemini-3-flash-preview:cloud
   system_prompt: "You are Jarvis, an ambient home AI assistant.\nYou live in the house\
     \ and pay attention to what's going on around you.\nYou are observant, helpful,\
     \ and have a dry wit. You know when to stay quiet.\nYou speak like a smart friend,\
