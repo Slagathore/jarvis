@@ -236,7 +236,10 @@ class LoopsMixin(OrchestratorMixin):
                     logger.debug(f"[Context] Signals this cycle: {signal_summary}")
 
                     # BUG FIX: StateFusion.fuse() is async def — must be awaited
-                    prev_activity = self._current_state.activity
+                    prev_activity = (
+                        self._current_state.activity
+                        if self._current_state is not None else None
+                    )
                     new_state = await self.state_fusion.fuse(signals, room="office")
                     self._current_state = new_state
 
@@ -1748,6 +1751,11 @@ class LoopsMixin(OrchestratorMixin):
         try:
             if room is None:
                 room = self._active_user_room
+            # _active_user_room always carries a real room id ("office" by
+            # default); the `or` is a type-narrowing belt so `room` is a
+            # definite str for the rest of _speak (speaker routing, the
+            # echo-suppression dict keys, the follow-up listener).
+            room = room or "office"
 
             # Sleep deference: if anyone is napping/sleeping in the
             # target room, suppress proactive speech. Direct
