@@ -82,6 +82,13 @@ voice:
       southern_female: C:/Users/Cole/CodeStuff/Misc/piper/voices/southern_english_female/low/en_GB-southern_english_female-low.onnx
     speed: 1.0
     sample_rate: 22050
+    # Kokoro neural TTS — a second backend (Apache-2.0, 24 kHz, more
+    # expressive than Piper). Its voices surface in the menu as
+    # "KOK <id>"; selecting one routes synthesis through KokoroTTS.
+    # Needs: pip install kokoro
+    kokoro:
+      voice: af_nicole
+      speed: 1.0
   wake_word:
     model: hey_jarvis
     sensitivity: 0.5
@@ -99,6 +106,29 @@ voice:
     max_duration_seconds: 60
     adaptive_noise_floor: true
     follow_up_listen_seconds: 6
+  # ── Voice cascade (Option D) ──────────────────────────────────────────
+  # Staged pipeline: VAD -> wake-word -> sound-event -> STT -> triage LLM.
+  # Every component is built and unit-tested; wiring it into the live wake
+  # path is gated on cascade.enabled (default false — flip to test live).
+  vad:
+    backend: auto              # auto | silero | webrtc
+    threshold: 0.5             # silero speech-probability cutoff
+    webrtc_aggressiveness: 2   # 0-3, webrtc backend only
+    hangover_ms: 320           # keep the gate open this long past speech
+    min_speech_ms: 96          # speech must persist this long to open
+  sound_events:
+    enabled: true
+    threshold: 0.30            # min YAMNet class score to count as a hit
+    top_k: 5
+  triage:
+    enabled: true
+    model: qwen3:0.6b          # keep resident in Ollama (pull it first)
+    timeout_s: 6.0
+  cascade:
+    enabled: false             # MASTER SWITCH — flip true to run the cascade
+    preroll_ms: 800            # audio retained before VAD opens
+    max_segment_s: 20
+    min_segment_ms: 250
 mqtt:
   broker: localhost
   port: 1883
