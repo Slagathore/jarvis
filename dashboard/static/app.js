@@ -3843,6 +3843,11 @@ async function openLivePetTagModal(room) {
     drawArmed = on;
     if (drawBtn) drawBtn.classList.toggle("armed", on);
     overlaysSlot.style.cursor = on ? "crosshair" : "";
+    // #live-pet-overlays is pointer-events:none in CSS (so the image and
+    // the detection boxes handle clicks). While the draw tool is armed we
+    // flip the container to pointer-events:auto so it actually receives
+    // the pointerdown — otherwise the drag handler never fires.
+    overlaysSlot.style.pointerEvents = on ? "auto" : "";
     if (drawStatus) {
       drawStatus.textContent = on
         ? "drag a box over the pet, then release"
