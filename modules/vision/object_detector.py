@@ -186,7 +186,9 @@ class ObjectDetector:
                         }
                     )
 
-            logger.debug(
+            # TRACE (below DEBUG) — this fires once per frame on every
+            # camera. At DEBUG it produced 30k+ lines/day in the file log.
+            logger.trace(
                 f"[ObjectDetector] {len(detections)} objects: "
                 + ", ".join(d["class"] for d in detections[:5])
             )

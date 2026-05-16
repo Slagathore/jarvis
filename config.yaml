@@ -1,7 +1,15 @@
 system:
   name: Jarvis
   version: 1.0.0
-  log_level: DEBUG
+  # Console verbosity. DEBUG here floods the console; per-frame DEBUG from
+  # the vision modules is blacklisted from the console regardless (see
+  # main.py _CONSOLE_DEBUG_BLACKLIST).
+  log_level: INFO
+  # File-log verbosity, separate from the console. The rotating file log is
+  # what the dashboard Logs tab streams. Keep at INFO — DEBUG here produced
+  # 200+ MB/day log files (object_detector logs every frame). Bump to DEBUG
+  # only for a focused debugging session.
+  file_log_level: INFO
   data_dir: data/
   dashboard_enabled: true
   dashboard_port: 7070

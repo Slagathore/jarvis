@@ -34,7 +34,7 @@ import io
 import json
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import numpy as np
@@ -1086,6 +1086,34 @@ class IdentityManager:
             f"[Identity] {modality} cap-evict: dropped sample id={evict_id} "
             f"for person {person_id} (most redundant of {len(rows)})"
         )
+
+    async def prune_resolved_pending(self, *, retain_days: int = 14) -> int:
+        """Delete identity_pending rows that have already been reviewed
+        (resolved IN (1,2)) and are older than `retain_days`.
+
+        Each pending row carries an image_jpeg + audio_pcm16 BLOB; once
+        applied or rejected they only bloat the DB (3k+ rows at audit
+        time). Unresolved rows (resolved=0) are never touched — they're
+        the live review queue. Called by the nightly maintenance pass.
+
+        Returns the number of rows deleted.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=int(retain_days))
+        ).isoformat()
+        row = await self._db.fetchone(
+            "SELECT COUNT(*) AS n FROM identity_pending "
+            "WHERE resolved IN (1, 2) AND captured_at < ?",
+            (cutoff,),
+        )
+        n = int(row["n"]) if row else 0
+        if n:
+            await self._db.execute(
+                "DELETE FROM identity_pending "
+                "WHERE resolved IN (1, 2) AND captured_at < ?",
+                (cutoff,),
+            )
+        return n
 
     async def prune_bank_redundancy(
         self,

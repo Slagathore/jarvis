@@ -3918,6 +3918,29 @@ class Orchestrator:
                     logger.warning(
                         f"[WorldModel] snapshot prune failed: {e}"
                     )
+
+                # DB retention — the append-only / inbox tables that grow
+                # without bound (world_entity_events was 150k+ rows / the
+                # bulk of a 160 MB DB at audit time). Prune, then VACUUM
+                # once so the .db file actually shrinks (DELETE alone never
+                # returns pages to the OS).
+                try:
+                    deleted = 0
+                    if world.store is not None:
+                        deleted += await world.store.prune_world_events(
+                            retain_days=int(cfg.get("event_retention_days", 30))
+                        )
+                    if self.identity is not None:
+                        deleted += await self.identity.prune_resolved_pending()
+                    if self.notifications is not None:
+                        deleted += await self.notifications.prune_read()
+                    if deleted and self.db is not None:
+                        await self.db.vacuum()
+                    logger.info(
+                        f"[Maintenance] nightly DB prune removed {deleted} row(s)"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Maintenance] DB prune failed: {e}")
             except asyncio.CancelledError:
                 break
             except Exception:

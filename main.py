@@ -84,10 +84,16 @@ def _configure_event_loop_policy() -> None:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
-def _setup_logging(log_level: str) -> None:
+def _setup_logging(log_level: str, file_log_level: str = "INFO") -> None:
     """
     Configure Loguru with console + rotating file output.
     Removes the default handler and replaces with our own.
+
+    `log_level` drives the console sink; `file_log_level` drives the
+    rotating file sink independently. The file sink used to be unfiltered
+    at the console level — with log_level=DEBUG that produced 200+ MB/day
+    log files because object_detector logs every frame. Now the file sink
+    has its own level AND the per-frame DEBUG blacklist applied.
     """
     logger.remove()  # Remove default stderr handler
 
@@ -119,13 +125,15 @@ def _setup_logging(log_level: str) -> None:
         filter=_console_filter,
     )
 
-    # Rotating file log — unfiltered, so the dashboard logs tab and
-    # post-mortem debugging see every line.
+    # Rotating file log. Has its own level (file_log_level) and the same
+    # per-frame DEBUG blacklist as the console — without the filter, a
+    # DEBUG file level turns object_detector into a 200+ MB/day disk sink.
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger.add(
         str(LOG_DIR / "jarvis_{time:YYYY-MM-DD}.log"),
         format=log_format,
-        level=log_level,
+        level=file_log_level,
+        filter=_console_filter,
         rotation="00:00",   # New file each midnight
         retention="14 days",
         compression="zip",
@@ -287,7 +295,13 @@ async def main(args: argparse.Namespace) -> None:
         args.log_level
         or config.get("system", {}).get("log_level", "INFO")
     ).upper()
-    _setup_logging(log_level)
+    # File sink defaults to INFO independent of the console. A CLI
+    # --log-level override applies to both (debugging convenience).
+    file_log_level = (
+        args.log_level
+        or config.get("system", {}).get("file_log_level", "INFO")
+    ).upper()
+    _setup_logging(log_level, file_log_level)
 
     logger.info("=" * 60)
     logger.info(

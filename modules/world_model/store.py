@@ -401,6 +401,30 @@ class WorldStore:
         return [dict(r) for r in rows]
 
 
+    # ── Event-log retention ─────────────────────────────────────────────────
+
+    async def prune_world_events(self, *, retain_days: int = 30) -> int:
+        """Delete `world_entity_events` rows older than `retain_days`.
+
+        The table is an append-only telemetry log — the durable world
+        state lives in `world_entities`. Left unbounded it grows forever
+        (it was the dominant share of a 160 MB DB at audit time). The
+        nightly maintenance pass calls this, then VACUUMs.
+
+        Returns the number of rows deleted.
+        """
+        cutoff = (_utcnow() - timedelta(days=int(retain_days))).isoformat()
+        row = await self.db.fetchone(
+            "SELECT COUNT(*) AS n FROM world_entity_events WHERE ts < ?",
+            (cutoff,),
+        )
+        n = int(row["n"]) if row else 0
+        if n:
+            await self.db.execute(
+                "DELETE FROM world_entity_events WHERE ts < ?", (cutoff,)
+            )
+        return n
+
     # ── Snapshot disk retention ─────────────────────────────────────────────
 
     async def prune_snapshot_files(

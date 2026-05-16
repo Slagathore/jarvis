@@ -285,6 +285,11 @@ class DatabaseManager:
             await cursor.close()
             cursor = await conn.execute("PRAGMA foreign_keys=ON")
             await cursor.close()
+            # NORMAL is safe under WAL (a crash can lose the last txn but
+            # never corrupts the DB) and materially faster than the FULL
+            # default for our per-write commit pattern.
+            cursor = await conn.execute("PRAGMA synchronous=NORMAL")
+            await cursor.close()
 
             # Apply schema
             await conn.executescript(SCHEMA_SQL)
@@ -391,6 +396,21 @@ class DatabaseManager:
         finally:
             if cursor is not None:
                 await cursor.close()
+
+    async def vacuum(self) -> None:
+        """Compact the database file, returning freed pages to the OS.
+
+        DELETE statements never shrink the .db file on their own — only
+        VACUUM does. Run after a bulk prune (see the nightly maintenance
+        pass). Cannot run inside a transaction; we commit first.
+        """
+        conn = self._get_connection()
+        try:
+            await conn.commit()
+            await conn.execute("VACUUM")
+            logger.info("[DB] VACUUM complete")
+        except aiosqlite.Error as e:
+            raise DatabaseError(f"VACUUM failed: {e}") from e
 
     async def close(self) -> None:
         """Close the database connection gracefully."""

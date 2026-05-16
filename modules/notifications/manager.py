@@ -18,7 +18,7 @@ Classes: NotificationManager
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from loguru import logger
@@ -156,6 +156,33 @@ class NotificationManager:
             except Exception:
                 pass
         return True
+
+    async def prune_read(self, *, retain_days: int = 30) -> int:
+        """Delete read notifications older than `retain_days`.
+
+        The bell inbox is append-mostly; unread rows are always kept.
+        Called by the nightly maintenance pass. Returns rows deleted.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=int(retain_days))
+        ).isoformat()
+        try:
+            row = await self._db.fetchone(
+                "SELECT COUNT(*) AS n FROM notifications "
+                "WHERE read = 1 AND created_at < ?",
+                (cutoff,),
+            )
+            n = int(row["n"]) if row else 0
+            if n:
+                await self._db.execute(
+                    "DELETE FROM notifications "
+                    "WHERE read = 1 AND created_at < ?",
+                    (cutoff,),
+                )
+            return n
+        except Exception:
+            logger.exception("[Notifications] prune_read failed")
+            return 0
 
     async def dismiss_for_target(
         self, target_type: str, target_id: int,
