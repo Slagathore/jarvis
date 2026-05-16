@@ -75,3 +75,6 @@ Thumbs.db
 .claude/
 data/jarvis.pid
 data/polygon_overrides.json
+
+# Scratch / throwaway working dir (test DB copies, ad-hoc scratch files)
+tmp/
