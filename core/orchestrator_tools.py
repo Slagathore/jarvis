@@ -22,7 +22,7 @@ Classes: ToolsMixin
 import asyncio
 import base64
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 from loguru import logger
@@ -129,7 +129,9 @@ class ToolsMixin:
         world_query_tools: Optional[Any]
         _claude_client: Optional[Any]
         _CALENDAR_TOOLS: list[dict]
-        _broadcast: Callable[[dict], Any]
+
+        # method stub — real impl is Orchestrator._broadcast
+        async def _broadcast(self, event: dict) -> None: ...
 
     async def _tool_calendar_list_events(
         self,
