@@ -108,17 +108,17 @@ class OllamaLLM:
 
     @staticmethod
     def _needs_no_think_for_tools(model_name: str) -> bool:
-        """True for models that break tool-call round-trips when thinking is
-        enabled. Any Gemini routed through Ollama-cloud — Ollama-cloud strips
-        Gemini's thought_signature field on response deserialization, then
-        Gemini 400s the next request claiming the prior assistant tool_call
-        is missing its signature. There is no way to repair the offending
-        message after the fact, so think=False is forced from the very first
-        request. Matches all `gemini*:cloud` (not just gemini-3) so a future
-        Gemini revision can never reintroduce the 400.
+        """Legacy hook, kept only for the startup pre-population path.
+
+        NOTE: forcing think=False does NOT prevent the Gemini-via-Ollama-cloud
+        tool-call 400. A probe confirmed think=omitted / False / True all 400
+        identically on the round-trip — the `thought_signature` requirement is
+        on the functionCall part itself, independent of thinking mode. The 400
+        is an Ollama-cloud limitation (it strips the signature); the real fix
+        is routing Gemini through its direct API. See chat_with_tools.
         """
         n = (model_name or "").lower()
-        return n.startswith("gemini") and ":cloud" in n
+        return n.startswith("gemini-3") and ":cloud" in n
 
     @staticmethod
     def _is_cloud_model(model_name: str) -> bool:
@@ -382,14 +382,7 @@ class OllamaLLM:
                 # via one wasted round-trip, fine for a million-context
                 # session that's already paid for.
                 effective_think = think
-                # Force think=False for Gemini-cloud tool calls from the
-                # FIRST request — both the learned set and the static
-                # gemini*:cloud check. The static check is what catches a
-                # model selected at runtime (dashboard swap / action-model
-                # routing) that was never in the startup pre-population, so
-                # the thought_signature 400 simply never happens.
-                if (active_model in self._tools_force_no_think
-                        or self._needs_no_think_for_tools(active_model)):
+                if active_model in self._tools_force_no_think:
                     effective_think = False
                 if effective_think is not None:
                     chat_kwargs["think"] = effective_think
