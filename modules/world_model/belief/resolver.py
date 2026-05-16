@@ -244,7 +244,18 @@ class BeliefResolver:
         hyp.confidence_location = round(
             hyp.confidence_location * self._cfg["absence_location_decay"], 4
         )
-        if (hyp.confidence_visibility < self._cfg["present_unseen_threshold"]
+        if hyp.confidence_location < self._cfg["departed_threshold"]:
+            # Location confidence has decayed past the floor — absent long
+            # enough that we no longer believe it is even in the room.
+            # This check must live here, not only in _decay_loop: the decay
+            # loop skips entities with recent evidence, and a continuous
+            # stream of absence frames IS recent evidence — so without this
+            # an entity that left frame would decay toward zero confidence
+            # but stay PRESENT_UNSEEN forever. Going DEPARTED also stops the
+            # absence spam: the _on_observation absence loop only feeds
+            # hypotheses still in a PRESENT_* state.
+            hyp.state = BeliefState.DEPARTED
+        elif (hyp.confidence_visibility < self._cfg["present_unseen_threshold"]
                 and hyp.state == BeliefState.PRESENT_CONFIRMED):
             # Not detected, but location confidence is still high — believed
             # present, just not currently observable. (Door-disappearance /
