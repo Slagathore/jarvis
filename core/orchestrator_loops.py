@@ -659,9 +659,20 @@ class LoopsMixin(OrchestratorMixin):
             if posture_label is None and md.get("posture"):
                 posture_label = md.get("posture")
 
-        # detection-shaped list for the scene LLM's object grounding
+        # detection-shaped list for the scene LLM's object grounding.
+        # ObservationBuilder emits tracked/open-vocab objects with
+        # obj_class="object" and the real label in metadata.detected_class
+        # ("cell phone", "backpack"). Surface that label, not the generic
+        # "object", or the scene summary loses all object specificity.
+        def _disp_class(o: Any) -> str:
+            if getattr(o, "obj_class", None) == "object":
+                md = getattr(o, "metadata", {}) or {}
+                return (md.get("detected_class")
+                        or md.get("openvocab_query") or "object")
+            return str(getattr(o, "obj_class", "?"))
+
         detections = [
-            {"class": getattr(o, "obj_class", "?"),
+            {"class": _disp_class(o),
              "box": list(getattr(o, "bbox", ()) or ()),
              "confidence": float(getattr(o, "confidence", 0.0))}
             for o in observations

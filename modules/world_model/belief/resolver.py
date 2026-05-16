@@ -399,6 +399,10 @@ class BeliefResolver:
             logger.debug(f"[BeliefResolver] load skipped: {e}")
             return
         for r in rows:
+            # Restore last_*_ts too: the decay loop skips any hypothesis
+            # with last_evidence_ts is None, so a belief restored without
+            # its timestamps would never decay after a restart until fresh
+            # evidence happened to arrive.
             self._hyp[r["entity_key"]] = BeliefHypothesis(
                 hypothesis_id=r["hypothesis_id"], entity_key=r["entity_key"],
                 entity_type=r["entity_type"], state=r["state"],
@@ -407,6 +411,8 @@ class BeliefResolver:
                 confidence_location=r["confidence_location"],
                 confidence_visibility=r["confidence_visibility"],
                 confidence_state=r["confidence_state"],
+                last_confirmed_ts=_parse_dt(r["last_confirmed_ts"]),
+                last_evidence_ts=_parse_dt(r["last_evidence_ts"]),
             )
 
     # ── Introspection (dashboard / D4b hand-off) ─────────────────────────────
@@ -469,3 +475,15 @@ def _aware(ts: datetime) -> datetime:
 
 def _iso(ts: Optional[datetime]) -> Optional[str]:
     return _aware(ts).isoformat() if ts is not None else None
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    """Parse an ISO timestamp stored in SQLite back to an aware datetime.
+    Returns None for empty/garbage so callers stay None-safe."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
