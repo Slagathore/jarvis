@@ -107,6 +107,8 @@ class WorldStore:
             "CREATE INDEX IF NOT EXISTS idx_world_events_room_ts ON world_entity_events(room, ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_world_events_type_ts ON world_entity_events(event_type, ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_world_events_person_ts ON world_entity_events(person_id, ts DESC)",
+            # Plain ts index — supports prune_world_events' `WHERE ts < ?`.
+            "CREATE INDEX IF NOT EXISTS idx_world_events_ts ON world_entity_events(ts)",
             """CREATE TABLE IF NOT EXISTS world_entity_embeddings (
                 entity_id TEXT PRIMARY KEY REFERENCES world_entities(id),
                 embedding BLOB NOT NULL,

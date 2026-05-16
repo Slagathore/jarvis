@@ -323,6 +323,13 @@ class DatabaseManager:
             await conn.commit()
             self._conn = conn
 
+            # Forward-only schema migrations. Runs after the legacy schema
+            # (SCHEMA_SQL + ALTERs) so migration SQL can rely on the core
+            # tables existing. self._conn is set above so the migrator's
+            # executescript/fetchall calls resolve.
+            from modules.storage import SchemaMigrator
+            await SchemaMigrator(self).run()
+
             logger.info(f"[DB] Ready: {self._db_path}")
 
         except Exception as e:
@@ -396,6 +403,19 @@ class DatabaseManager:
         finally:
             if cursor is not None:
                 await cursor.close()
+
+    async def executescript(self, sql: str) -> None:
+        """Run a multi-statement SQL script (used by the schema migrator).
+
+        Raises:
+            DatabaseError: On SQL error.
+        """
+        conn = self._get_connection()
+        try:
+            await conn.executescript(sql)
+            await conn.commit()
+        except aiosqlite.Error as e:
+            raise DatabaseError(f"executescript failed: {e}") from e
 
     async def vacuum(self) -> None:
         """Compact the database file, returning freed pages to the OS.
