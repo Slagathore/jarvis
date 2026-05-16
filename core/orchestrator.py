@@ -106,7 +106,8 @@ from modules.context.state_fusion import StateFusion
 from modules.memory.database import DatabaseManager
 from modules.memory.event_log import EventLogger
 from modules.memory.memory_v2 import MemoryStore
-from modules.notifications import NotificationManager
+from modules.notifications import NotificationDispatcher, NotificationManager
+from modules.notifications.channels import build_channels_from_config
 from modules.memory.room_baselines import RoomBaselines
 from modules.agenda import GoogleCalendar
 from modules.network.mqtt_client import MQTTClient
@@ -191,6 +192,12 @@ class Orchestrator:
         # Set up after DB init; passed into IdentityManager so drift/cluster
         # events auto-fire user-visible notifications.
         self.notifications: Optional[NotificationManager] = None
+        # Phone/push fan-out for the §29 alarm subsystem (ntfy / Telegram /
+        # Home Assistant). Distinct from `self.notifications` (the dashboard
+        # bell). Built in _init_database; passed into every alarm so phone
+        # alerts actually go out — previously this was never constructed and
+        # alarms silently ran local-only.
+        self.notification_dispatcher: Optional[NotificationDispatcher] = None
         # Long-term semantic memory (facts, preferences, events, thoughts).
         # LLM-extracted from each turn + retrieved by semantic search and
         # injected into the prompt context. Initialized after the LLM is up.
@@ -394,6 +401,15 @@ class Orchestrator:
         await self.db.init()
         self.event_log = EventLogger(self.db)
         self.notifications = NotificationManager(db=self.db, broadcast=self._broadcast)
+        # Phone-alert dispatcher. An absent/empty `notifications:` config
+        # block yields zero channels and alarms run local-only — no boot
+        # failure. config.notifications.routing maps alarm_type → channels.
+        notif_cfg = self.config.get("notifications", {}) or {}
+        self.notification_dispatcher = NotificationDispatcher(
+            channels=build_channels_from_config(notif_cfg),
+            routing=notif_cfg.get("routing", {}) or {},
+            db_manager=self.db,
+        )
         # BUG FIX: RoomBaselines takes (db, config) — was only receiving db
         self.room_baselines = RoomBaselines(db=self.db, config=self.config)
         self.reminders_store = RemindersStore(self.db)
@@ -3303,20 +3319,39 @@ class Orchestrator:
                         ):
                             try:
                                 match = await self.identity.identify_face(frame)
+                                if match is not None and match.is_ambiguous:
+                                    # Ambiguous = candidates too close to call.
+                                    # Surface it for the dashboard but DO NOT
+                                    # commit identity: a wrong "Cole is here"
+                                    # poisons presence, persona activation, and
+                                    # (soon) the BeliefResolver.
+                                    logger.info(
+                                        f"[Identity/face] '{room_id}' ambiguous "
+                                        f"candidate {match.name} "
+                                        f"(sim={match.similarity:.2f}) — not committed"
+                                    )
+                                    await self._broadcast({
+                                        "type":       "person_recognized",
+                                        "room":       room_id,
+                                        "name":       None,
+                                        "candidate":  match.name,
+                                        "similarity": match.similarity,
+                                        "ambiguous":  True,
+                                    })
+                                    match = None
                                 if match is not None:
                                     recognized_name = match.name
                                     recognized_pid = match.person_id
-                                    ambig = " (ambiguous)" if match.is_ambiguous else ""
                                     logger.info(
                                         f"[Identity/face] '{room_id}' → {match.name} "
-                                        f"(sim={match.similarity:.2f}){ambig}"
+                                        f"(sim={match.similarity:.2f})"
                                     )
                                     await self._broadcast({
                                         "type":       "person_recognized",
                                         "room":       room_id,
                                         "name":       match.name,
                                         "similarity": match.similarity,
-                                        "ambiguous":  match.is_ambiguous,
+                                        "ambiguous":  False,
                                     })
                                     # Presence signal — Cole moved rooms.
                                     # Future proactive speech follows him here.
@@ -5132,6 +5167,12 @@ class Orchestrator:
             except Exception as e:
                 logger.debug(f"[Shutdown] WebhookManager close failed: {e}")
 
+        if self.notification_dispatcher is not None:
+            try:
+                await self.notification_dispatcher.close()
+            except Exception as e:
+                logger.debug(f"[Shutdown] notification dispatcher close failed: {e}")
+
         try:
             await self.integrations.stop_all()
         except Exception as e:
@@ -5315,6 +5356,9 @@ class Orchestrator:
                     clip_encoder=clip_encoder,
                     openvocab_detector=openvocab_detector,
                     tracked_objects_open_vocab=tracked_open_vocab,
+                    tracked_objects_closed_vocab=(
+                        tracked_objects_cfg.get("closed_vocabulary") or None
+                    ),
                     openvocab_interval_seconds=openvocab_interval,
                     entity_min_confidence=(
                         (self.config.get("vision", {}) or {}).get(

@@ -198,6 +198,18 @@ class NotificationDispatcher:
             "ON notification_deliveries(alert_ts DESC)"
         )
 
+    async def close(self) -> None:
+        """Release every channel's shared httpx client. Idempotent —
+        safe to call once at orchestrator shutdown."""
+        for name, channel in self._channels_by_name.items():
+            aclose = getattr(channel, "aclose", None)
+            if aclose is None:
+                continue
+            try:
+                await aclose()
+            except Exception as e:
+                logger.debug(f"[Notifier] '{name}' aclose failed: {e}")
+
     async def recent_deliveries(self, limit: int = 50) -> list[dict]:
         """Fetch the last `limit` delivery rows for the dashboard panel."""
         if self._db is None:

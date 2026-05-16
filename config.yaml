@@ -773,3 +773,30 @@ tracked_objects:
   detection_interval_seconds:
     open_vocabulary: 30
     closed_vocabulary: 0
+
+# ── Notifications ────────────────────────────────────────────────────────────
+# Phone/push fan-out for the alarm subsystem (fire / cat_escape / door_open).
+# Every channel is disabled by default — flip `enabled: true` and fill in the
+# topic/token to go live. With all channels off, alarms still fire locally
+# (audio + dashboard) and delivery attempts are logged to the DB only.
+#
+# Secrets (Telegram/HA tokens) come from environment variables, never here.
+notifications:
+  ntfy:
+    enabled: false
+    server: "https://ntfy.sh"      # or your self-hosted http://localhost:8080
+    topic: ""                       # set a long, unguessable topic name
+  telegram:
+    enabled: false
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    alert_chat_id_env: TELEGRAM_ALERT_CHAT_ID
+  home_assistant:
+    enabled: false
+    base_url: "http://homeassistant.local:8123"
+    service: mobile_app_cole_phone
+    token_env: HOME_ASSISTANT_TOKEN
+  # alarm_type → [channel names]. Omit a type to fan it to every channel.
+  routing:
+    fire:       [ntfy]
+    cat_escape: [ntfy]
+    door_open:  [ntfy]

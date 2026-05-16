@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Optional
 
+import numpy as np
 from loguru import logger
 
 
@@ -294,15 +295,15 @@ class AlarmAudio:
             return None
 
     async def _render_tts(self, text: str) -> tuple[bytes, int]:
-        """Render TTS to PCM. Tolerant of differing TTS APIs — tries
-        synthesize_async, then synthesize, then falls back to empty
-        bytes (which the caller logs as 'no audio')."""
+        """Render TTS to PCM. Tolerant of differing TTS APIs.
+
+        PiperTTS.synthesize[_async]() returns a float32 np.ndarray in
+        [-1, 1] — NOT a (bytes, rate) tuple. Earlier code only handled
+        the tuple shape, so every spoken alarm announcement silently
+        rendered to empty audio. Both shapes are handled now; other TTS
+        backends that return (bytes, rate) keep working unchanged."""
         if self._tts is None:
             return b"", 16000
-        # PiperTTS.synthesize_async returns (pcm_int16, sample_rate).
-        # If your TTS speaks directly through the local PC speaker
-        # (speak_async), we still want PCM bytes for SpeakerManager —
-        # so synthesize_async is the contract.
         for method_name in ("synthesize_async", "synthesize"):
             meth = getattr(self._tts, method_name, None)
             if meth is None:
@@ -311,10 +312,18 @@ class AlarmAudio:
                 result = meth(text)
                 if asyncio.iscoroutine(result):
                     result = await result
+                # Backend A: (pcm_bytes, sample_rate)
                 if isinstance(result, tuple) and len(result) == 2:
                     pcm, rate = result
                     if isinstance(pcm, (bytes, bytearray)):
                         return bytes(pcm), int(rate)
+                # Backend B: PiperTTS — float32 ndarray in [-1, 1]
+                if isinstance(result, np.ndarray) and result.size:
+                    pcm_i16 = (
+                        np.clip(result, -1.0, 1.0) * 32767.0
+                    ).astype(np.int16)
+                    rate = int(getattr(self._tts, "_sample_rate", 22050))
+                    return pcm_i16.tobytes(), rate
             except Exception as e:
                 logger.debug(f"[AlarmAudio] TTS {method_name} failed: {e}")
         return b"", 16000
