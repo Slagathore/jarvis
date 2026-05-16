@@ -21,7 +21,7 @@ comtypes==1.4.5
 #    if its package is absent, so these are not hard requirements:
 #      silero-vad — better VAD backend (else webrtcvad / torch.hub are used)
 #      kokoro     — Kokoro neural TTS backend (else Piper is used)
-silero-vad==5.1.2
+silero-vad==6.2.1
 kokoro==0.9.4
 
 # ── LLM / Brain ────────────────────────────────────────────────────────────

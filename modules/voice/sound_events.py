@@ -9,10 +9,10 @@ Mission: SoundEventClassifier — Stage 2b of the voice cascade. When the
          ontology and reports any hit on a watched category.
 
          MODEL: Google's YAMNet via tensorflow_hub — a ~17 MB MobileNet
-         trained on AudioSet's 521 sound classes, ~10 ms inference.
-         Loaded CPU-only on purpose: it is tiny, CPU latency is already
-         negligible, and that keeps it from contending with the YOLO /
-         Whisper torch stack for VRAM.
+         trained on AudioSet's 521 sound classes. Device is config-driven
+         (sound_events.device): "cuda" runs it on the GPU, "cpu" forces
+         it off the GPU so it cannot contend with the YOLO/Whisper torch
+         stack for VRAM. YAMNet is tiny either way.
 
          Watched categories map a Jarvis-meaningful event name to a set
          of AudioSet display-name substrings. Config can override the
@@ -57,6 +57,7 @@ class SoundEventClassifier:
 
     Config keys (from config["voice"]["sound_events"], all optional):
         enabled:    bool — master switch (default True)
+        device:     "cuda" | "cpu" — GPU or CPU inference (default cuda)
         threshold:  float — min class score to count as a hit (0.30)
         watchlist:  dict — overrides _DEFAULT_WATCHLIST entirely if given
         top_k:      int — how many raw classes classify() returns (5)
@@ -65,6 +66,7 @@ class SoundEventClassifier:
     def __init__(self, config: Optional[dict] = None) -> None:
         cfg = config or {}
         self.enabled = bool(cfg.get("enabled", True))
+        self._device = str(cfg.get("device", "cuda")).lower()
         self._threshold = float(cfg.get("threshold", 0.30))
         self._top_k = int(cfg.get("top_k", 5))
         self._watchlist: dict[str, list[str]] = {
@@ -87,18 +89,22 @@ class SoundEventClassifier:
         try:
             import tensorflow as tf
             import tensorflow_hub as hub
-            # Keep YAMNet off the GPU — it is tiny and the GPU belongs to
-            # the YOLO / Whisper torch stack.
-            try:
-                tf.config.set_visible_devices([], "GPU")
-            except Exception:
-                pass
+            if self._device == "cpu":
+                # Force YAMNet off the GPU so it cannot contend with the
+                # YOLO / Whisper torch stack for VRAM.
+                try:
+                    tf.config.set_visible_devices([], "GPU")
+                except Exception:
+                    pass
+            gpus = tf.config.list_physical_devices("GPU")
             self._model = hub.load(_YAMNET_HANDLE)
             self._class_names = self._load_class_names()
             self.loaded = bool(self._class_names)
             if self.loaded:
+                on_gpu = bool(gpus) and self._device != "cpu"
                 logger.info(
-                    f"[SoundEvents] YAMNet ready "
+                    f"[SoundEvents] YAMNet ready on "
+                    f"{'GPU' if on_gpu else 'CPU'} "
                     f"({len(self._class_names)} classes, "
                     f"{len(self._watchlist)} watched categories)"
                 )

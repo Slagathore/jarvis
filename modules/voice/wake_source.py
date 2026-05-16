@@ -187,10 +187,29 @@ class WakeSourceManager:
     running immediately. `stop()` cancels all runners on shutdown.
     """
 
-    def __init__(self, config: dict, bus: EventBus) -> None:
+    def __init__(
+        self,
+        config: dict,
+        bus: EventBus,
+        *,
+        sound_classifier: Any = None,
+        stt: Any = None,
+        triage_gate: Any = None,
+    ) -> None:
         self._config = config
         self._bus = bus
-        self._runners: dict[str, MicWakeRunner] = {}
+        # Cascade wiring. When voice.cascade.enabled is true, register()
+        # builds a CascadeWakeRunner (streaming wake + VAD/event/triage
+        # cascade) instead of the wake-only MicWakeRunner. The cascade
+        # components are shared across rooms; each runner makes its own
+        # stateful VAD.
+        self._sound_classifier = sound_classifier
+        self._stt = stt
+        self._triage_gate = triage_gate
+        self._cascade_enabled = bool(
+            (config.get("voice", {}).get("cascade", {}) or {}).get("enabled", False)
+        )
+        self._runners: dict[str, Any] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._started: bool = False
 
@@ -203,7 +222,17 @@ class WakeSourceManager:
             old_task = self._tasks.pop(room, None)
             if old_task is not None and not old_task.done():
                 old_task.cancel()
-        runner = MicWakeRunner(self._config, self._bus, source)
+        if self._cascade_enabled:
+            # Lazy import — cascade_runner imports from this module.
+            from modules.voice.cascade_runner import CascadeWakeRunner
+            runner: Any = CascadeWakeRunner(
+                self._config, self._bus, source,
+                sound_classifier=self._sound_classifier,
+                stt=self._stt, triage_gate=self._triage_gate,
+            )
+            logger.info(f"[WakeSource] Cascade runner for room '{room}'")
+        else:
+            runner = MicWakeRunner(self._config, self._bus, source)
         self._runners[room] = runner
         if self._started:
             self._tasks[room] = asyncio.create_task(runner.run())

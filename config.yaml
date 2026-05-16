@@ -118,17 +118,19 @@ voice:
     min_speech_ms: 96          # speech must persist this long to open
   sound_events:
     enabled: true
+    device: cuda               # cuda | cpu — YAMNet inference device
     threshold: 0.30            # min YAMNet class score to count as a hit
     top_k: 5
   triage:
     enabled: true
-    model: qwen3:0.6b          # keep resident in Ollama (pull it first)
+    model: qwen3.5:0.8b        # small resident triage model
     timeout_s: 6.0
   cascade:
-    enabled: false             # MASTER SWITCH — flip true to run the cascade
+    enabled: true              # MASTER SWITCH — cascade live (Wyze rooms)
     preroll_ms: 800            # audio retained before VAD opens
     max_segment_s: 20
     min_segment_ms: 250
+    wake_suppress_s: 30        # mute cascade triage this long after a wake
 mqtt:
   broker: localhost
   port: 1883

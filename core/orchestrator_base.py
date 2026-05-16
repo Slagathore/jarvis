@@ -109,10 +109,12 @@ class OrchestratorMixin:
     selfedit: Any
     sessions: Any
     sleep_tracker: Any
+    sound_event_classifier: Any
     speaker_id: Any
     speaker_manager: Any
     state_fusion: Any
     stt: Any
+    triage_gate: Any
     tts: Any
     wake: Any
     wake_sources: Any

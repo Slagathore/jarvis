@@ -177,10 +177,34 @@ class InitMixin(OrchestratorMixin):
         await asyncio.to_thread(self.wake.load)
         logger.info("[Init] Wake word detector ready")
 
+        # Voice cascade components (Option D). Built only when
+        # voice.cascade.enabled is true, and shared across every per-room
+        # CascadeWakeRunner (each runner still makes its own stateful VAD).
+        voice_cfg = self.config.get("voice", {}) or {}
+        cascade_enabled = bool(
+            (voice_cfg.get("cascade", {}) or {}).get("enabled", False)
+        )
+        self.sound_event_classifier = None
+        self.triage_gate = None
+        if cascade_enabled:
+            from modules.brain.triage_gate import TriageGate
+            from modules.voice.sound_events import SoundEventClassifier
+            self.sound_event_classifier = SoundEventClassifier(
+                voice_cfg.get("sound_events", {}) or {}
+            )
+            await asyncio.to_thread(self.sound_event_classifier.load)
+            self.triage_gate = TriageGate(voice_cfg.get("triage", {}) or {})
+            logger.info("[Init] Voice cascade enabled — components ready")
+
         # Multi-room wake registry — empty today, populated below from
         # MicManager. Started when the run loop spins up so any sources
-        # registered between init and start are picked up.
-        self.wake_sources = WakeSourceManager(config=self.config, bus=self.bus)
+        # registered between init and start are picked up. When the
+        # cascade is enabled it builds CascadeWakeRunners with these.
+        self.wake_sources = WakeSourceManager(
+            config=self.config, bus=self.bus,
+            sound_classifier=self.sound_event_classifier,
+            stt=self.stt, triage_gate=self.triage_gate,
+        )
 
         # Per-room mic + speaker managers. Built unconditionally — null
         # drivers handle "this room has no audio" cleanly so the rest of

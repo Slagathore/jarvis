@@ -416,6 +416,36 @@ class ConversationMixin(OrchestratorMixin):
             )
         await self._on_wake_detected(winner)
 
+    async def _on_triage_escalate(self, event: dict) -> None:
+        """Voice cascade Stage 4 decided an un-waked utterance is actually
+        for Jarvis. The transcript already exists — feed it straight into
+        the normal text-utterance path (no chime, no re-record)."""
+        room = event.get("room", "office")
+        text = (event.get("text") or "").strip()
+        if not text:
+            return
+        logger.info(f"[Cascade] triage-escalated utterance in {room}: {text!r}")
+        try:
+            await self._process_user_text(text, room)
+        except Exception as e:
+            logger.warning(f"[Cascade] triage escalation handling failed: {e}")
+
+    async def _on_cascade_sound_event(self, event: dict) -> None:
+        """Voice cascade Stage 2b detected a watched non-speech sound
+        (alarm, glass, cry, siren). Log it and surface it on the
+        dashboard. Routing into the alarm/safety dispatcher is a
+        follow-up — for now this makes the detection visible."""
+        room = event.get("room", "?")
+        category = event.get("category", "?")
+        logger.info(f"[Cascade] sound event '{category}' in {room}")
+        try:
+            await self._broadcast({
+                "type": "sound_event", "room": room, "category": category,
+                "detail": event.get("detail", {}),
+            })
+        except Exception as e:
+            logger.debug(f"[Cascade] sound_event broadcast failed: {e}")
+
     async def _on_wake_detected(self, event: dict) -> None:
         """
         Full pipeline from wake word to spoken response.

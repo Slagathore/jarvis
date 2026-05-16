@@ -426,6 +426,9 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # window and forwards only the loudest to _on_wake_detected.
         self.bus.subscribe("voice.wake_detected", self._on_wake_event_raw)
         self.bus.subscribe("voice.wake_score", self._on_wake_score)
+        # Voice cascade (Option D) outcomes — published by CascadeWakeRunner.
+        self.bus.subscribe("voice.triage_escalate", self._on_triage_escalate)
+        self.bus.subscribe("voice.sound_event", self._on_cascade_sound_event)
         self.bus.subscribe("appliance.state_changed", self._on_appliance_changed)
         self.bus.subscribe("node.status", self._on_node_status)
         self.bus.subscribe("audio.level", self._on_audio_level)
@@ -565,6 +568,11 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
                 await self.llm.aclose()
             except Exception as e:
                 logger.debug(f"[Shutdown] LLM aclose failed: {e}")
+        if getattr(self, "triage_gate", None) is not None:
+            try:
+                await self.triage_gate.aclose()
+            except Exception as e:
+                logger.debug(f"[Shutdown] triage gate aclose failed: {e}")
         if self._claude_client is not None and hasattr(self._claude_client, "close"):
             try:
                 await self._claude_client.close()
