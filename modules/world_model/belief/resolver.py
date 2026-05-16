@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from loguru import logger
@@ -343,6 +343,33 @@ class BeliefResolver:
             )
         except Exception as e:
             logger.debug(f"[BeliefResolver] evidence persist failed: {e}")
+
+    async def prune_evidence(self, *, retain_days: int = 30) -> int:
+        """Delete `belief_evidence` rows older than `retain_days`.
+
+        `belief_evidence` is an append-only evidence log — the durable
+        belief state lives in `entity_beliefs`. It is the D4-era sibling
+        of `world_entity_events` and grows just as fast (~90k rows within
+        days of going live). The nightly maintenance pass calls this so
+        the table cannot grow without bound. Returns rows deleted.
+        """
+        if self._db is None:
+            return 0
+        cutoff = (_utcnow() - timedelta(days=int(retain_days))).isoformat()
+        try:
+            row = await self._db.fetchone(
+                "SELECT COUNT(*) AS n FROM belief_evidence WHERE ts < ?",
+                (cutoff,),
+            )
+            n = int(row["n"]) if row else 0
+            if n:
+                await self._db.execute(
+                    "DELETE FROM belief_evidence WHERE ts < ?", (cutoff,)
+                )
+            return n
+        except Exception as e:
+            logger.debug(f"[BeliefResolver] evidence prune failed: {e}")
+            return 0
 
     async def _persist_belief(self, hyp: BeliefHypothesis) -> None:
         try:

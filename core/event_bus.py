@@ -68,6 +68,11 @@ _DEFAULT_TOPIC_PRIORITIES: dict[str, int] = {
     "fire.": EventPriority.CRITICAL,
     "cat_escape.": EventPriority.CRITICAL,
     "voice.wake_detected": EventPriority.VOICE,
+    # The continuous wake-confidence meter (dashboard gauge), NOT a wake
+    # event. Published several times/sec per room — it must NOT inherit
+    # VOICE priority or it evicts real telemetry every sample. Longest-
+    # prefix match means this exact key beats the "voice." rule below.
+    "voice.wake_score": EventPriority.TELEMETRY,
     "voice.": EventPriority.VOICE,
     "reminder.due": EventPriority.CONTROL,
     "node.status": EventPriority.CONTROL,
@@ -91,6 +96,9 @@ _DEFAULT_TOPIC_PRIORITIES: dict[str, int] = {
 # of those events matters.
 _DEFAULT_TOPIC_COALESCE: dict[str, str] = {
     "vision.observation": "room",
+    # Wake-confidence meter: only the freshest score per room matters.
+    # Under queue pressure, a stale gauge reading is worthless.
+    "voice.wake_score": "room",
 }
 
 _DEFAULT_TOPIC_RATE_LIMITS: dict[str, tuple[float, int]] = {

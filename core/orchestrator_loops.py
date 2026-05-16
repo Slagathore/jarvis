@@ -1158,6 +1158,10 @@ class LoopsMixin(OrchestratorMixin):
                         deleted += await self.identity.prune_resolved_pending()
                     if self.notifications is not None:
                         deleted += await self.notifications.prune_read()
+                    if self.belief_resolver is not None:
+                        deleted += await self.belief_resolver.prune_evidence(
+                            retain_days=int(cfg.get("event_retention_days", 30))
+                        )
                     if deleted and self.db is not None:
                         await self.db.vacuum()
                     logger.info(
