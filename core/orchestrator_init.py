@@ -89,6 +89,7 @@ from modules.voice.sources.wake_adapter import MicSourceWakeAdapter
 from modules.voice.sources.wyze_ssh_speaker import WyzeSshSpeakerSink
 from modules.voice.stt import WhisperSTT
 from modules.voice.tts import PiperTTS
+from modules.voice.tts_router import TTSRouter
 from modules.voice.wake_word import WakeWordDetector
 from modules.voice.wake_source import WakeSourceManager
 
@@ -166,10 +167,14 @@ class InitMixin(OrchestratorMixin):
         await asyncio.to_thread(self.stt.load)
         logger.info("[Init] STT (Whisper) loaded")
 
-        self.tts = PiperTTS(self.config)
+        # TTSRouter fronts both backends — Piper (default) + Kokoro. It
+        # mirrors the PiperTTS surface, so every `self.tts.*` call site is
+        # unchanged; a "KOK <id>" voice selection routes to Kokoro. Kokoro
+        # loads lazily on first KOK-voice pick, so boot only pays Piper.
+        self.tts = TTSRouter(self.config)
         # BUG FIX: tts.load() was never called — piper binary + model path never located
         await asyncio.to_thread(self.tts.load)
-        logger.info("[Init] TTS (Piper) ready")
+        logger.info("[Init] TTS (Piper + Kokoro router) ready")
 
         # BUG FIX: WakeWordDetector takes (config, bus) — was passing wrong flat kwargs
         # and using "event_bus" instead of "bus" as the param name

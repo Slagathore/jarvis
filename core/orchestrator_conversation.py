@@ -1351,10 +1351,18 @@ class ConversationMixin(OrchestratorMixin):
             logger.error(f"[Chat] Pipeline error: {e}")
 
     async def _on_voice_change(self, voice_name: str) -> None:
-        """Switch TTS voice at runtime from the dashboard dev panel."""
+        """Switch TTS voice at runtime from the dashboard dev panel.
+
+        Uses the TTSRouter's async switch when available — a first-time
+        "KOK <id>" pick lazily loads the Kokoro backend (a one-time model
+        download) off the event loop. Plain PiperTTS has no async variant,
+        so it falls back to the synchronous switch."""
         if not self.tts:
             return
-        success = self.tts.set_voice(voice_name)
+        if hasattr(self.tts, "set_voice_async"):
+            success = await self.tts.set_voice_async(voice_name)
+        else:
+            success = self.tts.set_voice(voice_name)
         if success:
             text = await self._compose_in_character(
                 prompt=(

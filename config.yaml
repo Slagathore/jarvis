@@ -83,10 +83,13 @@ voice:
     speed: 1.0
     sample_rate: 22050
     # Kokoro neural TTS — a second backend (Apache-2.0, 24 kHz, more
-    # expressive than Piper). Its voices surface in the menu as
-    # "KOK <id>"; selecting one routes synthesis through KokoroTTS.
-    # Needs: pip install kokoro
+    # expressive than Piper). The TTSRouter offers Piper AND Kokoro voices
+    # in one menu; Kokoro's surface as "KOK <id>" and selecting one routes
+    # synthesis through KokoroTTS. Kokoro loads lazily on the first KOK
+    # pick (a one-time ~330 MB model download), so boot only pays Piper.
+    # Needs: pip install kokoro. Set enabled: false to hide KOK voices.
     kokoro:
+      enabled: true
       voice: af_nicole
       speed: 1.0
   wake_word:

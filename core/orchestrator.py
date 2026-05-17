@@ -40,7 +40,7 @@ Variables:
     Orchestrator.event_log  — EventLogger
     Orchestrator.wake       — WakeWordDetector
     Orchestrator.stt        — WhisperSTT
-    Orchestrator.tts        — PiperTTS
+    Orchestrator.tts        — TTSRouter (fronts Piper + Kokoro)
     Orchestrator.llm        — OllamaLLM
     Orchestrator.sessions   — SessionManager
     Orchestrator.prompts    — PromptBuilder
@@ -150,7 +150,7 @@ from modules.voice.sources.usb_mic import UsbMicSource
 from modules.voice.sources.wake_adapter import MicSourceWakeAdapter
 from modules.voice.sources.wyze_ssh_speaker import WyzeSshSpeakerSink
 from modules.voice.stt import WhisperSTT
-from modules.voice.tts import PiperTTS
+from modules.voice.tts_router import TTSRouter
 from modules.voice.wake_word import WakeWordDetector
 from modules.voice.wake_source import WakeSourceManager
 
@@ -220,7 +220,8 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # room-tagged 'voice.wake_detected' events on detection.
         self.wake_sources: Optional[WakeSourceManager] = None
         self.stt: Optional[WhisperSTT] = None
-        self.tts: Optional[PiperTTS] = None
+        # TTSRouter fronts Piper + Kokoro; mirrors the PiperTTS surface.
+        self.tts: Optional[TTSRouter] = None
         # Per-room mic/speaker dispatch. MicManager owns one driver per room
         # (USB / Wyze RTSP / ESP MQTT / null); SpeakerManager mirrors it on
         # the output side. The PC mic stays on `self.wake` (WakeWordDetector
