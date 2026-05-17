@@ -102,6 +102,12 @@ from modules.voice.wake_source import WakeSourceManager
 # follow-up listener is already open separately for that case).
 _ECHO_SUPPRESSION_TAIL_S: float = 1.5
 
+# How long an unanswered §23 object-vocab ask stays "pending" before the
+# ask loop gives up and allows a new one. Comfortably past the follow-up
+# listen window + STT/LLM round-trip, short enough that the feature
+# self-heals within a couple of poll cycles if Cole ignores a question.
+_OBJECT_VOCAB_ANSWER_TIMEOUT_S: float = 180.0
+
 
 from core.orchestrator_tools import ToolsMixin
 
@@ -1976,9 +1982,22 @@ class LoopsMixin(OrchestratorMixin):
         while True:
             await asyncio.sleep(poll_s)
             try:
-                # Already waiting on an answer — don't stack a second ask.
-                if self._pending_object_question is not None:
-                    continue
+                # Waiting on an answer to a previous ask? Don't stack a
+                # second one. But if it has gone unanswered well past the
+                # follow-up window (Cole ignored the question, or the
+                # capture caught nothing), clear it so the loop self-heals
+                # instead of wedging the feature permanently.
+                pending = self._pending_object_question
+                if pending is not None:
+                    import time as _time
+                    age = _time.monotonic() - pending.get("asked_ts", 0.0)
+                    if age < _OBJECT_VOCAB_ANSWER_TIMEOUT_S:
+                        continue
+                    logger.info(
+                        f"[ObjectVocab] previous ask unanswered ({age:.0f}s)"
+                        " — clearing so a new one can fire"
+                    )
+                    self._pending_object_question = None
                 question = learner.pending_question()
                 if not question:
                     continue
@@ -2009,8 +2028,12 @@ class LoopsMixin(OrchestratorMixin):
         count = int(question.get("count", 0))
         # mark_asked first so the loop won't re-pick this one if the speak
         # path is slow; _pending_object_question routes the reply back.
+        # asked_ts lets _object_vocab_loop time out an unanswered ask.
+        import time as _time
         learner.mark_asked(key)
-        self._pending_object_question = {"key": key, "room": room}
+        self._pending_object_question = {
+            "key": key, "room": room, "asked_ts": _time.monotonic(),
+        }
         logger.info(
             f"[ObjectVocab] asking about '{yolo_class}' in '{room}' "
             f"(seen {count}x)"
