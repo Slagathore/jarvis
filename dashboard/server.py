@@ -3123,7 +3123,11 @@ class DashboardServer:
             wm = getattr(orch, "world_model", None) if orch else None
             if wm is None:
                 return JSONResponse({"residents": [], "available": False})
-            residents: list[dict] = []
+            # The world model accumulates many historical person entities
+            # per resident (one per tracking session). Dedupe by person_id
+            # (fall back to name) and, within each resident, keep the
+            # entity that actually carries a pattern_profile.
+            by_person: dict[str, dict] = {}
             try:
                 for e in wm.entities.values():
                     if getattr(e, "entity_type", None) != "person":
@@ -3134,19 +3138,31 @@ class DashboardServer:
                         continue
                     meta = getattr(e, "metadata", {}) or {}
                     profile = meta.get("pattern_profile")
-                    residents.append({
-                        "id": str(getattr(e, "id", "")),
-                        "name": getattr(e, "display_name", "") or "?",
+                    name = getattr(e, "display_name", "") or "?"
+                    pid = getattr(e, "person_id", None)
+                    key = str(pid) if pid is not None else f"name:{name}"
+                    entry = {
+                        "id": key,
+                        "name": name,
                         "profile": profile if profile else None,
                         "profile_updated": meta.get(
                             "pattern_profile_updated_ts"
                         ),
-                    })
+                    }
+                    prev = by_person.get(key)
+                    # Keep the profile-bearing entity for this resident;
+                    # otherwise the first one seen.
+                    if prev is None or (
+                        entry["profile"] and not prev["profile"]
+                    ):
+                        by_person[key] = entry
             except Exception as exc:
                 logger.warning(
                     f"[/api/world_model/pattern_profile] {exc}"
                 )
-            residents.sort(key=lambda r: r["name"].lower())
+            residents = sorted(
+                by_person.values(), key=lambda r: r["name"].lower()
+            )
             scorer = getattr(orch, "anomaly_scorer", None) if orch else None
             return JSONResponse({
                 "residents": residents,

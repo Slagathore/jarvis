@@ -59,11 +59,12 @@ class StubEntity:
     """Mimics a WorldEntity for the pattern_profile endpoint."""
 
     def __init__(self, *, id, name, entity_type="person", is_resident=True,
-                 archived=False, profile=None) -> None:
+                 archived=False, profile=None, person_id=None) -> None:
         self.id = id
         self.display_name = name
         self.entity_type = entity_type
         self.is_resident = is_resident
+        self.person_id = person_id
         self.archived_at = "2026-01-01" if archived else None
         self.metadata = {}
         if profile is not None:
@@ -215,6 +216,35 @@ def test_pattern_profile_returns_residents_only() -> None:
     print("PASS: pattern_profile -> resident persons only (no pets/guests/archived)")
 
 
+def test_pattern_profile_dedupes_resident_entities() -> None:
+    # The world model accumulates many historical person entities per
+    # resident (one per tracking session); only one carries the rebuilt
+    # profile. The endpoint must collapse them by person_id to one entry
+    # each — and keep the profile-bearing one.
+    profile = {"n_events": 5000, "weekly_active_hours": {0: [9]}}
+    wm = StubWorldModel([
+        StubEntity(id="cole-s1", name="Cole", person_id=7, profile=None),
+        StubEntity(id="cole-s2", name="Cole", person_id=7, profile=profile),
+        StubEntity(id="cole-s3", name="Cole", person_id=7, profile=None),
+        StubEntity(id="anna-s1", name="Anna", person_id=9, profile=None),
+        StubEntity(id="anna-s2", name="Anna", person_id=9, profile=None),
+    ])
+    client = _client(scorer=StubAnomalyScorer([]), world_model=wm)
+    res = client.get("/api/world_model/pattern_profile")
+    body = res.json()
+    residents = body["residents"]
+    assert len(residents) == 2, (
+        f"expected 2 deduped residents, got {len(residents)}"
+    )
+    cole = next(r for r in residents if r["name"] == "Cole")
+    assert cole["profile"] and cole["profile"]["n_events"] == 5000, (
+        "dedup must keep the profile-bearing Cole entity"
+    )
+    anna = next(r for r in residents if r["name"] == "Anna")
+    assert anna["profile"] is None, anna
+    print("PASS: pattern_profile dedupes many entities per resident -> one each")
+
+
 def main() -> None:
     test_no_scorer_reports_unavailable()
     test_populated_queue_decodes_json_columns()
@@ -223,6 +253,7 @@ def main() -> None:
     test_invalidate_without_scorer_503()
     test_pattern_profile_no_world_model()
     test_pattern_profile_returns_residents_only()
+    test_pattern_profile_dedupes_resident_entities()
     print("\nAll §25 anomaly + routine dashboard tests passed.")
 
 
