@@ -4,27 +4,34 @@ JARVIS — World Model / Belief
 Mission: BeliefResolver — the belief-state tracker (audit roadmap D4).
 
          It subscribes to `vision.observation`, turns every observation
-         into an EvidenceFrame, and maintains competing hypotheses about
+         into an EvidenceFrame, and maintains COMPETING HYPOTHESES about
          each entity with the four-axis confidence model from
-         belief.types. Movement between rooms requires the new evidence
-         to clear the old location confidence by a margin, so a weak
-         stray detection never yanks a confident pin.
+         belief.types.
 
-SHADOW MODE (D4a — current):
-         The resolver runs read-only. It ingests evidence, updates
-         hypotheses, persists them to entity_beliefs / belief_evidence,
-         and logs state transitions — but it publishes nothing on the
-         bus and does not touch WorldModel.world_entities. The live
-         system is completely unaffected. This lets the belief model be
-         observed against the running WorldModel before D4b flips the
-         projection over to it.
+MULTI-HYPOTHESIS MODEL (D4b):
+         Each entity carries a *list* of hypotheses — exactly one
+         `is_primary` (the projection: "where Jarvis believes X is") plus
+         zero or more competitors. A weak sighting of X in a new room
+         does NOT yank the confident primary pin; it creates a SECONDARY
+         hypothesis there in state SUSPECTED_ELSEWHERE. The secondary is
+         only promoted to primary once its location confidence clears the
+         primary's by `cross_room_move_margin` — i.e. the entity is now
+         more likely there than where it was pinned. So the resolver can
+         hold, correctly:
 
-         SCOPE: people (keyed by resolved person_id) AND pets (cat/dog,
-         keyed coarsely by obj_class:room). Pet *identity* — which cat —
-         is deliberately NOT resolved here; that per-animal matching is
-         the D4b job. Shadow-mode pet ingest exists so belief_evidence
-         accumulates real pet sightings (with colour/size/bbox features)
-         for D4b to be built and tuned against. Objects are still D4b.
+             Summer  primary   : PRESENT_UNSEEN      @ bedroom
+             Summer  secondary : SUSPECTED_ELSEWHERE @ kitchen
+
+         Dead secondaries are pruned; if a primary decays to DEPARTED and
+         a live secondary exists, the secondary takes over.
+
+LIVE vs SHADOW:
+         `shadow: false` → on every primary transition the resolver
+         publishes `world.belief_changed`. `shadow: true` → observe-only.
+
+         SCOPE: people (keyed by person_id) and pets (cat/dog, keyed
+         coarsely obj_class:room). Per-animal identity is not resolved
+         here. Objects are out of scope.
 
 Modules: modules/world_model/belief/resolver.py
 Classes: BeliefResolver
@@ -45,31 +52,28 @@ from modules.world_model.belief.types import (
     EvidenceFrame,
 )
 
+_PRESENT_STATES = (BeliefState.PRESENT_CONFIRMED, BeliefState.PRESENT_UNSEEN)
+
 # Tuning. Conservative defaults; overridable via the world_model.
 # belief_resolver config block.
 _DEFAULTS = {
-    "shadow": True,                  # D4a: never leave shadow mode without D4b
+    "shadow": True,                  # never leave shadow without D4b done
     "sighting_location_gain": 0.45,  # how hard a sighting pulls location conf
     "sighting_visibility_gain": 0.6,
     "absence_visibility_decay": 0.55,  # multiply visibility on a missed frame
     "absence_location_decay": 0.97,    # location barely moves on a missed frame
-    "cross_room_move_margin": 0.30,    # new room must beat old location by this
+    "cross_room_move_margin": 0.30,    # a secondary must beat the primary's
+                                       # location confidence by this to be promoted
     "present_unseen_threshold": 0.30,  # visibility below this → PRESENT_UNSEEN
     # Hysteresis: the discrete CONFIRMED<->UNSEEN state flips only on a RUN
-    # of consecutive misses / hits, not a single noisy frame. A full flap
-    # now costs unseen_misses + confirmed_hits detector cycles, which keeps
-    # an intermittently-detected entity's belief stable instead of
-    # oscillating every cycle.
+    # of consecutive misses / hits, not a single noisy frame.
     "present_unseen_misses": 6,        # consec. misses: CONFIRMED → UNSEEN
     "present_confirmed_hits": 3,       # consec. hits:   UNSEEN → CONFIRMED
     "decay_interval_s": 30.0,
     "stale_location_decay": 0.92,      # per decay tick with no evidence
     "departed_threshold": 0.12,        # location below this → DEPARTED
-    # belief_evidence write throttle. The table is D4b tuning data, not a
-    # per-frame audit log — persisting every absence frame grew it to 90k
-    # rows/day. Transitions always persist; otherwise a sighting persists
-    # at most once per this interval per entity, non-transition absences
-    # never do.
+    "max_hypotheses": 4,               # cap competitors per entity
+    # belief_evidence write throttle (D4b tuning data, not a per-frame log).
     "evidence_min_interval_s": 15.0,
 }
 
@@ -79,8 +83,8 @@ def _utcnow() -> datetime:
 
 
 class BeliefResolver:
-    """Belief-state tracker. Constructed after WorldModel; started/stopped
-    by the orchestrator. In shadow mode it only reads + persists beliefs."""
+    """Multi-hypothesis belief-state tracker. Constructed after
+    WorldModel; started/stopped by the orchestrator."""
 
     def __init__(self, bus: Any, db: Any, config: Optional[dict] = None) -> None:
         self._bus = bus
@@ -91,11 +95,10 @@ class BeliefResolver:
         self._cfg = cfg
         self.shadow: bool = bool(cfg["shadow"])
         self._evidence_min_interval_s = float(cfg["evidence_min_interval_s"])
-        # entity_key → primary hypothesis. (D4a tracks one per entity;
-        # competing secondaries arrive in D4b.)
-        self._hyp: dict[str, BeliefHypothesis] = {}
-        # entity_key → ts of its last persisted belief_evidence row, for
-        # the non-transition write throttle.
+        self._max_hyps = int(cfg["max_hypotheses"])
+        # entity_key → list of hypotheses; exactly one has is_primary=True.
+        self._entities: dict[str, list[BeliefHypothesis]] = {}
+        # entity_key → ts of its last persisted belief_evidence row.
         self._last_evidence_persist: dict[str, datetime] = {}
         self._sub = None
         self._decay_task: Optional[asyncio.Task] = None
@@ -109,9 +112,10 @@ class BeliefResolver:
         self._decay_task = asyncio.create_task(
             self._decay_loop(), name="belief_resolver:decay"
         )
+        n_hyp = sum(len(v) for v in self._entities.values())
         logger.info(
             f"[BeliefResolver] started (shadow={self.shadow}, "
-            f"{len(self._hyp)} hypothesis(es) restored)"
+            f"{len(self._entities)} entit(ies) / {n_hyp} hypothesis(es) restored)"
         )
 
     async def stop(self) -> None:
@@ -130,6 +134,40 @@ class BeliefResolver:
             self._decay_task = None
         logger.debug("[BeliefResolver] stopped")
 
+    # ── Hypothesis-set helpers ───────────────────────────────────────────────
+
+    def _primary(self, key: str) -> Optional[BeliefHypothesis]:
+        for h in self._entities.get(key, []):
+            if h.is_primary:
+                return h
+        return None
+
+    def _hyp_in_room(self, key: str, room: Optional[str]) -> Optional[BeliefHypothesis]:
+        for h in self._entities.get(key, []):
+            if h.room == room:
+                return h
+        return None
+
+    def _new_hyp(
+        self, key: str, etype: str, room: Optional[str],
+        camera: Optional[str], *, primary: bool,
+    ) -> BeliefHypothesis:
+        h = BeliefHypothesis(
+            hypothesis_id=str(uuid.uuid4()), entity_key=key,
+            entity_type=etype, room=room, camera=camera, is_primary=primary,
+        )
+        self._entities.setdefault(key, []).append(h)
+        return h
+
+    def _promote(self, key: str, hyp: BeliefHypothesis) -> None:
+        """Make `hyp` the sole primary for its entity."""
+        for h in self._entities.get(key, []):
+            h.is_primary = (h is hyp)
+
+    def _primary_view(self, key: str) -> tuple[Optional[str], Optional[str]]:
+        p = self._primary(key)
+        return (p.state, p.room) if p is not None else (None, None)
+
     # ── Event ingest ─────────────────────────────────────────────────────────
 
     async def _on_observation(self, payload: dict) -> None:
@@ -140,14 +178,6 @@ class BeliefResolver:
             ts = payload.get("ts") or _utcnow()
             observations = payload.get("observations") or []
 
-            # Build evidence from each observation. People are keyed by their
-            # resolved person_id; pets (cat/dog) are keyed coarsely by
-            # obj_class:room. The coarse pet key means multi-animal identity
-            # is NOT resolved here — proper per-animal matching is the D4b
-            # job. What matters in shadow mode is that every pet sighting
-            # still lands a belief_evidence row carrying the colour / size /
-            # bbox features D4b will need, so one walk-around gathers data
-            # for people and pets alike.
             seen_keys: set[str] = set()
             async with self._lock:
                 for obs in observations:
@@ -180,95 +210,108 @@ class BeliefResolver:
                         ts=ts, entity_key=key, entity_type=etype,
                         source="vision.observation", evidence_type="sighting",
                         room=room, camera=camera, score=score,
-                        bbox=getattr(obs, "bbox", None),
-                        payload=meta,
+                        bbox=getattr(obs, "bbox", None), payload=meta,
                     )
                     await self._ingest_sighting(ev)
 
-                # Absence: anyone we believe is PRESENT in this room but who
-                # was not in this batch gets weak negative evidence.
-                for key, hyp in list(self._hyp.items()):
-                    if (key not in seen_keys and hyp.room == room
-                            and hyp.state in (BeliefState.PRESENT_CONFIRMED,
-                                              BeliefState.PRESENT_UNSEEN)):
-                        ev = EvidenceFrame(
-                            ts=ts, entity_key=key, entity_type=hyp.entity_type,
-                            source="vision.observation", evidence_type="absence",
-                            room=room, camera=camera,
-                            score=self._cfg["absence_visibility_decay"],
-                        )
-                        await self._ingest_absence(ev, hyp)
+                # Absence: a hypothesis pinned to THIS room whose entity was
+                # not in this batch gets weak negative evidence. Only the
+                # `room` hypothesis is affected — competitors elsewhere are
+                # not observable by this camera.
+                for key in list(self._entities.keys()):
+                    if key in seen_keys:
+                        continue
+                    for hyp in list(self._entities.get(key, [])):
+                        if hyp.room == room and hyp.state in _PRESENT_STATES:
+                            ev = EvidenceFrame(
+                                ts=ts, entity_key=key,
+                                entity_type=hyp.entity_type,
+                                source="vision.observation",
+                                evidence_type="absence", room=room,
+                                camera=camera,
+                                score=self._cfg["absence_visibility_decay"],
+                            )
+                            await self._ingest_absence(ev, hyp)
         except Exception:
             logger.exception("[BeliefResolver] observation ingest failed")
 
     async def _ingest_sighting(self, ev: EvidenceFrame) -> None:
-        hyp = self._hyp.get(ev.entity_key)
-        if hyp is None:
-            hyp = BeliefHypothesis(
-                hypothesis_id=str(uuid.uuid4()),
-                entity_key=ev.entity_key, entity_type=ev.entity_type,
-            )
-            self._hyp[ev.entity_key] = hyp
-
-        prev_state, prev_room = hyp.state, hyp.room
+        key = ev.entity_key
+        prev_state, prev_room = self._primary_view(key)
         gain_loc = self._cfg["sighting_location_gain"]
         gain_vis = self._cfg["sighting_visibility_gain"]
 
-        if hyp.room is None or hyp.room == ev.room:
-            # Same room (or first sighting) — reinforce. Confidences track
-            # every frame; the discrete STATE is hysteretic (run-counters).
-            hyp.room, hyp.camera = ev.room, ev.camera
-            hyp.confidence_location = _lift(hyp.confidence_location,
-                                            ev.score * gain_loc)
-            hyp.confidence_visibility = _lift(hyp.confidence_visibility,
-                                              ev.score * gain_vis)
-            hyp.consecutive_hits += 1
-            hyp.consecutive_misses = 0
-            if hyp.state == BeliefState.PRESENT_UNSEEN:
-                # Re-confirm only after a run of hits — one stray frame in
-                # a quiet gap should not flip the label back to confirmed.
-                if hyp.consecutive_hits >= self._cfg["present_confirmed_hits"]:
-                    hyp.state = BeliefState.PRESENT_CONFIRMED
-            elif hyp.state != BeliefState.PRESENT_CONFIRMED:
-                # UNKNOWN / DEPARTED / SUSPECTED_ELSEWHERE / TRANSITIONING —
-                # a same-room sighting is an unambiguous (re)acquisition.
-                hyp.state = BeliefState.PRESENT_CONFIRMED
-            # else already PRESENT_CONFIRMED — hold.
+        # First-ever sighting of this entity → the founding primary.
+        if not self._entities.get(key):
+            h = self._new_hyp(key, ev.entity_type, ev.room, ev.camera,
+                               primary=True)
+            h.state = BeliefState.PRESENT_CONFIRMED
+            self._reinforce(h, ev, gain_loc, gain_vis)
+            await self._commit(key, ev, prev_state, prev_room)
+            return
+
+        primary = self._primary(key)
+        target = self._hyp_in_room(key, ev.room)
+        if target is None:
+            # A new room for this entity — a competing SECONDARY hypothesis.
+            target = self._new_hyp(key, ev.entity_type, ev.room, ev.camera,
+                                   primary=False)
+            target.state = BeliefState.SUSPECTED_ELSEWHERE
+
+        self._reinforce(target, ev, gain_loc, gain_vis)
+
+        if primary is None or target is primary:
+            # Reinforcing the primary in its own room — hysteretic re-confirm.
+            if target.state == BeliefState.PRESENT_UNSEEN:
+                if target.consecutive_hits >= self._cfg["present_confirmed_hits"]:
+                    target.state = BeliefState.PRESENT_CONFIRMED
+            elif target.state != BeliefState.PRESENT_CONFIRMED:
+                target.state = BeliefState.PRESENT_CONFIRMED
         else:
-            # Different room — only move if this sighting beats the old
-            # location confidence by the move margin. Otherwise the old
-            # pin holds and we note a competing hypothesis elsewhere.
+            # `target` is a secondary — does the entity now belong there?
             margin = self._cfg["cross_room_move_margin"]
-            if ev.score > hyp.confidence_location + margin:
+            if target.confidence_location > primary.confidence_location + margin:
+                # The new room beats the old pin → the entity moved.
+                target.state = BeliefState.PRESENT_CONFIRMED
+                primary.state = BeliefState.PRESENT_UNSEEN
+                self._promote(key, target)
                 logger.info(
-                    f"[BeliefResolver] {ev.entity_key} moved "
-                    f"{hyp.room} → {ev.room} "
-                    f"(evidence {ev.score:.2f} > {hyp.confidence_location:.2f}+{margin})"
+                    f"[BeliefResolver] {key} moved {primary.room} → {ev.room} "
+                    f"(loc {target.confidence_location:.2f} > "
+                    f"{primary.confidence_location:.2f}+{margin})"
                 )
-                hyp.room, hyp.camera = ev.room, ev.camera
-                hyp.confidence_location = ev.score
-                hyp.confidence_visibility = ev.score * gain_vis
-                hyp.state = BeliefState.PRESENT_CONFIRMED
             else:
-                hyp.state = BeliefState.SUSPECTED_ELSEWHERE
+                # Weak — the secondary stands as a competitor, pin holds.
+                target.state = BeliefState.SUSPECTED_ELSEWHERE
                 logger.debug(
-                    f"[BeliefResolver] {ev.entity_key} weak sighting in "
-                    f"{ev.room} ({ev.score:.2f}) — pin holds at {hyp.room}"
+                    f"[BeliefResolver] {key} weak sighting in {ev.room} "
+                    f"({ev.score:.2f}) — primary holds at {primary.room}"
                 )
 
+        await self._commit(key, ev, prev_state, prev_room)
+
+    def _reinforce(
+        self, hyp: BeliefHypothesis, ev: EvidenceFrame,
+        gain_loc: float, gain_vis: float,
+    ) -> None:
+        """Apply a positive sighting to one hypothesis."""
+        hyp.camera = ev.camera
+        hyp.confidence_location = _lift(hyp.confidence_location,
+                                        ev.score * gain_loc)
+        hyp.confidence_visibility = _lift(hyp.confidence_visibility,
+                                          ev.score * gain_vis)
         hyp.confidence_identity = _lift(hyp.confidence_identity, ev.score)
+        hyp.consecutive_hits += 1
+        hyp.consecutive_misses = 0
         hyp.last_confirmed_ts = ev.ts
         hyp.last_evidence_ts = ev.ts
-        hyp.recompute_state_confidence()
         hyp.evidence_breakdown = {"last": "sighting", "score": round(ev.score, 3)}
-        transitioned = (hyp.state != prev_state or hyp.room != prev_room)
-        if self._should_persist_evidence(ev, transitioned):
-            await self._persist_evidence(ev)
-        await self._persist_belief(hyp)
-        await self._on_transition(hyp, prev_state, prev_room)
 
-    async def _ingest_absence(self, ev: EvidenceFrame, hyp: BeliefHypothesis) -> None:
-        prev_state, prev_room = hyp.state, hyp.room
+    async def _ingest_absence(
+        self, ev: EvidenceFrame, hyp: BeliefHypothesis
+    ) -> None:
+        key = ev.entity_key
+        prev_state, prev_room = self._primary_view(key)
         hyp.consecutive_misses += 1
         hyp.consecutive_hits = 0
         hyp.confidence_visibility = round(
@@ -278,67 +321,131 @@ class BeliefResolver:
             hyp.confidence_location * self._cfg["absence_location_decay"], 4
         )
         if hyp.confidence_location < self._cfg["departed_threshold"]:
-            # Location confidence has decayed past the floor — absent long
-            # enough that we no longer believe it is even in the room.
-            # This check must live here, not only in _decay_loop: the decay
-            # loop skips entities with recent evidence, and a continuous
-            # stream of absence frames IS recent evidence — so without this
-            # an entity that left frame would decay toward zero confidence
-            # but stay PRESENT_UNSEEN forever. Going DEPARTED also stops the
-            # absence spam: the _on_observation absence loop only feeds
-            # hypotheses still in a PRESENT_* state.
             hyp.state = BeliefState.DEPARTED
         elif (hyp.state == BeliefState.PRESENT_CONFIRMED
                 and hyp.consecutive_misses >= self._cfg["present_unseen_misses"]
                 and hyp.confidence_visibility
                 < self._cfg["present_unseen_threshold"]):
-            # Not detected for a sustained RUN of frames — believed still
-            # present (location confidence holds), just not currently
-            # observable. The miss-run gate is what stops the flapping: a
-            # 1-2 frame YOLO gap no longer flips the label. (Door-
-            # disappearance / white-dog-on-white-blanket rule.)
             hyp.state = BeliefState.PRESENT_UNSEEN
         hyp.last_evidence_ts = ev.ts
-        hyp.recompute_state_confidence()
         hyp.evidence_breakdown = {"last": "absence"}
-        transitioned = (hyp.state != prev_state or hyp.room != prev_room)
+        await self._commit(key, ev, prev_state, prev_room)
+
+    # ── Reconcile + commit ───────────────────────────────────────────────────
+
+    def _reconcile(self, key: str) -> list[str]:
+        """Keep an entity's hypothesis set sane. Returns hypothesis_ids
+        removed (so the caller deletes their rows):
+          - prune DEPARTED secondaries;
+          - if the primary is DEPARTED and a live secondary exists,
+            promote the strongest live secondary;
+          - cap the set at max_hypotheses (drop the weakest secondaries).
+        """
+        hyps = self._entities.get(key, [])
+        if not hyps:
+            return []
+        removed: list[str] = []
+
+        kept = [h for h in hyps
+                if h.is_primary or h.state != BeliefState.DEPARTED]
+        removed += [h.hypothesis_id for h in hyps if h not in kept]
+
+        # Re-promote if the primary has departed but a competitor is alive.
+        primary = next((h for h in kept if h.is_primary), None)
+        if primary is not None and primary.state == BeliefState.DEPARTED:
+            live = [h for h in kept
+                    if h is not primary and h.state in _PRESENT_STATES]
+            if live:
+                best = max(live, key=lambda h: h.confidence_location)
+                for h in kept:
+                    h.is_primary = (h is best)
+
+        # Cap the competitor set — drop the weakest non-primary extras.
+        if len(kept) > self._max_hyps:
+            secondaries = sorted(
+                (h for h in kept if not h.is_primary),
+                key=lambda h: h.confidence_location,
+            )
+            drop = secondaries[: len(kept) - self._max_hyps]
+            removed += [h.hypothesis_id for h in drop]
+            kept = [h for h in kept if h not in drop]
+
+        self._entities[key] = kept
+        return removed
+
+    async def _commit(
+        self, key: str, ev: EvidenceFrame,
+        prev_state: Optional[str], prev_room: Optional[str],
+    ) -> None:
+        """Reconcile the entity, persist every live hypothesis, delete
+        pruned rows, persist evidence, and fire a transition if the
+        PRIMARY (the projection) changed."""
+        removed = self._reconcile(key)
+        for h in self._entities.get(key, []):
+            h.recompute_state_confidence()
+
+        new_state, new_room = self._primary_view(key)
+        transitioned = (new_state != prev_state or new_room != prev_room)
+
         if self._should_persist_evidence(ev, transitioned):
             await self._persist_evidence(ev)
-        await self._persist_belief(hyp)
-        await self._on_transition(hyp, prev_state, prev_room)
+        for hid in removed:
+            await self._delete_belief(hid)
+        for h in self._entities.get(key, []):
+            await self._persist_belief(h)
+
+        primary = self._primary(key)
+        if primary is not None and transitioned:
+            await self._on_transition(primary, prev_state, prev_room)
 
     # ── Decay ────────────────────────────────────────────────────────────────
 
     async def _decay_loop(self) -> None:
-        """Slowly decay location confidence for hypotheses that have had no
-        evidence at all for a while (camera off, entity outside coverage)."""
+        """Slowly decay confidence for hypotheses with no recent evidence
+        (camera off, entity outside coverage)."""
         interval = float(self._cfg["decay_interval_s"])
         while True:
             try:
                 await asyncio.sleep(interval)
                 now = _utcnow()
                 async with self._lock:
-                    for hyp in list(self._hyp.values()):
-                        if hyp.last_evidence_ts is None:
+                    for key in list(self._entities.keys()):
+                        prev_state, prev_room = self._primary_view(key)
+                        changed = False
+                        for hyp in list(self._entities.get(key, [])):
+                            if hyp.last_evidence_ts is None:
+                                continue
+                            age = (now - _aware(hyp.last_evidence_ts)
+                                   ).total_seconds()
+                            if age < interval:
+                                continue
+                            changed = True
+                            hyp.confidence_location = round(
+                                hyp.confidence_location
+                                * self._cfg["stale_location_decay"], 4)
+                            hyp.confidence_visibility = round(
+                                hyp.confidence_visibility * 0.8, 4)
+                            if (hyp.confidence_location
+                                    < self._cfg["departed_threshold"]):
+                                hyp.state = BeliefState.DEPARTED
+                            elif hyp.state == BeliefState.PRESENT_CONFIRMED:
+                                hyp.state = BeliefState.PRESENT_UNSEEN
+                        if not changed:
                             continue
-                        age = (now - _aware(hyp.last_evidence_ts)).total_seconds()
-                        if age < interval:
-                            continue
-                        prev_state, prev_room = hyp.state, hyp.room
-                        hyp.confidence_location = round(
-                            hyp.confidence_location
-                            * self._cfg["stale_location_decay"], 4
-                        )
-                        hyp.confidence_visibility = round(
-                            hyp.confidence_visibility * 0.8, 4
-                        )
-                        if hyp.confidence_location < self._cfg["departed_threshold"]:
-                            hyp.state = BeliefState.DEPARTED
-                        elif hyp.state == BeliefState.PRESENT_CONFIRMED:
-                            hyp.state = BeliefState.PRESENT_UNSEEN
-                        hyp.recompute_state_confidence()
-                        await self._persist_belief(hyp)
-                        await self._on_transition(hyp, prev_state, prev_room)
+                        removed = self._reconcile(key)
+                        for h in self._entities.get(key, []):
+                            h.recompute_state_confidence()
+                        for hid in removed:
+                            await self._delete_belief(hid)
+                        for h in self._entities.get(key, []):
+                            await self._persist_belief(h)
+                        primary = self._primary(key)
+                        new_state, new_room = self._primary_view(key)
+                        if (primary is not None
+                                and (new_state != prev_state
+                                     or new_room != prev_room)):
+                            await self._on_transition(
+                                primary, prev_state, prev_room)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -349,17 +456,9 @@ class BeliefResolver:
     def _should_persist_evidence(
         self, ev: EvidenceFrame, transitioned: bool
     ) -> bool:
-        """Gate belief_evidence writes. The table is D4b tuning data, not
-        a per-frame audit log — persisting every absence frame grew it to
-        ~90k rows/day. Rules:
-          - a state transition always persists (the moment of change is
-            the most valuable row);
-          - otherwise a *sighting* persists at most once per
-            evidence_min_interval_s per entity (sightings carry the
-            colour / size / bbox features D4b needs to be tuned against);
-          - a non-transition *absence* never persists (a 'still not
-            seen' frame carries no signal worth a row).
-        """
+        """Gate belief_evidence writes. Transitions always persist; a
+        sighting persists at most once per evidence_min_interval_s per
+        entity; non-transition absences never persist."""
         if transitioned:
             self._last_evidence_persist[ev.entity_key] = ev.ts
             return True
@@ -386,14 +485,9 @@ class BeliefResolver:
             logger.debug(f"[BeliefResolver] evidence persist failed: {e}")
 
     async def prune_evidence(self, *, retain_days: int = 30) -> int:
-        """Delete `belief_evidence` rows older than `retain_days`.
-
-        `belief_evidence` is an append-only evidence log — the durable
-        belief state lives in `entity_beliefs`. It is the D4-era sibling
-        of `world_entity_events` and grows just as fast (~90k rows within
-        days of going live). The nightly maintenance pass calls this so
-        the table cannot grow without bound. Returns rows deleted.
-        """
+        """Delete `belief_evidence` rows older than `retain_days`. The
+        durable belief state lives in `entity_beliefs`; this table is an
+        append-only evidence log the nightly pass keeps bounded."""
         if self._db is None:
             return 0
         cutoff = (_utcnow() - timedelta(days=int(retain_days))).isoformat()
@@ -431,20 +525,25 @@ class BeliefResolver:
         except Exception as e:
             logger.debug(f"[BeliefResolver] belief persist failed: {e}")
 
-    async def _load_existing(self) -> None:
+    async def _delete_belief(self, hypothesis_id: str) -> None:
         try:
-            rows = await self._db.fetchall(
-                "SELECT * FROM entity_beliefs WHERE is_primary = 1"
+            await self._db.execute(
+                "DELETE FROM entity_beliefs WHERE hypothesis_id = ?",
+                (hypothesis_id,),
             )
+        except Exception as e:
+            logger.debug(f"[BeliefResolver] belief delete failed: {e}")
+
+    async def _load_existing(self) -> None:
+        """Restore every hypothesis (primary + competitors), grouped per
+        entity. Each entity is guaranteed exactly one primary afterwards."""
+        try:
+            rows = await self._db.fetchall("SELECT * FROM entity_beliefs")
         except Exception as e:
             logger.debug(f"[BeliefResolver] load skipped: {e}")
             return
         for r in rows:
-            # Restore last_*_ts too: the decay loop skips any hypothesis
-            # with last_evidence_ts is None, so a belief restored without
-            # its timestamps would never decay after a restart until fresh
-            # evidence happened to arrive.
-            self._hyp[r["entity_key"]] = BeliefHypothesis(
+            hyp = BeliefHypothesis(
                 hypothesis_id=r["hypothesis_id"], entity_key=r["entity_key"],
                 entity_type=r["entity_type"], state=r["state"],
                 room=r["room"], camera=r["camera"],
@@ -452,34 +551,51 @@ class BeliefResolver:
                 confidence_location=r["confidence_location"],
                 confidence_visibility=r["confidence_visibility"],
                 confidence_state=r["confidence_state"],
+                is_primary=bool(r["is_primary"]),
                 last_confirmed_ts=_parse_dt(r["last_confirmed_ts"]),
                 last_evidence_ts=_parse_dt(r["last_evidence_ts"]),
             )
+            self._entities.setdefault(r["entity_key"], []).append(hyp)
+        # Repair the invariant: exactly one primary per entity.
+        for key, hyps in self._entities.items():
+            primaries = [h for h in hyps if h.is_primary]
+            if len(primaries) == 1:
+                continue
+            best = max(hyps, key=lambda h: h.confidence_location)
+            for h in hyps:
+                h.is_primary = (h is best)
 
-    # ── Introspection (dashboard / D4b hand-off) ─────────────────────────────
+    # ── Introspection (dashboard) ────────────────────────────────────────────
 
     def snapshot(self) -> list[dict]:
-        """Current primary hypotheses — for a dashboard panel or a
-        shadow-vs-live comparison."""
-        return [
-            {
-                "entity_key": h.entity_key, "state": h.state, "room": h.room,
-                "confidence_location": h.confidence_location,
-                "confidence_visibility": h.confidence_visibility,
-                "confidence_state": h.confidence_state,
-            }
-            for h in self._hyp.values()
-        ]
+        """Per-entity belief view — the primary plus its competitors."""
+        out: list[dict] = []
+        for key, hyps in self._entities.items():
+            primary = self._primary(key)
+            out.append({
+                "entity_key": key,
+                "primary": self._hyp_dict(primary) if primary else None,
+                "competitors": [
+                    self._hyp_dict(h) for h in hyps if not h.is_primary
+                ],
+            })
+        return out
+
+    @staticmethod
+    def _hyp_dict(h: BeliefHypothesis) -> dict:
+        return {
+            "state": h.state, "room": h.room,
+            "confidence_location": h.confidence_location,
+            "confidence_visibility": h.confidence_visibility,
+            "confidence_state": h.confidence_state,
+        }
 
     async def _on_transition(
-        self, hyp: BeliefHypothesis, prev_state: str, prev_room: Optional[str],
+        self, hyp: BeliefHypothesis, prev_state: Optional[str],
+        prev_room: Optional[str],
     ) -> None:
-        """Handle a belief change: always log it; when LIVE (not shadow),
-        also publish a world.belief_changed event so consumers (dashboard,
-        and eventually presence) can react. In shadow mode nothing is
-        published — the resolver stays observe-only."""
-        if hyp.state == prev_state and hyp.room == prev_room:
-            return
+        """The projection (primary hypothesis) changed. Always log it;
+        when LIVE, also publish `world.belief_changed`."""
         logger.info(
             f"[BeliefResolver]{' (shadow)' if self.shadow else ' (live)'} "
             f"{hyp.entity_key}: {prev_state}@{prev_room} → "
@@ -519,8 +635,7 @@ def _iso(ts: Optional[datetime]) -> Optional[str]:
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
-    """Parse an ISO timestamp stored in SQLite back to an aware datetime.
-    Returns None for empty/garbage so callers stay None-safe."""
+    """Parse an ISO timestamp from SQLite back to an aware datetime."""
     if not value:
         return None
     try:
