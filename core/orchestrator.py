@@ -1167,8 +1167,14 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
 
         wake = self.wake
         sessions = self.sessions
-        if wake is None or sessions is None:
+        if sessions is None:
             raise JarvisError("Core voice modules failed to initialize")
+        # `wake` (legacy WakeWordDetector) is None when the office mic is
+        # routed through the cascade — wake then comes from the per-room
+        # CascadeWakeRunners managed by wake_sources. Require at least one
+        # of the two wake paths.
+        if wake is None and self.wake_sources is None:
+            raise JarvisError("No wake path initialized (no detector, no sources)")
 
         # Build task list. The orchestrator's own loops are wrapped in
         # _supervised so an outer-level crash (one that escapes the loop's
@@ -1176,7 +1182,6 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # silently leaving the system degraded until a full restart.
         tasks = [
             self.bus.run(),
-            wake.listen_forever(),
             sessions.cleanup_expired(),
             # Watches for data/stop.flag (written by stop.ps1) and turns an
             # external "stop" into a real graceful shutdown. NOT supervised —
@@ -1190,6 +1195,12 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
             self._supervised("calendar_alert_loop", self._calendar_alert_loop),
             self._supervised("self_thought_loop", self._self_thought_loop),
         ]
+        # Legacy PC wake detector — only when it's the active wake path.
+        # With office_mic_via_cascade on, `wake` is None and the per-room
+        # CascadeWakeRunners (started via wake_sources.start() below) own
+        # wake detection for every room including the office.
+        if wake is not None:
+            tasks.append(wake.listen_forever())
 
         # MQTT monitoring
         if self.mqtt:

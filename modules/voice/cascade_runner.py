@@ -78,14 +78,25 @@ class CascadeWakeRunner:
         self._last_score_emit = 0.0
         self._wake_suppress_until = 0.0
         self._running = False
+        # voice.speech_start/end tracking. Two consumers:
+        #   - echo suppression: a cascade segment that closes while
+        #     Jarvis is speaking in this room (+ a short tail) is his own
+        #     voice — _on_segment drops it instead of triaging it. This
+        #     matters most for the office mic, whose local PC speaker the
+        #     office mic hears directly.
+        #   - barge-in (below): the user talking over Jarvis.
+        self._jarvis_speaking = False     # set by voice.speech_start for this room
+        self._speaking_since = 0.0
+        # Keep suppressing for echo_tail_s after speech ends so room
+        # reverb / the speech tail is not transcribed as a user turn.
+        self._speaking_until = 0.0
+        self._echo_tail_s = float(self._cascade_cfg.get("speech_echo_tail_s", 1.5))
+        self._speech_subs: list = []
         # Barge-in: detect the user talking over Jarvis's TTS.
         barge_cfg = voice_cfg.get("barge_in", {}) or {}
         self._barge_enabled = bool(barge_cfg.get("enabled", False))
         self._barge_grace_s = float(barge_cfg.get("grace_ms", 700)) / 1000.0
-        self._jarvis_speaking = False     # set by voice.speech_start for this room
-        self._speaking_since = 0.0
         self._barged = False              # one barge per speech episode
-        self._barge_subs: list = []
 
     @property
     def room(self) -> str:
@@ -119,11 +130,12 @@ class CascadeWakeRunner:
         sensitivity = float(self._wake_cfg.get("sensitivity", 0.5))
         cooldown = float(self._wake_cfg.get("cooldown_seconds", 2))
         self._running = True
-        if self._barge_enabled:
-            self._barge_subs.append(
-                self._bus.subscribe("voice.speech_start", self._on_speech_start))
-            self._barge_subs.append(
-                self._bus.subscribe("voice.speech_end", self._on_speech_end))
+        # Subscribe to Jarvis-speech brackets unconditionally — echo
+        # suppression in _on_segment needs them even with barge-in off.
+        self._speech_subs.append(
+            self._bus.subscribe("voice.speech_start", self._on_speech_start))
+        self._speech_subs.append(
+            self._bus.subscribe("voice.speech_end", self._on_speech_end))
         try:
             async for chunk in self._source.stream():
                 if not self._running:
@@ -206,8 +218,17 @@ class CascadeWakeRunner:
 
     async def _on_segment(self, segment: np.ndarray) -> None:
         """A speech segment closed — run Stages 2b-4 and publish the outcome."""
-        if time.monotonic() < self._wake_suppress_until:
+        now = time.monotonic()
+        if now < self._wake_suppress_until:
             return  # within the post-wake window — orchestrator owns this
+        # Echo suppression: a segment that closed while Jarvis is speaking
+        # in this room (or within the echo tail just after) is almost
+        # certainly Jarvis's own voice — drop it rather than triaging it.
+        if self._jarvis_speaking or now < self._speaking_until:
+            logger.debug(
+                f"[CascadeWake:{self.room}] segment dropped — Jarvis speaking"
+            )
+            return
         cascade = self._cascade
         if cascade is None:
             return
@@ -245,15 +266,16 @@ class CascadeWakeRunner:
     async def _on_speech_end(self, payload: dict) -> None:
         if payload.get("room") == self.room:
             self._jarvis_speaking = False
+            self._speaking_until = time.monotonic() + self._echo_tail_s
             self._barged = False
 
     def stop(self) -> None:
         self._running = False
-        for sub in self._barge_subs:
+        for sub in self._speech_subs:
             try:
                 sub.unsubscribe()
             except Exception:
                 pass
-        self._barge_subs.clear()
+        self._speech_subs.clear()
         if self._task is not None and not self._task.done():
             self._task.cancel()

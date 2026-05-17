@@ -112,6 +112,24 @@ class LoopsMixin(OrchestratorMixin):
     Mixed into Orchestrator — see core/orchestrator_base.py.
     """
 
+    def _recent_ambient_audio(self, window_s: float) -> Optional[np.ndarray]:
+        """Last `window_s` seconds of office-mic audio for the ambient
+        AudioClassifier (YAMNet), as float32 [-1, 1] mono @ 16 kHz.
+
+        The rolling buffer lives on whichever component owns the office
+        PC mic: the legacy WakeWordDetector, or — when the office mic is
+        routed through the cascade (self.wake is None) — the office
+        MicSourceWakeAdapter. Returns None when neither has audio yet.
+        """
+        if self.wake is not None:
+            return self.wake.get_recent_audio(window_s)
+        if self.wake_sources is not None:
+            src = self.wake_sources.get_source("office")
+            getter = getattr(src, "get_recent_audio", None)
+            if getter is not None:
+                return getter(window_s)
+        return None
+
     async def _context_loop(self) -> None:
         """
         Continuously polls PC activity and audio, fuses signals into a state,
@@ -130,21 +148,20 @@ class LoopsMixin(OrchestratorMixin):
                     if pc_signal:
                         signals["pc"] = pc_signal
 
-                if (
-                    self.audio_classifier
-                    and not self._audio_io_active
-                    and self.wake is not None
-                ):
-                    # Read the last N seconds of audio from wake_word's shared
-                    # buffer instead of opening a second InputStream. The old
-                    # suspend/wakeup approach killed wake responsiveness — wake
-                    # was unavailable ~50% of the time and openWakeWord lost
-                    # its prediction context every cycle. Now wake_word holds
-                    # the mic continuously and YAMNet just snapshots its buffer.
+                if self.audio_classifier and not self._audio_io_active:
+                    # Read the last N seconds of audio from the office mic's
+                    # shared rolling buffer instead of opening a second
+                    # InputStream. The buffer lives on the legacy
+                    # WakeWordDetector, or — when the office mic is routed
+                    # through the cascade — on the office MicSourceWakeAdapter;
+                    # _recent_ambient_audio picks whichever owns the mic. The
+                    # old suspend/wakeup approach killed wake responsiveness —
+                    # wake was unavailable ~50% of the time and openWakeWord
+                    # lost its prediction context every cycle.
                     window_s = float(
                         self.config["context"].get("audio_classify_window_seconds", 3)
                     )
-                    waveform = self.wake.get_recent_audio(window_s)
+                    waveform = self._recent_ambient_audio(window_s)
                     if waveform is not None and len(waveform) > 0:
                         classifications = await asyncio.to_thread(
                             self.audio_classifier.classify, waveform
@@ -1931,25 +1948,31 @@ class LoopsMixin(OrchestratorMixin):
     # ── TTS Helper ─────────────────────────────────────────────────────────
 
     async def _play_tts(self, text: str, room: str) -> None:
-        """Play TTS on the local speaker. With barge-in enabled the
-        playback runs as a tracked task — a voice.barge_in event can
-        cancel it (the streaming player stops at the next sentence
-        boundary) — and voice.speech_start/end bracket it so the cascade
-        knows Jarvis is talking. Barge-in OFF → a plain awaited call,
-        byte-identical to the pre-barge-in behaviour."""
-        if not self._barge_in_enabled:
-            await self.tts.speak_async(text)
-            return
+        """Play TTS on the local speaker.
+
+        voice.speech_start / voice.speech_end ALWAYS bracket playback —
+        a CascadeWakeRunner keys off them for echo suppression so a room
+        mic driving the cascade (e.g. the office mic) does not transcribe
+        and triage Jarvis's own voice. With barge-in additionally
+        enabled, playback runs as a cancellable tracked task so a
+        voice.barge_in event can cut it off at the next sentence."""
         await self.bus.publish("voice.speech_start", {"room": room})
-        task = asyncio.create_task(self.tts.speak_async(text))
-        self._active_speech[room] = task
         try:
-            await task
-        except asyncio.CancelledError:
-            logger.info(f"[BargeIn] speech in '{room}' cut off by the user")
+            if not self._barge_in_enabled:
+                await self.tts.speak_async(text)
+            else:
+                task = asyncio.create_task(self.tts.speak_async(text))
+                self._active_speech[room] = task
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    logger.info(
+                        f"[BargeIn] speech in '{room}' cut off by the user"
+                    )
+                finally:
+                    if self._active_speech.get(room) is task:
+                        self._active_speech.pop(room, None)
         finally:
-            if self._active_speech.get(room) is task:
-                self._active_speech.pop(room, None)
             await self.bus.publish("voice.speech_end", {"room": room})
 
     async def _on_barge_in(self, event: dict) -> None:

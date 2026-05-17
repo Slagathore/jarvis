@@ -176,19 +176,39 @@ class InitMixin(OrchestratorMixin):
         await asyncio.to_thread(self.tts.load)
         logger.info("[Init] TTS (Piper + Kokoro router) ready")
 
-        # BUG FIX: WakeWordDetector takes (config, bus) — was passing wrong flat kwargs
-        # and using "event_bus" instead of "bus" as the param name
-        self.wake = WakeWordDetector(config=self.config, bus=self.bus)
-        await asyncio.to_thread(self.wake.load)
-        logger.info("[Init] Wake word detector ready")
+        # Voice cascade flags. cascade.enabled is the master switch;
+        # cascade.office_mic additionally routes the office PC mic through
+        # a CascadeWakeRunner instead of the legacy WakeWordDetector.
+        voice_cfg = self.config.get("voice", {}) or {}
+        cascade_cfg = voice_cfg.get("cascade", {}) or {}
+        cascade_enabled = bool(cascade_cfg.get("enabled", False))
+        office_mic_via_cascade = cascade_enabled and bool(
+            cascade_cfg.get("office_mic", True)
+        )
+
+        # The legacy WakeWordDetector owns the PC mic via its own
+        # sounddevice stream. When the office mic is routed through the
+        # cascade, that stream would fight the cascade's UsbMicSource for
+        # the device — so the detector is NOT built and `self.wake` stays
+        # None. The office UsbMicSource is registered with wake_sources
+        # below and a CascadeWakeRunner drives it instead (streaming wake
+        # + VAD/sound-event/triage). All `self.wake` consumers are
+        # None-guarded; the recording path auto-switches to the room tap.
+        if office_mic_via_cascade:
+            self.wake = None
+            logger.info(
+                "[Init] Office mic → cascade — legacy WakeWordDetector "
+                "skipped; office runs on a CascadeWakeRunner"
+            )
+        else:
+            # WakeWordDetector takes (config, bus).
+            self.wake = WakeWordDetector(config=self.config, bus=self.bus)
+            await asyncio.to_thread(self.wake.load)
+            logger.info("[Init] Wake word detector ready")
 
         # Voice cascade components (Option D). Built only when
         # voice.cascade.enabled is true, and shared across every per-room
         # CascadeWakeRunner (each runner still makes its own stateful VAD).
-        voice_cfg = self.config.get("voice", {}) or {}
-        cascade_enabled = bool(
-            (voice_cfg.get("cascade", {}) or {}).get("enabled", False)
-        )
         self.sound_event_classifier = None
         self.triage_gate = None
         self.clap_classifier = None
@@ -237,19 +257,22 @@ class InitMixin(OrchestratorMixin):
         )
 
         # Bridge per-room mic sources into the wake-word system. Skip:
-        #   - Rooms whose mic is the PC's USB device — WakeWordDetector
-        #     already consumes that via its own sounddevice grab; a
-        #     second listener on the same device would race for samples.
         #   - Rooms with no mic configured (NullMicSource).
-        # Everything else (Wyze RTSP audio, ESP MQTT mic) gets a
+        #   - USB mics — UNLESS office_mic_via_cascade is on. When the
+        #     legacy WakeWordDetector owns the PC mic (office_mic off), a
+        #     second listener on the same device would race for samples,
+        #     so USB mics are skipped. When the office mic is routed
+        #     through the cascade, the detector is not running and the
+        #     USB mic SHOULD get an adapter → CascadeWakeRunner.
+        # Everything else (Wyze RTSP audio, ESP MQTT mic) always gets a
         # MicSourceWakeAdapter so wake-word detection fires per-room.
         for room_id, src in self.mic_manager._sources.items():
             if isinstance(src, NullMicSource):
                 continue
-            if isinstance(src, UsbMicSource):
+            if isinstance(src, UsbMicSource) and not office_mic_via_cascade:
                 logger.debug(
-                    f"[Init] Skipping wake adapter for '{room_id}' — USB mic is "
-                    "owned by the PC WakeWordDetector"
+                    f"[Init] Skipping wake adapter for '{room_id}' — USB mic "
+                    "is owned by the legacy WakeWordDetector"
                 )
                 continue
             try:

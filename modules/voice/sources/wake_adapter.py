@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections import deque
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
 import numpy as np
@@ -97,6 +98,15 @@ class MicSourceWakeAdapter:
         # mic emits 1280-sample chunks today, but USB mic blocksize can
         # drift slightly under load.
         self._partial = bytearray()
+        # Rolling buffer of recent OWW-sized chunks (int16, 16 kHz), ~5 s
+        # deep — 80 chunks × 1280 samples. Lets the orchestrator's ambient
+        # AudioClassifier read a recent snapshot via get_recent_audio()
+        # without opening a second stream. This is the role the legacy
+        # WakeWordDetector's buffer played for the office PC mic; routing
+        # the office mic through the cascade moves that duty here.
+        # _mic_callback and get_recent_audio both run on the event loop
+        # (UsbMicSource bridges its audio thread → loop), so no lock.
+        self._recent_audio: deque = deque(maxlen=80)
         # Optional recording tap: when set, every raw mic chunk is also
         # forwarded here. Used by the orchestrator's _on_wake_detected /
         # _listen_followup paths so they can capture audio from the SAME
@@ -174,6 +184,23 @@ class MicSourceWakeAdapter:
         flowed."""
         return self._recording_sample_rate
 
+    def get_recent_audio(self, seconds: float) -> Optional[np.ndarray]:
+        """Last `seconds` of buffered mic audio as a float32 [-1, 1] mono
+        waveform at 16 kHz. None when nothing has been buffered yet.
+
+        Mirrors WakeWordDetector.get_recent_audio so the orchestrator's
+        ambient AudioClassifier (YAMNet) can read from a cascade-driven
+        mic exactly the way it read from the legacy PC wake detector —
+        the OWW chunks are 16 kHz (MicSources resample to match OWW)."""
+        if not self._recent_audio:
+            return None
+        n_chunks = max(1, int(seconds * 16000 / _OWW_CHUNK_SIZE))
+        chunks = list(self._recent_audio)[-n_chunks:]
+        if not chunks:
+            return None
+        pcm_int16 = np.concatenate(chunks)
+        return pcm_int16.astype(np.float32) / 32768.0
+
     async def _mic_callback(self, pcm: bytes, sample_rate: int) -> None:
         """Called by MicSource per chunk. Slice into OWW-sized chunks and
         push to the queue. sample_rate is captured for logging only — OWW
@@ -217,6 +244,10 @@ class MicSourceWakeAdapter:
         while len(self._partial) >= target_bytes:
             chunk = bytes(self._partial[:target_bytes])
             del self._partial[:target_bytes]
+            # Record into the ambient buffer BEFORE the OWW queue — the
+            # AudioClassifier wants continuous audio even on the chunks
+            # the (bounded) wake queue would drop under backpressure.
+            self._recent_audio.append(np.frombuffer(chunk, dtype=np.int16))
             try:
                 self._queue.put_nowait(chunk)
             except asyncio.QueueFull:

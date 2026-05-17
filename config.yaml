@@ -155,6 +155,18 @@ voice:
     max_segment_s: 20
     min_segment_ms: 250
     wake_suppress_s: 30        # mute cascade triage this long after a wake
+    # Route the office PC mic through the cascade too. When true (and
+    # cascade.enabled), the office USB mic is driven by a CascadeWakeRunner
+    # like the Wyze rooms — so office ambient speech gets VAD/sound-event/
+    # triage, not just bare wake detection. The legacy WakeWordDetector is
+    # NOT started in that case (it would fight the cascade for the device).
+    # Flip to false to revert the office to the legacy wake-only path.
+    office_mic: true
+    # Echo suppression: a CascadeWakeRunner drops any speech segment that
+    # closes while Jarvis is speaking in its room — plus this many seconds
+    # of tail after — so the cascade never transcribes + triages Jarvis's
+    # own voice. Raise it if a slow room reverb still leaks through.
+    speech_echo_tail_s: 1.5
 mqtt:
   broker: localhost
   port: 1883

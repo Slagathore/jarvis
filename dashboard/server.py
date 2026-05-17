@@ -348,11 +348,25 @@ class DashboardServer:
 
         items: list[dict] = []
         wake = getattr(orch, "wake", None)
-        items.append(_item(
-            "wake word",
-            "loaded" if getattr(wake, "loaded", False) else "error",
-            str(getattr(wake, "device", "")),
-        ))
+        # `wake` is the legacy PC WakeWordDetector — None when the office
+        # mic is routed through the cascade. In that case the per-room
+        # CascadeWakeRunners under wake_sources ARE the wake path, so the
+        # capability is healthy even though `wake` is None.
+        wake_sources = getattr(orch, "wake_sources", None)
+        cascade_rooms: list = []
+        if wake_sources is not None:
+            try:
+                cascade_rooms = list(wake_sources.registered_rooms())
+            except Exception:
+                cascade_rooms = []
+        if getattr(wake, "loaded", False):
+            wake_status, wake_detail = "loaded", str(getattr(wake, "device", ""))
+        elif cascade_rooms:
+            wake_status = "loaded"
+            wake_detail = "cascade: " + ", ".join(cascade_rooms)
+        else:
+            wake_status, wake_detail = "error", ""
+        items.append(_item("wake word", wake_status, wake_detail))
         stt = getattr(orch, "stt", None)
         items.append(_item(
             "stt",
