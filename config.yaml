@@ -72,6 +72,10 @@ voice:
     # New voices are picked up on Jarvis restart.
     voices:
       glados: C:/Users/Cole/CodeStuff/Misc/piper/voices/vits-piper-en_US-glados-high/en_US-glados-high.onnx
+      # dnhkng/GLaDOS project's freshly-trained GLaDOS voice (Piper VITS,
+      # ~61 MB). A/B it against `glados` above. Sidecar must be named
+      # glados.onnx.json (piper.exe's <model>.onnx.json convention).
+      glados_dnhkng: C:/Users/Cole/CodeStuff/Misc/piper/voices/glados-dnhkng/glados.onnx
       wheatley: C:/Users/Cole/CodeStuff/Misc/piper/voices/wheatley1/wheatley1.onnx
       cori: C:/Users/Cole/CodeStuff/Misc/piper/voices/cori/high/en_GB-cori-high.onnx
       cori_medium: C:/Users/Cole/CodeStuff/Misc/piper/voices/cori/medium/en_GB-cori-medium.onnx
