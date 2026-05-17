@@ -2948,6 +2948,94 @@ main {
   color: var(--green, #6ce6a6);
 }
 
+/* ── Anomalies (§25 — behavioral anomaly review queue) ────────────────── */
+
+.anomalies-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 340px;
+  overflow-y: auto;
+}
+.anomaly-threshold {
+  font-weight: 400;
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+.anomaly-row {
+  display: flex;
+  gap: 8px;
+  padding: 5px 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  align-items: flex-start;
+}
+.anomaly-score {
+  flex-shrink: 0;
+  min-width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  font-family: var(--mono, "Space Mono", monospace);
+  font-weight: 700;
+  font-size: 13px;
+  color: #1a1208;
+  background: var(--orange, #e8a445);
+}
+.anomaly-score.anomaly-score-high {
+  background: var(--red, #e57373);
+}
+.anomaly-body {
+  flex: 1;
+  min-width: 0;
+}
+.anomaly-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+.anomaly-name {
+  font-weight: 700;
+  color: var(--text);
+}
+.anomaly-where {
+  font-family: var(--mono, "Space Mono", monospace);
+  font-size: 11px;
+  color: var(--blue-dim);
+}
+.anomaly-ago {
+  margin-left: auto;
+  opacity: 0.6;
+  font-size: 10px;
+}
+.anomaly-components {
+  font-family: var(--mono, "Space Mono", monospace);
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.anomaly-fp {
+  font-size: 10px;
+  color: var(--green, #6ce6a6);
+  margin-top: 2px;
+}
+.anomaly-dismiss {
+  flex-shrink: 0;
+  align-self: center;
+  font-size: 10px;
+  padding: 3px 7px;
+}
+.anomaly-invalidated {
+  opacity: 0.5;
+}
+.anomaly-invalidated .anomaly-score {
+  background: var(--text-dim);
+  color: #0a0b10;
+}
+
 /* ── Interactions timeline (§24.6) ────────────────────────────────────── */
 
 .interactions-list {

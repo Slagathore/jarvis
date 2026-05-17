@@ -3035,6 +3035,69 @@ class DashboardServer:
                 "available": True,
             })
 
+        @app.get("/api/world_model/anomalies")
+        async def world_model_anomalies(limit: int = 50):
+            """§25 anomaly review queue — recent fired anomalies, newest
+            first. `available` is False when the §25 subsystem never
+            started (world model disabled). The stored `components` /
+            `event` columns are JSON text; decode them here so the
+            frontend gets ready-to-render objects."""
+            orch = self._orchestrator
+            scorer = getattr(orch, "anomaly_scorer", None) if orch else None
+            if scorer is None:
+                return JSONResponse({"anomalies": [], "available": False})
+            try:
+                rows = await scorer.recent_anomalies(
+                    max(1, min(int(limit), 200))
+                )
+            except Exception as e:
+                logger.warning(f"[/api/world_model/anomalies] {e}")
+                rows = []
+
+            def _decode(row: dict) -> dict:
+                out = dict(row)
+                for field in ("components", "event"):
+                    raw = out.get(field)
+                    if isinstance(raw, str) and raw:
+                        try:
+                            out[field] = json.loads(raw)
+                        except Exception:
+                            out[field] = {}
+                    elif raw is None:
+                        out[field] = {}
+                out["invalidated"] = bool(out.get("invalidated"))
+                return out
+
+            return JSONResponse({
+                "anomalies": [_decode(r) for r in rows],
+                "threshold": round(float(getattr(scorer, "threshold", 0.0)), 2),
+                "available": True,
+            })
+
+        @app.post("/api/world_model/anomalies/{anomaly_id}/invalidate")
+        async def world_model_anomaly_invalidate(
+            anomaly_id: str, request: Request,
+        ):
+            """Mark an anomaly 'not actually unusual'. Feeds AnomalyScorer
+            auto_tune's false-positive rate so the threshold self-corrects."""
+            orch = self._orchestrator
+            scorer = getattr(orch, "anomaly_scorer", None) if orch else None
+            if scorer is None:
+                raise HTTPException(
+                    status_code=503, detail="anomaly subsystem unavailable"
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            reason = str((body or {}).get("reason", "")).strip()
+            ok = await scorer.invalidate(anomaly_id, reason)
+            if not ok:
+                raise HTTPException(
+                    status_code=404, detail="anomaly not found"
+                )
+            return JSONResponse({"ok": True, "anomaly_id": anomaly_id})
+
         @app.get("/api/world_model/cluster/known_pets")
         async def cluster_known_pets(species: str = "cat"):
             """List of resident pet display_names for `species`. Used by

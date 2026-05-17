@@ -505,6 +505,18 @@
           </div>
         </div>
 
+        <!-- Anomalies (§25 — AnomalyScorer review queue). Each row is a
+             resident world event that scored unusual against their
+             nightly behavioral profile; "not unusual" feeds auto-tune. -->
+        <div class="card" id="anomalies-card">
+          <div class="card-label">
+            ANOMALIES <span class="anomaly-threshold" id="anomaly-threshold"></span>
+          </div>
+          <div class="anomalies-list" id="anomalies-list">
+            <div class="who-empty">Loading…</div>
+          </div>
+        </div>
+
         <!-- Interactions timeline (§24.6) — narrative card for
              INTERACTED_WITH / PICKED_UP / PLACED_DOWN / HANDED_OFF
              events. Filtered subset of WORLD EVENTS, with thumbnail

@@ -4071,6 +4071,122 @@ loadWorldEvents();
 // the endpoint reads the indexed event log + decodes JSON, no I/O fanout.
 safeInterval(loadWorldEvents, 5000);
 
+// ── Anomalies (§25 — behavioral anomaly review queue) ─────────────────────
+// AnomalyScorer fires world.anomaly when a resident's world event scores
+// unusual against their nightly behavioral profile. This card is the review
+// queue: "not unusual" POSTs an invalidate, which feeds auto_tune's
+// false-positive rate so the score threshold self-corrects over time.
+
+function renderAnomalyRow(a) {
+  const div = document.createElement("div");
+  div.className = "anomaly-row" + (a.invalidated ? " anomaly-invalidated" : "");
+  const score = Number(a.score || 0);
+  const ev = a.event || {};
+  const comps = a.components || {};
+  // Components are per-signal sub-scores; show the ones that contributed,
+  // strongest first, as "room_at_time 6.5 · time_of_day 4.0".
+  const compStr =
+    Object.entries(comps)
+      .filter(([, v]) => Number(v) > 0)
+      .sort((x, y) => Number(y[1]) - Number(x[1]))
+      .map(([k, v]) => `${escapeHtml(k)} ${Number(v).toFixed(1)}`)
+      .join(" · ") || "—";
+  const where = [ev.event_type, ev.room]
+    .filter(Boolean)
+    .map(escapeHtml)
+    .join(" · ");
+  const ago = formatRelativeTs(a.ts);
+  const scoreClass = score >= 8 ? " anomaly-score-high" : "";
+  div.innerHTML = `
+    <div class="anomaly-score${scoreClass}" title="anomaly score 0–10">${score.toFixed(1)}</div>
+    <div class="anomaly-body">
+      <div class="anomaly-line">
+        <span class="anomaly-name">${escapeHtml(a.entity_name || "?")}</span>
+        ${where ? `<span class="anomaly-where">${where}</span>` : ""}
+        <span class="anomaly-ago">${escapeHtml(ago)}</span>
+      </div>
+      <div class="anomaly-components">${compStr}</div>
+      ${
+        a.invalidated
+          ? `<div class="anomaly-fp">marked not unusual${
+              a.invalidated_reason
+                ? ": " + escapeHtml(a.invalidated_reason)
+                : ""
+            }</div>`
+          : ""
+      }
+    </div>
+    ${
+      a.invalidated
+        ? ""
+        : `<button class="anomaly-dismiss dev-btn">not unusual</button>`
+    }
+  `;
+  const btn = div.querySelector(".anomaly-dismiss");
+  if (btn) {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.textContent = "…";
+      try {
+        const res = await fetch(
+          `/api/world_model/anomalies/${encodeURIComponent(a.id)}/invalidate`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reason: "dashboard review" }),
+          },
+        );
+        if (res.ok) {
+          loadAnomalies();
+        } else {
+          btn.disabled = false;
+          btn.textContent = "not unusual";
+        }
+      } catch (e) {
+        console.warn("[anomaly invalidate] failed:", e);
+        btn.disabled = false;
+        btn.textContent = "not unusual";
+      }
+    });
+  }
+  return div;
+}
+
+async function loadAnomalies() {
+  try {
+    const res = await fetch("/api/world_model/anomalies?limit=40");
+    if (!res.ok) return;
+    const body = await res.json();
+    const list = document.getElementById("anomalies-list");
+    if (!list) return;
+    const thresholdEl = document.getElementById("anomaly-threshold");
+    if (!body.available) {
+      list.innerHTML =
+        '<div class="who-empty">Anomaly scoring unavailable.</div>';
+      if (thresholdEl) thresholdEl.textContent = "";
+      return;
+    }
+    if (thresholdEl) {
+      thresholdEl.textContent =
+        body.threshold != null ? `· fires above ${body.threshold}` : "";
+    }
+    const anomalies = Array.isArray(body.anomalies) ? body.anomalies : [];
+    if (anomalies.length === 0) {
+      list.innerHTML =
+        '<div class="who-empty">No anomalies — behavior looks normal.</div>';
+      return;
+    }
+    list.innerHTML = "";
+    anomalies.forEach((a) => list.appendChild(renderAnomalyRow(a)));
+  } catch (err) {
+    console.warn("[loadAnomalies] failed:", err);
+  }
+}
+loadAnomalies();
+// 15s cadence — anomalies are rare (per-entity 10-min cooldown), so a
+// slow poll keeps the review queue fresh without busy-work.
+safeInterval(loadAnomalies, 15000);
+
 // ── Interactions timeline (§24.6) ─────────────────────────────────────────
 // Pre-filtered tail of INTERACTED_WITH / PICKED_UP / PLACED_DOWN / HANDED_OFF
 // events. The verb-template + thumbnail makes each row read like a sentence
