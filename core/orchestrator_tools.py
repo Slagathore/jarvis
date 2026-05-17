@@ -700,6 +700,13 @@ class ToolsMixin(OrchestratorMixin):
         if self.world_query_tools is not None:
             tools.extend(self._WORLD_TOOLS)
             handlers.update(self._world_tool_handlers())
+        # B4 — MCP: tools discovered from configured MCP servers, namespaced
+        # mcp__<server>__<tool>. Empty unless the gateway connected.
+        mcp_gateway = getattr(self, "mcp_gateway", None)
+        if mcp_gateway is not None:
+            mcp_tools, mcp_handlers = mcp_gateway.tool_registry()
+            tools.extend(mcp_tools)
+            handlers.update(mcp_handlers)
         return tools, handlers
 
     # ── World Model query tools (Phase 3.2) ─────────────────────────────────

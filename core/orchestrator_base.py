@@ -99,6 +99,7 @@ class OrchestratorMixin:
     notifications: Any
     object_detector: Any
     observation_builder: Any
+    mcp_gateway: Any
     pattern_miner: Any
     pc_monitor: Any
     persona: Any

@@ -703,6 +703,18 @@ personality:
     arousal: 0.10
     dominance: 0.85           # very much in control
 
+# ── MCP — Model Context Protocol gateway (audit roadmap B4) ───────────────
+# Connects to external MCP servers and bridges their tools into the LLM
+# tool registry (namespaced mcp__<server>__<tool>). Needs: pip install mcp.
+# Each server is launched over stdio. `servers` is empty by default — add
+# entries to go live, e.g.:
+#   - name: filesystem
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "/some/dir"]
+mcp:
+  enabled: true
+  servers: []
+
 # ── World Model — Phase 4 (§22) bootstrap ─────────────────────────────────
 # These blocks declare the household residents and resident pets so the
 # world model can materialize entity rows for them on every boot.

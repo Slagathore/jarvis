@@ -328,6 +328,9 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         self.nodes: Optional[NodeManager] = None
         self.webhooks: Optional[WebhookManager] = None
         self.integrations = IntegrationRegistry()
+        # B4 — MCP gateway. Bridges configured MCP servers' tools into the
+        # LLM tool registry. Built + started in run(); None until then.
+        self.mcp_gateway: Optional[Any] = None
 
         self.reminders_store: Optional[RemindersStore] = None
         self.reminder_scheduler: Optional[ReminderScheduler] = None
@@ -507,6 +510,11 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
                 await self.personality.stop()
             except Exception as e:
                 logger.debug(f"[Shutdown] personality stop failed: {e}")
+        if self.mcp_gateway is not None:
+            try:
+                await self.mcp_gateway.stop()
+            except Exception as e:
+                logger.debug(f"[Shutdown] mcp_gateway stop failed: {e}")
         if self.interaction_monitor is not None:
             try:
                 await self.interaction_monitor.stop()
@@ -1131,6 +1139,17 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
             dashboard=self.dashboard,
             db=self.db,
         ))
+
+        # B4 — MCP gateway. Connects to configured MCP servers and bridges
+        # their tools into the LLM tool registry. Graceful: no `mcp`
+        # package / no servers → loads disabled, exposes nothing.
+        try:
+            from modules.integrations.mcp_gateway import MCPGateway
+            self.mcp_gateway = MCPGateway(self.config.get("mcp", {}) or {})
+            await self.mcp_gateway.start()
+        except Exception as e:
+            logger.warning(f"[Init] MCP gateway init failed (continuing): {e}")
+            self.mcp_gateway = None
 
         # Register event handlers
         self._register_event_handlers()
