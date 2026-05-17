@@ -10,13 +10,16 @@ No cloud subscriptions. No wake-word-to-server round trips. Everything runs on y
 ## What It Does
 
 - **Wakes on a custom wake word** ("Hey Jarvis") detected locally via [openWakeWord](https://github.com/dscripka/openWakeWord)
+- **Triages ambient speech** through a staged voice cascade (VAD → wake → sound-event → STT → triage) so it can act on things said *near* it, not only after a wake word — every room mic, including the office PC mic, runs the cascade
 - **Transcribes speech** with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CUDA-accelerated)
 - **Understands context** — knows if you're gaming, on a call, asleep, or cooking, and adjusts interruptibility accordingly
 - **Watches rooms via camera** for mess, light state, posture, and presence using YOLOv8 + MediaPipe
 - **Classifies ambient audio** (appliances, music, silence) via TensorFlow/YAMNet
-- **Speaks proactively** when curiosity fires and you're interruptible — "Washer's done." / "Kitchen counter's looking a bit busy."
+- **Learns object names by asking** — when it keeps seeing something it can't name, it asks you what it is, then recognises it by name from then on
+- **Flags behavioral anomalies** — learns each resident's daily routine and surfaces genuinely-unusual events (off-hours activity, an unexpected room) in a dashboard review queue
+- **Speaks proactively** when curiosity fires and you're interruptible — "Washer's done." / "Kitchen counter's looking a bit busy." Speech is local via [Piper](https://github.com/rhasspy/piper) or the more expressive [Kokoro](https://github.com/hexgrad/kokoro) backend, selectable per voice
 - **Responds to direct questions** via Ollama LLM running locally or configured cloud-backed models
-- **Real-time dashboard** at `http://localhost:7070` — activity state, room status, conversation log, appliance tracking, degraded-mode status, wake calibration, and perf/model-call metrics
+- **Real-time dashboard** at `http://localhost:7070` — activity state, room status, conversation log, appliance tracking, behavioral-anomaly review queue, degraded-mode status, wake calibration, and perf/model-call metrics
 - **Multi-room support** via ESP32-CAM nodes over MQTT (optional hardware expansion)
 
 ---
@@ -153,7 +156,7 @@ jarvis/
 │   └── exceptions.py
 │
 ├── modules/
-│   ├── voice/                  # STT (Whisper), TTS (Piper), wake word
+│   ├── voice/                  # STT (Whisper), TTS (Piper + Kokoro), wake word + voice cascade
 │   ├── brain/                  # LLM (Ollama), session memory, prompt builder
 │   ├── context/                # State fusion, interruptibility, curiosity, sleep
 │   ├── activity/               # PC monitor, audio classifier, appliance tracker
@@ -218,6 +221,7 @@ The dashboard now includes:
 - **Perf tab model tracking** — per provider/model daily calls, cloud calls, average latency, timeout rate, and average tool-loop iterations.
 - **Degraded Mode card** — best-effort loaded/degraded/disabled status for wake word, STT, TTS, LLM, MQTT, cameras, identity, world model, open-vocab objects, and registered integrations.
 - **Wake Calibration card** — per-room RMS, peak level, wake score, false-positive count, and suggested sensitivity.
+- **Anomalies card** — behavioral-anomaly review queue (§25): events that scored unusual against a resident's learned routine, each with its score, the triggering event, the per-signal breakdown, and a "not unusual" button that feeds threshold auto-tuning.
 
 ### `modules/context/state_fusion.py`
 
