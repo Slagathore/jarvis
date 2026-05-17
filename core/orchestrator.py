@@ -502,6 +502,11 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
                 await self.anomaly_scorer.stop()
             except Exception as e:
                 logger.debug(f"[Shutdown] anomaly_scorer stop failed: {e}")
+        if getattr(self, "personality", None) is not None:
+            try:
+                await self.personality.stop()
+            except Exception as e:
+                logger.debug(f"[Shutdown] personality stop failed: {e}")
         if self.interaction_monitor is not None:
             try:
                 await self.interaction_monitor.stop()

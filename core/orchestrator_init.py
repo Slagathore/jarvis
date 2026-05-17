@@ -308,11 +308,19 @@ class InitMixin(OrchestratorMixin):
         # PromptBuilder falls back to ollama.system_prompt.
         typed_personas = self.config.get("_typed_personas")
         if typed_personas:
+            # B3 — PAD/HEXACO temperament model. Toggleable in config;
+            # composed into the persona's system prompt by PersonaManager.
+            from modules.brain.personality import PersonalityModel
+            self.personality = PersonalityModel(
+                bus=self.bus, config=self.config.get("personality", {}) or {},
+            )
+            await self.personality.start()
             self.persona = PersonaManager(
                 personas=typed_personas,
                 overlay=self.config.get("_persona_overlay", ""),
                 revert_cfg=self.config["_persona_revert_cfg"],
                 broadcast=self._broadcast,
+                personality=self.personality,
             )
             self.prompts.attach_persona_manager(self.persona)
             logger.info(

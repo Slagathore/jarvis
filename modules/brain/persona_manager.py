@@ -116,12 +116,16 @@ class PersonaManager:
         overlay: str,
         revert_cfg: PersonaRevertCfg,
         broadcast: Optional[Callable[[dict], Awaitable[None]]] = None,
+        personality: Optional[Any] = None,
     ) -> None:
         if "default" not in personas:
             raise PersonaError("personas dict missing required 'default' key")
         self._personas = personas
         self._overlay = (overlay or "").strip()
         self._revert_cfg = revert_cfg
+        # B3 — optional PAD/HEXACO temperament model. Its prompt_fragment()
+        # is appended to the composed system prompt when present.
+        self._personality = personality
         # Optional dashboard broadcast hook — orchestrator wires this so
         # persona transitions push to all open dashboard tabs.
         self._broadcast = broadcast
@@ -176,14 +180,23 @@ class PersonaManager:
         ]
 
     def composed_system_prompt(self) -> str:
-        """Return the full system prompt: overlay + active persona prompt.
-        This is what the prompt builder injects as the system message.
-        Overlay is unconditional — it makes default-Jarvis discreet too.
+        """Return the full system prompt: overlay + active persona prompt
+        + (optional) the PAD/HEXACO temperament cue. This is what the
+        prompt builder injects as the system message. Overlay is
+        unconditional — it makes default-Jarvis discreet too.
         """
-        persona_prompt = self.current().system_prompt.strip()
+        parts: list[str] = []
         if self._overlay:
-            return f"{self._overlay}\n\n{persona_prompt}"
-        return persona_prompt
+            parts.append(self._overlay)
+        parts.append(self.current().system_prompt.strip())
+        if self._personality is not None:
+            try:
+                fragment = self._personality.prompt_fragment()
+            except Exception:
+                fragment = ""
+            if fragment:
+                parts.append(fragment)
+        return "\n\n".join(parts)
 
     # ── Public mutation API ──────────────────────────────────────────────
 

@@ -102,6 +102,7 @@ class OrchestratorMixin:
     pattern_miner: Any
     pc_monitor: Any
     persona: Any
+    personality: Any
     posture: Any
     prompts: Any
     reminder_scheduler: Any
