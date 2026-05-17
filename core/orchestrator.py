@@ -306,6 +306,9 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # §25 Cross-Day Patterns & Anomalies — built alongside WorldModel.
         self.pattern_miner: Optional[PatternMiner] = None
         self.anomaly_scorer: Optional[AnomalyScorer] = None
+        # §23 ask-to-learn object vocabulary — built alongside the
+        # ObservationBuilder (None when the world model is disabled).
+        self.object_vocab: Optional[Any] = None
         self.alarm_dispatcher: Optional[Any] = None
         # LLM-facing query layer — built alongside WorldModel. The four
         # tools (get_entity_status, list_entities_in_room, who_is_home,
@@ -420,6 +423,10 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # as a normal turn) and seeds a new person from the original audio +
         # the active room's camera frame.
         self._pending_live_enroll: Optional[dict] = None
+        # §23 ask-to-learn state machine. When set, the next follow-up
+        # listen is treated as Cole's answer to "what's that object?" —
+        # {key, room} of the ObjectVocabLearner unknown being named.
+        self._pending_object_question: Optional[dict] = None
         self.dashboard: Optional[DashboardServer]
 
         # Dashboard
@@ -889,6 +896,20 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
                         "detection_interval_seconds", {},
                     ) or {}).get("open_vocabulary", 30.0)
                 )
+                # §23 ask-to-learn — ObjectVocabLearner. ObservationBuilder
+                # feeds it un-tracked YOLO objects (note_unknown), the
+                # open-vocab loop merges its learned queries into OWLv2,
+                # and the orchestrator's _object_vocab_loop turns a
+                # recurring unknown into a spoken "what's that?" ask.
+                from modules.vision.object_vocab import ObjectVocabLearner
+                object_vocab_cfg = (
+                    (self.config.get("vision", {}) or {})
+                    .get("object_vocab", {}) or {}
+                )
+                self.object_vocab = ObjectVocabLearner(
+                    object_vocab_cfg,
+                    store_path=str(data_dir / "learned_objects.json"),
+                )
                 # Hand the CLIP encoder to the WorldModel so find_object
                 # can encode text queries against the same model.
                 self.world_model.clip_encoder = clip_encoder
@@ -914,6 +935,7 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
                             "entity_min_confidence", {}
                         ) or {}
                     ),
+                    object_vocab=self.object_vocab,
                 )
                 # Wire the camera-health publisher so WorldModel can
                 # suspend its state machine for offline rooms.
@@ -1190,6 +1212,9 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
             self._supervised("context_loop", self._context_loop),
             self._supervised("vision_loop", self._vision_loop),
             self._supervised("curiosity_loop", self._curiosity_loop),
+            # §23 ask-to-learn — self-returns immediately when the
+            # ObjectVocabLearner is absent/disabled, so always safe to list.
+            self._supervised("object_vocab_loop", self._object_vocab_loop),
             self._supervised("health_broadcast_loop", self._health_broadcast_loop),
             self._supervised("eod_summary_loop", self._eod_summary_loop),
             self._supervised("calendar_alert_loop", self._calendar_alert_loop),

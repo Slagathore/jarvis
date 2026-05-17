@@ -114,6 +114,7 @@ class ObservationBuilder:
         tracked_objects_closed_vocab: Optional[list[str]] = None,
         openvocab_interval_seconds: float = 30.0,
         entity_min_confidence: Optional[dict[str, float]] = None,
+        object_vocab: Optional[Any] = None,
     ) -> None:
         self.bus = bus
         self.cm = camera_manager
@@ -133,6 +134,11 @@ class ObservationBuilder:
         # and no open-vocab "where's my wallet" tracking.
         self.clip_encoder = clip_encoder
         self.openvocab = openvocab_detector
+        # §23 ask-to-learn — ObjectVocabLearner (or None). The else-branch
+        # of _build_for_frame feeds it un-tracked YOLO objects via
+        # note_unknown; _open_vocab_loop_for_room merges its learned
+        # queries into the OWLv2 query set so named objects get tracked.
+        self.object_vocab = object_vocab
         self.tracked_objects_open_vocab: list[dict] = list(
             tracked_objects_open_vocab or []
         )
@@ -222,9 +228,13 @@ class ObservationBuilder:
                 name=f"observation_builder:{room_id}",
             )
             # §23 — additional low-frequency loop per room for OWLv2.
-            # Skipped silently when no detector / no queries declared.
-            if (self.openvocab is not None
-                    and self.tracked_objects_open_vocab):
+            # Runs when there are declared open-vocab queries OR an
+            # ObjectVocabLearner is wired (its learned vocab may be empty
+            # now but fill in as Cole names objects). Skipped silently
+            # when there is no detector at all.
+            if self.openvocab is not None and (
+                    self.tracked_objects_open_vocab
+                    or self.object_vocab is not None):
                 self._openvocab_tasks[room_id] = asyncio.create_task(
                     self._open_vocab_loop_for_room(room_id),
                     name=f"observation_builder_openvocab:{room_id}",
@@ -373,6 +383,22 @@ class ObservationBuilder:
                         frame, det, room, ts, frame_w, frame_h
                     )
                 else:
+                    # A YOLO object that is not a person, a tracked pet,
+                    # or a tracked object — feed it to the §23 ask-to-learn
+                    # vocab learner. should_note() filters always-present
+                    # furniture and low-confidence detections; recurrences
+                    # of the same class+room accumulate toward an ask.
+                    if (self.object_vocab is not None
+                            and self.object_vocab.should_note(
+                                cls, det.confidence)):
+                        self.object_vocab.note_unknown(
+                            key=f"{room}:{cls}", room=room,
+                            descriptor={
+                                "yolo_class": cls,
+                                "bbox": [int(v) for v in det.bbox],
+                                "confidence": float(det.confidence),
+                            },
+                        )
                     continue
                 observations.append(obs)
             except Exception as e:
@@ -772,32 +798,53 @@ class ObservationBuilder:
         Skipped entirely when no queries are declared, when OWLv2
         isn't loaded, or when the camera isn't currently streaming.
         """
-        if (self.openvocab is None
-                or not self.tracked_objects_open_vocab):
+        if self.openvocab is None:
             return
-        queries = [
+        if not self.tracked_objects_open_vocab and self.object_vocab is None:
+            return
+        # Declared (config) open-vocab queries + their friendly names.
+        # The learner's learned queries are merged in PER-ITERATION below
+        # so an object Cole just named via the ask-to-learn flow is
+        # searched on the next tick without a restart.
+        declared_queries = [
             t.get("description") or t.get("name")
             for t in self.tracked_objects_open_vocab
             if t.get("description") or t.get("name")
         ]
-        if not queries:
-            return
-        # Map description → friendly name for the metadata.
-        name_for_query: dict[str, str] = {}
+        declared_names: dict[str, str] = {}
         for t in self.tracked_objects_open_vocab:
             q = t.get("description") or t.get("name")
             n = t.get("name") or q
             if q and n:
-                name_for_query[str(q)] = str(n)
+                declared_names[str(q)] = str(n)
         logger.info(
             f"[ObservationBuilder] open-vocab loop on '{room_id}' — "
-            f"{len(queries)} queries, every {self._openvocab_interval_s:.0f}s"
+            f"{len(declared_queries)} declared "
+            f"quer{'y' if len(declared_queries) == 1 else 'ies'}"
+            f"{' + learned vocab' if self.object_vocab is not None else ''}"
+            f", every {self._openvocab_interval_s:.0f}s"
         )
         while not self._stopped:
             try:
                 await asyncio.sleep(self._openvocab_interval_s)
             except asyncio.CancelledError:
                 return
+            # Rebuild the query set each tick so objects Cole just named
+            # via the ask-to-learn flow are picked up live. name_for_query
+            # maps an OWLv2 query string → its friendly label.
+            queries = list(declared_queries)
+            name_for_query = dict(declared_names)
+            if self.object_vocab is not None:
+                try:
+                    learned = self.object_vocab.learned_query_names()
+                except Exception:
+                    learned = {}
+                for lq, ln in learned.items():
+                    if lq and lq not in name_for_query:
+                        queries.append(lq)
+                        name_for_query[lq] = ln
+            if not queries:
+                continue  # nothing declared and nothing learned yet
             try:
                 frame = await self.cm.capture_frame_async(room_id)
                 if frame is None:

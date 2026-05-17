@@ -1816,6 +1816,18 @@ class LoopsMixin(OrchestratorMixin):
                 )
                 return
 
+            # Object-vocab branch: this reply is Cole answering the §23
+            # "what's that object?" ask — name it or dismiss it.
+            if self._pending_object_question is not None:
+                obj_q = self._pending_object_question
+                self._pending_object_question = None
+                await self._complete_object_vocab_answer(
+                    reply_transcript=transcript,
+                    key=obj_q.get("key", ""),
+                    room=obj_q.get("room") or room,
+                )
+                return
+
             # Normal continuation — same identification + LLM path as a
             # wake-driven turn, just no chime / no wake word required.
             speaker_name: Optional[str] = None
@@ -1944,6 +1956,182 @@ class LoopsMixin(OrchestratorMixin):
         except Exception as e:
             logger.debug(f"[LiveEnroll] name extraction failed: {e}")
             return None
+
+    # ── §23 ask-to-learn object vocabulary ─────────────────────────────────
+
+    async def _object_vocab_loop(self) -> None:
+        """§23 ask-to-learn loop. Periodically checks the ObjectVocabLearner
+        for a recurring un-tracked object worth asking Cole to name, and —
+        when interruptibility allows — speaks the question. Cole's reply is
+        caught by _listen_followup via the _pending_object_question flag."""
+        learner = getattr(self, "object_vocab", None)
+        if learner is None or not getattr(learner, "enabled", False):
+            logger.info("[ObjectVocab] ask loop disabled (no learner)")
+            return
+        poll_s = float(
+            ((self.config.get("vision", {}) or {})
+             .get("object_vocab", {}) or {}).get("ask_poll_seconds", 90)
+        )
+        logger.info(f"[ObjectVocab] ask loop started (poll {poll_s:.0f}s)")
+        while True:
+            await asyncio.sleep(poll_s)
+            try:
+                # Already waiting on an answer — don't stack a second ask.
+                if self._pending_object_question is not None:
+                    continue
+                question = learner.pending_question()
+                if not question:
+                    continue
+                if self._current_state is None:
+                    continue  # no fused state yet — stay quiet
+                # Same ambient-interruptibility gate the curiosity loop uses.
+                if (self.interruptibility is not None
+                        and not self.interruptibility.can_interrupt(
+                            self._current_state, priority="ambient")):
+                    logger.debug(
+                        "[ObjectVocab] ask deferred — interruptibility gate"
+                    )
+                    continue
+                await self._ask_about_unknown_object(question)
+            except Exception as e:
+                logger.error(f"[ObjectVocab] ask loop error: {e}")
+
+    async def _ask_about_unknown_object(self, question: dict) -> None:
+        """Speak a §23 'what's that object?' ask and arm the follow-up
+        listener (via _pending_object_question) to route Cole's reply."""
+        learner = getattr(self, "object_vocab", None)
+        if learner is None:
+            return
+        key = question.get("key", "")
+        room = question.get("room") or self._active_user_room or "office"
+        descriptor = question.get("descriptor") or {}
+        yolo_class = str(descriptor.get("yolo_class") or "object")
+        count = int(question.get("count", 0))
+        # mark_asked first so the loop won't re-pick this one if the speak
+        # path is slow; _pending_object_question routes the reply back.
+        learner.mark_asked(key)
+        self._pending_object_question = {"key": key, "room": room}
+        logger.info(
+            f"[ObjectVocab] asking about '{yolo_class}' in '{room}' "
+            f"(seen {count}x)"
+        )
+        line = await self._compose_in_character(
+            prompt=(
+                f"The vision system keeps seeing an object it labels "
+                f"'{yolo_class}' in the {room} — about {count} times — but "
+                f"it is not in your tracked-objects list. Ask Cole, in one "
+                f"short in-character line, what it actually is. No preamble, "
+                f"no quotes."
+            ),
+            fallback=(
+                f"I keep noticing a {yolo_class} in the {room} — what is "
+                f"that, exactly?"
+            ),
+        )
+        await self._speak(
+            line, room=room, priority="curiosity", expects_response=True,
+        )
+
+    async def _complete_object_vocab_answer(
+        self, reply_transcript: str, key: str, room: str,
+    ) -> None:
+        """Cole answered the §23 'what's that?' ask. Dismiss the unknown
+        if he waved it off, else record the name as a learned object so
+        the open-vocab detector tracks it from now on."""
+        learner = getattr(self, "object_vocab", None)
+        if learner is None:
+            return
+        reply = (reply_transcript or "").strip()
+        low = reply.lower()
+        dismiss_cues = (
+            "nothing", "never mind", "nevermind", "ignore it", "ignore that",
+            "don't track", "dont track", "not important", "no idea",
+            "leave it", "forget it", "skip it", "don't worry",
+        )
+        if not reply or any(cue in low for cue in dismiss_cues):
+            learner.dismiss(key)
+            logger.info(f"[ObjectVocab] dismissed unknown '{key}'")
+            line = await self._compose_in_character(
+                prompt=(
+                    "Cole told you that recurring object is not worth "
+                    "tracking. Acknowledge in one short in-character line."
+                ),
+                fallback="Noted — I'll stop watching that one.",
+            )
+            await self._speak(line, room=room, priority="conversation")
+            return
+        name = await self._extract_object_name_from_reply(reply)
+        if not name:
+            logger.info(f"[ObjectVocab] no object name parsed from {reply!r}")
+            line = await self._compose_in_character(
+                prompt=(
+                    f"You could not make out an object name from Cole's "
+                    f"reply: {reply!r}. Acknowledge briefly — you will ask "
+                    f"again later if you keep seeing it. One short line."
+                ),
+                fallback="Hm, I didn't catch what that was — I'll ask later.",
+            )
+            await self._speak(line, room=room, priority="conversation")
+            return
+        entry = learner.record_answer(key, name)
+        learned_name = (entry or {}).get("name", name)
+        logger.info(f"[ObjectVocab] learned object '{learned_name}'")
+        await self._broadcast({
+            "type": "object_vocab_learned",
+            "name": learned_name,
+            "room": room,
+        })
+        line = await self._compose_in_character(
+            prompt=(
+                f"Cole just told you that recurring object is a "
+                f"'{learned_name}'. You will now track it by name. Give one "
+                f"short in-character line of acknowledgement. No quotes."
+            ),
+            fallback=f"Got it — a {learned_name}. I'll keep track of it now.",
+        )
+        await self._speak(line, room=room, priority="conversation")
+
+    async def _extract_object_name_from_reply(
+        self, reply: str,
+    ) -> Optional[str]:
+        """LLM-extract a short object name from Cole's reply, with a
+        leading-filler-strip heuristic fallback. None when nothing
+        plausible is found."""
+        reply = (reply or "").strip()
+        if not reply:
+            return None
+        if self.llm is not None:
+            try:
+                prompt = (
+                    "Cole was asked what an object is. Extract a short "
+                    "object name (1-3 words, lowercase, singular) from his "
+                    "reply. Respond with ONLY the name — no punctuation, no "
+                    "extra words. If there is no clear object, respond with "
+                    f"the literal word: NONE.\n\nReply: {reply!r}"
+                )
+                resp = await self.llm.chat(
+                    [{"role": "user", "content": prompt}]
+                )
+                candidate = (resp or "").strip().strip(".,;:!?'\"").lower()
+                if (candidate and candidate.upper() != "NONE"
+                        and len(candidate) <= 40
+                        and any(c.isalpha() for c in candidate)):
+                    return " ".join(candidate.split()[:3])
+            except Exception as e:
+                logger.debug(f"[ObjectVocab] name extraction failed: {e}")
+        # Heuristic fallback: strip leading filler / articles / possessives,
+        # then take up to three words.
+        import re as _re
+        cleaned = _re.sub(
+            r"^\s*(it'?s|that'?s|it is|that is|just|probably)\b\s*",
+            "", reply.lower(),
+        )
+        cleaned = _re.sub(
+            r"^\s*(a|an|the|my|your|our|his|her)\b\s*", "", cleaned,
+        ).strip(".,;:!?'\" ")
+        if cleaned and any(c.isalpha() for c in cleaned):
+            return " ".join(cleaned.split()[:3])
+        return None
 
     # ── TTS Helper ─────────────────────────────────────────────────────────
 

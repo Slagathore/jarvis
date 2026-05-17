@@ -58,6 +58,7 @@ class OrchestratorMixin:
     _last_pets_per_room: Any
     _last_wake_audio: Any
     _pending_live_enroll: Any
+    _pending_object_question: Any
     _pending_speaker_enrollment: Any
     _pending_wakes: Any
     _room_speech_until: Any
@@ -100,6 +101,7 @@ class OrchestratorMixin:
     notification_dispatcher: Any
     notifications: Any
     object_detector: Any
+    object_vocab: Any
     observation_builder: Any
     mcp_gateway: Any
     pattern_miner: Any

@@ -465,6 +465,20 @@ vision:
     person: 0.55
     cat: 0.20
     dog: 0.20
+  # §23 ask-to-learn object vocabulary. When the vision loop sees a YOLO
+  # object that is not a person, a tracked pet, or a tracked object, it
+  # counts the sighting; after ask_after_sightings recurrences Jarvis asks
+  # Cole what it is, and the answer becomes an OWLv2 open-vocab query so
+  # the object is recognised from then on. Always-present furniture is
+  # ignored by a built-in default list (add `ignore_classes: [...]` here
+  # to override it). min_confidence is the detection-confidence floor for
+  # counting a sighting; ask_poll_seconds is how often the ask loop checks.
+  object_vocab:
+    enabled: true
+    ask_after_sightings: 3
+    forget_unasked_after_s: 1800
+    min_confidence: 0.45
+    ask_poll_seconds: 90
 anomaly:
   alert_threshold: 6.0
   cooldown_seconds: 600

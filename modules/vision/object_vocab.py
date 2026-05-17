@@ -46,7 +46,17 @@ class ObjectVocabLearner:
         enabled:              master switch (default True)
         ask_after_sightings:  recurrences before an unknown is asked (3)
         forget_unasked_after_s: drop a stale unknown never re-seen (1800)
+        ignore_classes:       YOLO classes never worth an ask (furniture)
+        min_confidence:       detection confidence floor for noting (0.45)
     """
+
+    # Static furniture / fixtures YOLO sees constantly — never worth an
+    # ask-to-learn prompt. Overridable via config.vision.object_vocab.
+    _DEFAULT_IGNORE_CLASSES: frozenset[str] = frozenset({
+        "chair", "couch", "bed", "dining table", "tv", "potted plant",
+        "clock", "sink", "toilet", "refrigerator", "microwave", "oven",
+        "keyboard", "mouse", "vase", "bench", "toaster",
+    })
 
     def __init__(
         self,
@@ -58,11 +68,22 @@ class ObjectVocabLearner:
         self.enabled = bool(cfg.get("enabled", True))
         self._ask_after = int(cfg.get("ask_after_sightings", 3))
         self._forget_after_s = float(cfg.get("forget_unasked_after_s", 1800))
+        # Caller-side "is this worth noting" policy (see should_note): an
+        # ignore list of always-present classes + a confidence floor.
+        ignore = cfg.get("ignore_classes")
+        self._ignore_classes: set[str] = (
+            {str(c) for c in ignore} if ignore is not None
+            else set(self._DEFAULT_IGNORE_CLASSES)
+        )
+        self._min_confidence = float(cfg.get("min_confidence", 0.45))
         self._store_path = Path(store_path)
         # Confirmed vocabulary: [{name, query, room, learned_at, sightings}].
         self._learned: list[dict] = []
         # In-flight unknowns: key -> {count, room, first_ts, last_ts, asked}.
         self._pending: dict[str, dict] = {}
+        # Keys Cole has explicitly dismissed — note_unknown ignores them so
+        # a "don't track that" answer sticks across future sightings.
+        self._dismissed: set[str] = set()
         self._load()
 
     # ── Persistence ──────────────────────────────────────────────────────────
@@ -73,8 +94,11 @@ class ObjectVocabLearner:
         try:
             data = json.loads(self._store_path.read_text(encoding="utf-8"))
             self._learned = list(data.get("learned", []))
+            self._dismissed = {str(k) for k in data.get("dismissed", [])}
             logger.info(
                 f"[ObjectVocab] loaded {len(self._learned)} learned object(s)"
+                + (f", {len(self._dismissed)} dismissed"
+                   if self._dismissed else "")
             )
         except Exception as e:
             logger.warning(f"[ObjectVocab] store load failed: {e}")
@@ -83,11 +107,28 @@ class ObjectVocabLearner:
         try:
             self._store_path.parent.mkdir(parents=True, exist_ok=True)
             self._store_path.write_text(
-                json.dumps({"learned": self._learned}, indent=2),
+                json.dumps(
+                    {"learned": self._learned,
+                     "dismissed": sorted(self._dismissed)},
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
         except Exception as e:
             logger.warning(f"[ObjectVocab] store save failed: {e}")
+
+    # ── Caller-side noting policy ────────────────────────────────────────────
+
+    def should_note(self, yolo_class: str, confidence: float) -> bool:
+        """Gate for note_unknown the vision loop calls per detection.
+        True when a detection is worth counting toward an ask — False for
+        a disabled learner, an ignored (always-present furniture) class,
+        or a detection below the confidence floor."""
+        if not self.enabled:
+            return False
+        if not yolo_class or yolo_class in self._ignore_classes:
+            return False
+        return float(confidence) >= self._min_confidence
 
     # ── Sighting intake ──────────────────────────────────────────────────────
 
@@ -99,6 +140,8 @@ class ObjectVocabLearner:
         cluster id) so recurrences accumulate toward the ask threshold."""
         if not self.enabled or not key:
             return
+        if key in self._dismissed:
+            return  # Cole already said this one is not worth tracking
         now = time.time()
         self._expire_stale(now)
         rec = self._pending.get(key)
@@ -125,12 +168,16 @@ class ObjectVocabLearner:
 
     def pending_question(self) -> Optional[dict]:
         """The next unknown worth asking Cole about, or None. Returns
-        {key, room, count} — the caller turns it into a spoken question."""
+        {key, room, count, descriptor} — the caller turns it into a
+        spoken question (descriptor carries the YOLO class etc.)."""
         if not self.enabled:
             return None
         for key, rec in self._pending.items():
             if not rec["asked"] and rec["count"] >= self._ask_after:
-                return {"key": key, "room": rec["room"], "count": rec["count"]}
+                return {
+                    "key": key, "room": rec["room"], "count": rec["count"],
+                    "descriptor": dict(rec.get("descriptor") or {}),
+                }
         return None
 
     def mark_asked(self, key: str) -> None:
@@ -166,8 +213,13 @@ class ObjectVocabLearner:
         return entry
 
     def dismiss(self, key: str) -> None:
-        """Cole said it is not worth tracking — drop it, do not re-ask."""
+        """Cole said it is not worth tracking — drop it AND remember the
+        dismissal (persisted) so note_unknown won't re-add it on the next
+        sighting and pester him again."""
         self._pending.pop(key, None)
+        if key:
+            self._dismissed.add(key)
+            self._save()
 
     # ── Read-out for the detector ────────────────────────────────────────────
 
@@ -179,6 +231,12 @@ class ObjectVocabLearner:
 
     def learned_names(self) -> list[str]:
         return [e["name"] for e in self._learned if e.get("name")]
+
+    def learned_query_names(self) -> dict[str, str]:
+        """{query: friendly name} for every learned object — lets the
+        open-vocab loop tag an OWLv2 hit with the name Cole gave it."""
+        return {e["query"]: e.get("name", e["query"])
+                for e in self._learned if e.get("query")}
 
     def snapshot(self) -> dict:
         """Dashboard view — learned vocabulary + in-flight unknowns."""
