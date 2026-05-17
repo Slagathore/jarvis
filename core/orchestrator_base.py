@@ -66,6 +66,7 @@ class OrchestratorMixin:
     activity_history: Any
     alarm_dispatcher: Any
     anomaly_detector: Any
+    anomaly_scorer: Any
     appliance_tracker: Any
     audio_classifier: Any
     audio_focus: Any
@@ -98,6 +99,7 @@ class OrchestratorMixin:
     notifications: Any
     object_detector: Any
     observation_builder: Any
+    pattern_miner: Any
     pc_monitor: Any
     persona: Any
     posture: Any

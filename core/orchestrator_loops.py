@@ -1180,6 +1180,20 @@ class LoopsMixin(OrchestratorMixin):
                     )
                 except Exception as e:
                     logger.warning(f"[Maintenance] DB prune failed: {e}")
+
+                # §25 — rebuild resident behavioral profiles, then let the
+                # anomaly scorer auto-tune its threshold against the past
+                # week's false-positive rate.
+                try:
+                    if getattr(self, "pattern_miner", None) is not None:
+                        n = await self.pattern_miner.run_nightly()
+                        logger.info(
+                            f"[Maintenance] PatternMiner rebuilt {n} profile(s)"
+                        )
+                    if getattr(self, "anomaly_scorer", None) is not None:
+                        await self.anomaly_scorer.auto_tune()
+                except Exception as e:
+                    logger.warning(f"[Maintenance] §25 pattern pass failed: {e}")
             except asyncio.CancelledError:
                 break
             except Exception:

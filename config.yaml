@@ -685,6 +685,15 @@ world_model:
   #                   back to true if the belief layer misbehaves.
   belief_resolver:
     shadow: false
+  # §25 Cross-Day Patterns & Anomalies. PatternMiner builds resident
+  # behavioral profiles nightly; AnomalyScorer scores live events.
+  anomaly:
+    anomaly_threshold: 6.0           # 0-10; fires above this (auto-tuned)
+    anomaly_cooldown_seconds: 600    # one alert per resident per 10 min
+    anomaly_min_history_days: 14     # don't score against a thin profile
+    pattern_days_back: 30            # rolling window PatternMiner mines
+    anomaly_auto_tune_fp_high: 0.30  # FP rate above this raises threshold
+    anomaly_auto_tune_fp_low: 0.05   # FP rate below this lowers it
 
 residents:
   - id: cole

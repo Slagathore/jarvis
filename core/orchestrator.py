@@ -133,6 +133,8 @@ from modules.world_model import (
     bootstrap_pets_from_config,
 )
 from modules.world_model.belief import BeliefResolver
+from modules.world_model.patterns import PatternMiner
+from modules.world_model.anomaly import AnomalyScorer
 from modules.vision.scene_analyzer import SceneAnalyzer
 from modules.vision.wyze_cam_control import WyzeCamControl
 from core.room_settings import RoomSettings
@@ -300,6 +302,9 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # ingests vision.observation, maintains hypotheses, persists to the
         # belief_* tables, affects nothing live. None when world model is off.
         self.belief_resolver: Optional[BeliefResolver] = None
+        # §25 Cross-Day Patterns & Anomalies — built alongside WorldModel.
+        self.pattern_miner: Optional[PatternMiner] = None
+        self.anomaly_scorer: Optional[AnomalyScorer] = None
         self.alarm_dispatcher: Optional[Any] = None
         # LLM-facing query layer — built alongside WorldModel. The four
         # tools (get_entity_status, list_entities_in_room, who_is_home,
@@ -492,6 +497,11 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
                 await self.belief_resolver.stop()
             except Exception as e:
                 logger.debug(f"[Shutdown] belief_resolver stop failed: {e}")
+        if self.anomaly_scorer is not None:
+            try:
+                await self.anomaly_scorer.stop()
+            except Exception as e:
+                logger.debug(f"[Shutdown] anomaly_scorer stop failed: {e}")
         if self.interaction_monitor is not None:
             try:
                 await self.interaction_monitor.stop()
@@ -922,6 +932,28 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
                         f"without): {e}"
                     )
                     self.belief_resolver = None
+                # §25 Cross-Day Patterns & Anomalies — PatternMiner builds
+                # nightly behavioral profiles; AnomalyScorer scores live
+                # entity events against them and fires world.anomaly.
+                try:
+                    wm_cfg = self.config.get("world_model", {}) or {}
+                    anomaly_cfg = wm_cfg.get("anomaly", {}) or {}
+                    self.pattern_miner = PatternMiner(
+                        self.world_model,
+                        days_back=int(anomaly_cfg.get("pattern_days_back", 30)),
+                    )
+                    self.anomaly_scorer = AnomalyScorer(
+                        bus=self.bus, world=self.world_model, db=self.db,
+                        config=anomaly_cfg,
+                    )
+                    await self.anomaly_scorer.start()
+                except Exception as e:
+                    logger.warning(
+                        f"[Init] §25 anomaly subsystem init failed "
+                        f"(continuing without): {e}"
+                    )
+                    self.pattern_miner = None
+                    self.anomaly_scorer = None
                 # §29 alarm subsystem — KlaxonLibrary loads per-alarm
                 # audio assets, AlarmAudio fans out via the existing
                 # speaker manager, AlarmStore persists fires/state.
