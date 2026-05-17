@@ -55,9 +55,31 @@ class StubAnomalyScorer:
         return any(r["id"] == anomaly_id for r in self._rows)
 
 
+class StubEntity:
+    """Mimics a WorldEntity for the pattern_profile endpoint."""
+
+    def __init__(self, *, id, name, entity_type="person", is_resident=True,
+                 archived=False, profile=None) -> None:
+        self.id = id
+        self.display_name = name
+        self.entity_type = entity_type
+        self.is_resident = is_resident
+        self.archived_at = "2026-01-01" if archived else None
+        self.metadata = {}
+        if profile is not None:
+            self.metadata["pattern_profile"] = profile
+            self.metadata["pattern_profile_updated_ts"] = "2026-05-17T05:00:00+00:00"
+
+
+class StubWorldModel:
+    def __init__(self, entities: list) -> None:
+        self.entities = {e.id: e for e in entities}
+
+
 class StubOrchestrator:
-    def __init__(self, scorer) -> None:
+    def __init__(self, scorer=None, world_model=None) -> None:
         self.anomaly_scorer = scorer
+        self.world_model = world_model
 
 
 def _row(anomaly_id: str, score: float, invalidated: int = 0) -> dict:
@@ -76,10 +98,10 @@ def _row(anomaly_id: str, score: float, invalidated: int = 0) -> dict:
     }
 
 
-def _client(scorer) -> TestClient:
+def _client(scorer=None, world_model=None) -> TestClient:
     server = DashboardServer(host="127.0.0.1", port=0)
-    if scorer is not None:
-        server._orchestrator = StubOrchestrator(scorer)
+    if scorer is not None or world_model is not None:
+        server._orchestrator = StubOrchestrator(scorer, world_model)
     return TestClient(server.app)
 
 
@@ -150,13 +172,58 @@ def test_invalidate_without_scorer_503() -> None:
     print("PASS: invalidate with no anomaly subsystem -> 503")
 
 
+# ── pattern_profile endpoint (the Routine heatmap data source) ──────────────
+
+
+def test_pattern_profile_no_world_model() -> None:
+    client = _client(scorer=None)  # no orchestrator at all
+    res = client.get("/api/world_model/pattern_profile")
+    assert res.status_code == 200, res.status_code
+    body = res.json()
+    assert body["available"] is False, body
+    assert body["residents"] == [], body
+    print("PASS: pattern_profile -> available:false when no world model")
+
+
+def test_pattern_profile_returns_residents_only() -> None:
+    profile = {"n_events": 1200, "weekly_active_hours": {0: [8, 9, 10]}}
+    wm = StubWorldModel([
+        StubEntity(id="p-cole", name="Cole", profile=profile),
+        StubEntity(id="p-anna", name="Anna", profile=None),       # no profile
+        StubEntity(id="p-guest", name="unknown_person_3",
+                   is_resident=False, profile=profile),           # non-resident
+        StubEntity(id="cat-socks", name="Socks", entity_type="cat",
+                   profile=profile),                              # pet
+        StubEntity(id="p-old", name="Former", archived=True,
+                   profile=profile),                              # archived
+    ])
+    client = _client(scorer=StubAnomalyScorer([]), world_model=wm)
+    res = client.get("/api/world_model/pattern_profile")
+    assert res.status_code == 200, res.status_code
+    body = res.json()
+    assert body["available"] is True, body
+    names = sorted(r["name"] for r in body["residents"])
+    # Only resident, non-archived persons — Anna + Cole. No pet, no guest,
+    # no archived entity.
+    assert names == ["Anna", "Cole"], names
+    assert body["min_history_days"] == 14, body
+    cole = next(r for r in body["residents"] if r["name"] == "Cole")
+    assert cole["profile"]["n_events"] == 1200, cole
+    assert cole["profile_updated"], "expected a rebuilt timestamp"
+    anna = next(r for r in body["residents"] if r["name"] == "Anna")
+    assert anna["profile"] is None, "a resident with no profile -> null"
+    print("PASS: pattern_profile -> resident persons only (no pets/guests/archived)")
+
+
 def main() -> None:
     test_no_scorer_reports_unavailable()
     test_populated_queue_decodes_json_columns()
     test_invalidate_known_anomaly()
     test_invalidate_unknown_anomaly_404()
     test_invalidate_without_scorer_503()
-    print("\nAll §25 anomaly dashboard tests passed.")
+    test_pattern_profile_no_world_model()
+    test_pattern_profile_returns_residents_only()
+    print("\nAll §25 anomaly + routine dashboard tests passed.")
 
 
 if __name__ == "__main__":

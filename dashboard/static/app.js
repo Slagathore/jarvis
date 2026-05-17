@@ -4187,6 +4187,246 @@ loadAnomalies();
 // slow poll keeps the review queue fresh without busy-work.
 safeInterval(loadAnomalies, 15000);
 
+// ── Routine (§25 — PatternMiner behavioral heatmap) ───────────────────────
+// A resident's learned room-by-hour week — the baseline the AnomalyScorer
+// judges against. Cells where a recent anomaly fired are ringed so you can
+// see WHY each scored unusual (it landed in a cold cell). PatternMiner
+// builds profiles in UTC; the grid is shifted to local time so it reads
+// against your actual clock. Resident persons only.
+
+const ROUTINE_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const ROUTINE_ROOM_COLORS = {
+  office: "#5b9bd5",
+  bedroom: "#9b6dd5",
+  kitchen: "#e8a445",
+  living_room: "#6ce6a6",
+  laundry_room: "#d56d9b",
+};
+
+let _routineData = null; // last /pattern_profile response
+let _routineAnomalies = []; // last /anomalies response (heatmap overlay)
+
+function _routineRoomColor(room) {
+  if (ROUTINE_ROOM_COLORS[room]) return ROUTINE_ROOM_COLORS[room];
+  // Stable hue for any room outside the fixed palette.
+  let h = 0;
+  for (let i = 0; i < room.length; i++) {
+    h = (h * 31 + room.charCodeAt(i)) % 360;
+  }
+  return `hsl(${h}, 55%, 62%)`;
+}
+
+function _routineDominant(dist) {
+  // {room: probability} → [room, prob] of the max, or [null, 0].
+  let best = null;
+  let bestP = 0;
+  for (const [room, p] of Object.entries(dist || {})) {
+    if (Number(p) > bestP) {
+      best = room;
+      bestP = Number(p);
+    }
+  }
+  return [best, bestP];
+}
+
+function _routinePeakHourLocal(byWeekday, offsetH) {
+  // byWeekday = {weekday: {hour(UTC): count}} → modal hour, shifted local.
+  const totals = {};
+  for (const perHour of Object.values(byWeekday || {})) {
+    for (const [h, c] of Object.entries(perHour || {})) {
+      totals[h] = (totals[h] || 0) + Number(c);
+    }
+  }
+  let peak = null;
+  let peakC = 0;
+  for (const [h, c] of Object.entries(totals)) {
+    if (c > peakC) {
+      peak = Number(h);
+      peakC = c;
+    }
+  }
+  if (peak == null) return null;
+  return ((peak - offsetH) % 24 + 24) % 24;
+}
+
+function _routineFmtHour(h) {
+  if (h == null) return "—";
+  const ampm = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12} ${ampm}`;
+}
+
+function renderRoutine() {
+  const body = document.getElementById("routine-body");
+  if (!body || !_routineData) return;
+  const sel = document.getElementById("routine-resident");
+  const residents = _routineData.residents || [];
+  if (residents.length === 0) {
+    body.innerHTML = '<div class="who-empty">No resident profiles yet.</div>';
+    return;
+  }
+  const chosen =
+    residents.find((r) => r.id === (sel && sel.value)) || residents[0];
+  const profile = chosen.profile;
+  if (!profile || !profile.n_events) {
+    body.innerHTML =
+      `<div class="who-empty">No routine learned for ` +
+      `${escapeHtml(chosen.name)} yet — PatternMiner builds it nightly ` +
+      `from the world-event log.</div>`;
+    return;
+  }
+  const rbwh = profile.room_by_weekday_hour || {};
+  // UTC→local: getTimezoneOffset() is minutes WEST of UTC (positive in the
+  // Americas) and already accounts for the current DST state.
+  const offsetH = new Date().getTimezoneOffset() / 60;
+
+  // Anomaly overlay: local weekday-hour cells where a recent anomaly fired
+  // for THIS resident (Date getters below are already local time).
+  const hot = new Set();
+  for (const a of _routineAnomalies) {
+    if ((a.entity_name || "") !== chosen.name) continue;
+    const ts = a.event && a.event.ts ? a.event.ts : a.ts;
+    const d = ts ? new Date(ts) : null;
+    if (d && !isNaN(d.getTime())) {
+      hot.add(`${(d.getDay() + 6) % 7}:${d.getHours()}`);
+    }
+  }
+
+  // ── Heatmap grid (local time) ──
+  let grid = '<div class="routine-hours"><span></span>';
+  for (let h = 0; h < 24; h++) {
+    grid += `<span>${h % 6 === 0 ? h : ""}</span>`;
+  }
+  grid += "</div>";
+  const roomsSeen = new Set();
+  for (let lwd = 0; lwd < 7; lwd++) {
+    grid += `<div class="routine-row">` +
+      `<span class="routine-day">${ROUTINE_DAYS[lwd]}</span>`;
+    for (let lh = 0; lh < 24; lh++) {
+      // Local (lwd,lh) → the UTC bucket PatternMiner stored it under.
+      const utcTotal = ((lwd * 24 + lh + offsetH) % 168 + 168) % 168;
+      const uwd = Math.floor(utcTotal / 24);
+      const uh = utcTotal % 24;
+      const byHour = rbwh[uwd] || rbwh[String(uwd)] || {};
+      const dist = byHour[uh] || byHour[String(uh)] || {};
+      const [room, prob] = _routineDominant(dist);
+      let style = "";
+      let title = `${ROUTINE_DAYS[lwd]} ${_routineFmtHour(lh)}`;
+      if (room) {
+        roomsSeen.add(room);
+        style =
+          `background:${_routineRoomColor(room)};` +
+          `opacity:${(0.2 + 0.8 * prob).toFixed(2)}`;
+        title += ` — ${room} ${Math.round(prob * 100)}%`;
+      } else {
+        title += " — no data";
+      }
+      const hotCls = hot.has(`${lwd}:${lh}`) ? " routine-cell-anomaly" : "";
+      grid +=
+        `<span class="routine-cell${hotCls}" style="${style}" ` +
+        `title="${escapeHtml(title)}"></span>`;
+    }
+    grid += "</div>";
+  }
+
+  // ── Legend ──
+  let legend = '<div class="routine-legend">';
+  for (const room of [...roomsSeen].sort()) {
+    legend +=
+      `<span class="routine-legend-item">` +
+      `<span class="routine-legend-swatch" ` +
+      `style="background:${_routineRoomColor(room)}"></span>` +
+      `${escapeHtml(room)}</span>`;
+  }
+  if (hot.size > 0) {
+    legend +=
+      '<span class="routine-legend-item">' +
+      '<span class="routine-legend-swatch routine-cell-anomaly"></span>' +
+      "anomaly</span>";
+  }
+  legend += "</div>";
+
+  // ── Digest ──
+  const arr = _routinePeakHourLocal(profile.arrival_by_weekday, offsetH);
+  const dep = _routinePeakHourLocal(profile.departure_by_weekday, offsetH);
+  const seqs = (profile.morning_routine || {}).most_common_sequences || [];
+  const morning = seqs.length ? seqs[0].sequence.join(" → ") : "—";
+  const cop = Object.entries(profile.co_presence || {}).sort(
+    (a, b) => b[1] - a[1],
+  )[0];
+  const copStr = cop
+    ? `${escapeHtml(cop[0])} (${Math.round(cop[1] * 100)}%)`
+    : "—";
+  const updated = chosen.profile_updated
+    ? formatRelativeTs(chosen.profile_updated)
+    : "—";
+  const digest =
+    '<div class="routine-digest">' +
+    `<div><span class="routine-k">Arrives</span> ${_routineFmtHour(arr)}` +
+    ` &nbsp;·&nbsp; <span class="routine-k">Leaves</span> ` +
+    `${_routineFmtHour(dep)}</div>` +
+    `<div><span class="routine-k">Morning</span> ${escapeHtml(morning)}</div>` +
+    `<div><span class="routine-k">Usually with</span> ${copStr}</div>` +
+    `<div class="routine-meta">${profile.n_events} events / 30 days ` +
+    `· rebuilt ${escapeHtml(updated)} · local time</div>` +
+    "</div>";
+
+  body.innerHTML =
+    `<div class="routine-heatmap">${grid}</div>` + legend + digest;
+}
+
+async function loadRoutine() {
+  try {
+    const [pRes, aRes] = await Promise.all([
+      fetch("/api/world_model/pattern_profile"),
+      fetch("/api/world_model/anomalies?limit=60"),
+    ]);
+    if (!pRes.ok) return;
+    _routineData = await pRes.json();
+    if (aRes.ok) {
+      const ab = await aRes.json();
+      _routineAnomalies = Array.isArray(ab.anomalies) ? ab.anomalies : [];
+    }
+    const sel = document.getElementById("routine-resident");
+    const body = document.getElementById("routine-body");
+    if (!sel || !body) return;
+    if (!_routineData.available) {
+      body.innerHTML =
+        '<div class="who-empty">World model unavailable.</div>';
+      return;
+    }
+    const residents = _routineData.residents || [];
+    // Repopulate the selector; keep the current pick if still present,
+    // else default to the richest profile (most events — i.e. you).
+    const prev = sel.value;
+    sel.innerHTML = residents
+      .map(
+        (r) =>
+          `<option value="${escapeHtml(r.id)}">${escapeHtml(r.name)}</option>`,
+      )
+      .join("");
+    if (residents.some((r) => r.id === prev)) {
+      sel.value = prev;
+    } else {
+      let best = residents[0];
+      for (const r of residents) {
+        const n = (r.profile && r.profile.n_events) || 0;
+        const bn = (best && best.profile && best.profile.n_events) || 0;
+        if (n > bn) best = r;
+      }
+      if (best) sel.value = best.id;
+    }
+    renderRoutine();
+  } catch (err) {
+    console.warn("[loadRoutine] failed:", err);
+  }
+}
+const _routineSel = document.getElementById("routine-resident");
+if (_routineSel) _routineSel.addEventListener("change", renderRoutine);
+loadRoutine();
+// Profiles rebuild nightly + anomalies are rare — a slow refresh is plenty.
+safeInterval(loadRoutine, 300000);
+
 // ── Interactions timeline (§24.6) ─────────────────────────────────────────
 // Pre-filtered tail of INTERACTED_WITH / PICKED_UP / PLACED_DOWN / HANDED_OFF
 // events. The verb-template + thumbnail makes each row read like a sentence

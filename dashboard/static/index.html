@@ -517,6 +517,19 @@
           </div>
         </div>
 
+        <!-- Routine (§25 — PatternMiner behavioral heatmap). The baseline
+             the anomaly scorer judges against: a resident's room-by-hour
+             week, plus an arrival / departure / morning-routine digest. -->
+        <div class="card" id="routine-card">
+          <div class="card-label">
+            ROUTINE
+            <select class="dev-select" id="routine-resident"></select>
+          </div>
+          <div class="routine-body" id="routine-body">
+            <div class="who-empty">Loading…</div>
+          </div>
+        </div>
+
         <!-- Interactions timeline (§24.6) — narrative card for
              INTERACTED_WITH / PICKED_UP / PLACED_DOWN / HANDED_OFF
              events. Filtered subset of WORLD EVENTS, with thumbnail

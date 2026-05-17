@@ -3112,6 +3112,51 @@ class DashboardServer:
                 )
             return JSONResponse({"ok": True, "anomaly_id": anomaly_id})
 
+        @app.get("/api/world_model/pattern_profile")
+        async def world_model_pattern_profile():
+            """§25 behavioral profiles — the routine-heatmap data source.
+            One entry per resident person; `profile` is the histogram
+            bundle PatternMiner writes nightly to entity.metadata, or null
+            when no profile has been built yet. Resident persons only —
+            same scope as the AnomalyScorer that reads these profiles."""
+            orch = self._orchestrator
+            wm = getattr(orch, "world_model", None) if orch else None
+            if wm is None:
+                return JSONResponse({"residents": [], "available": False})
+            residents: list[dict] = []
+            try:
+                for e in wm.entities.values():
+                    if getattr(e, "entity_type", None) != "person":
+                        continue
+                    if not getattr(e, "is_resident", False):
+                        continue
+                    if getattr(e, "archived_at", None) is not None:
+                        continue
+                    meta = getattr(e, "metadata", {}) or {}
+                    profile = meta.get("pattern_profile")
+                    residents.append({
+                        "id": str(getattr(e, "id", "")),
+                        "name": getattr(e, "display_name", "") or "?",
+                        "profile": profile if profile else None,
+                        "profile_updated": meta.get(
+                            "pattern_profile_updated_ts"
+                        ),
+                    })
+            except Exception as exc:
+                logger.warning(
+                    f"[/api/world_model/pattern_profile] {exc}"
+                )
+            residents.sort(key=lambda r: r["name"].lower())
+            scorer = getattr(orch, "anomaly_scorer", None) if orch else None
+            return JSONResponse({
+                "residents": residents,
+                "available": True,
+                "min_history_days": (
+                    int(getattr(scorer, "min_history_days", 14))
+                    if scorer is not None else 14
+                ),
+            })
+
         @app.get("/api/world_model/cluster/known_pets")
         async def cluster_known_pets(species: str = "cat"):
             """List of resident pet display_names for `species`. Used by
