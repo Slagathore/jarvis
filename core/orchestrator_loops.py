@@ -1930,6 +1930,37 @@ class LoopsMixin(OrchestratorMixin):
 
     # ── TTS Helper ─────────────────────────────────────────────────────────
 
+    async def _play_tts(self, text: str, room: str) -> None:
+        """Play TTS on the local speaker. With barge-in enabled the
+        playback runs as a tracked task — a voice.barge_in event can
+        cancel it (the streaming player stops at the next sentence
+        boundary) — and voice.speech_start/end bracket it so the cascade
+        knows Jarvis is talking. Barge-in OFF → a plain awaited call,
+        byte-identical to the pre-barge-in behaviour."""
+        if not self._barge_in_enabled:
+            await self.tts.speak_async(text)
+            return
+        await self.bus.publish("voice.speech_start", {"room": room})
+        task = asyncio.create_task(self.tts.speak_async(text))
+        self._active_speech[room] = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.info(f"[BargeIn] speech in '{room}' cut off by the user")
+        finally:
+            if self._active_speech.get(room) is task:
+                self._active_speech.pop(room, None)
+            await self.bus.publish("voice.speech_end", {"room": room})
+
+    async def _on_barge_in(self, event: dict) -> None:
+        """A voice.barge_in event — the user talked over Jarvis. Cancel
+        the in-flight TTS task for that room (if any)."""
+        room = event.get("room", "")
+        task = self._active_speech.get(room)
+        if task is not None and not task.done():
+            logger.info(f"[BargeIn] cancelling speech in '{room}'")
+            task.cancel()
+
     async def _speak(
         self,
         text: str,
@@ -2057,7 +2088,7 @@ class LoopsMixin(OrchestratorMixin):
                 if self.audio_focus is not None and self.audio_focus.available:
                     await self.audio_focus.duck_async()
                 try:
-                    await self.tts.speak_async(text)
+                    await self._play_tts(text, room)
                 finally:
                     self._audio_io_active = was_audio_io_active
                     if self.audio_focus is not None and self.audio_focus.available:

@@ -78,6 +78,14 @@ class CascadeWakeRunner:
         self._last_score_emit = 0.0
         self._wake_suppress_until = 0.0
         self._running = False
+        # Barge-in: detect the user talking over Jarvis's TTS.
+        barge_cfg = voice_cfg.get("barge_in", {}) or {}
+        self._barge_enabled = bool(barge_cfg.get("enabled", False))
+        self._barge_grace_s = float(barge_cfg.get("grace_ms", 700)) / 1000.0
+        self._jarvis_speaking = False     # set by voice.speech_start for this room
+        self._speaking_since = 0.0
+        self._barged = False              # one barge per speech episode
+        self._barge_subs: list = []
 
     @property
     def room(self) -> str:
@@ -87,8 +95,9 @@ class CascadeWakeRunner:
         """Load the OWW model + VAD and build the cascade. Blocking."""
         from openwakeword.model import Model
 
-        model_name = self._wake_cfg.get("model", "hey_jarvis")
-        self._oww = Model(wakeword_models=[model_name], inference_framework="onnx")
+        from modules.voice.wake_source import wake_model_names
+        models = wake_model_names(self._wake_cfg)
+        self._oww = Model(wakeword_models=models, inference_framework="onnx")
         self._vad.load()
         self._cascade = VoiceCascade(
             vad=self._vad,
@@ -100,7 +109,7 @@ class CascadeWakeRunner:
         )
         logger.info(
             f"[CascadeWake] runner ready for room '{self.room}' "
-            f"(wake='{model_name}', VAD={self._vad.backend})"
+            f"(wake={models}, VAD={self._vad.backend})"
         )
 
     async def run(self) -> None:
@@ -110,6 +119,11 @@ class CascadeWakeRunner:
         sensitivity = float(self._wake_cfg.get("sensitivity", 0.5))
         cooldown = float(self._wake_cfg.get("cooldown_seconds", 2))
         self._running = True
+        if self._barge_enabled:
+            self._barge_subs.append(
+                self._bus.subscribe("voice.speech_start", self._on_speech_start))
+            self._barge_subs.append(
+                self._bus.subscribe("voice.speech_end", self._on_speech_end))
         try:
             async for chunk in self._source.stream():
                 if not self._running:
@@ -127,6 +141,20 @@ class CascadeWakeRunner:
                     segment = self._cascade.feed_chunk(f32)
                     if segment is not None:
                         await self._on_segment(segment)
+                # Barge-in: the user talking over Jarvis's TTS. The VAD
+                # the cascade just updated tells us if speech is active;
+                # past the grace window, that during Jarvis-speech is a
+                # barge. (Echo caveat — see config.voice.barge_in.)
+                if (self._barge_enabled and self._jarvis_speaking
+                        and not self._barged
+                        and self._vad.speech_active
+                        and (time.monotonic() - self._speaking_since
+                             > self._barge_grace_s)):
+                    self._barged = True
+                    logger.info(f"[CascadeWake:{self.room}] barge-in — "
+                                f"user talked over Jarvis")
+                    await self._bus.publish("voice.barge_in",
+                                            {"room": self.room})
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -208,7 +236,24 @@ class CascadeWakeRunner:
             )
         # CascadeAction.DROP / WAKE — nothing to do here.
 
+    async def _on_speech_start(self, payload: dict) -> None:
+        if payload.get("room") == self.room:
+            self._jarvis_speaking = True
+            self._speaking_since = time.monotonic()
+            self._barged = False
+
+    async def _on_speech_end(self, payload: dict) -> None:
+        if payload.get("room") == self.room:
+            self._jarvis_speaking = False
+            self._barged = False
+
     def stop(self) -> None:
         self._running = False
+        for sub in self._barge_subs:
+            try:
+                sub.unsubscribe()
+            except Exception:
+                pass
+        self._barge_subs.clear()
         if self._task is not None and not self._task.done():
             self._task.cancel()

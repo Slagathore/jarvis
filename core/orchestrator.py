@@ -331,6 +331,13 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # B4 — MCP gateway. Bridges configured MCP servers' tools into the
         # LLM tool registry. Built + started in run(); None until then.
         self.mcp_gateway: Optional[Any] = None
+        # Barge-in: per-room in-flight TTS task, so a voice.barge_in event
+        # can cancel it. Enabled flag read once from config.
+        self._active_speech: dict[str, Any] = {}
+        self._barge_in_enabled: bool = bool(
+            (self.config.get("voice", {}).get("barge_in", {}) or {}).get(
+                "enabled", False)
+        )
 
         self.reminders_store: Optional[RemindersStore] = None
         self.reminder_scheduler: Optional[ReminderScheduler] = None
@@ -437,6 +444,7 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # Voice cascade (Option D) outcomes — published by CascadeWakeRunner.
         self.bus.subscribe("voice.triage_escalate", self._on_triage_escalate)
         self.bus.subscribe("voice.sound_event", self._on_cascade_sound_event)
+        self.bus.subscribe("voice.barge_in", self._on_barge_in)
         self.bus.subscribe("appliance.state_changed", self._on_appliance_changed)
         self.bus.subscribe("node.status", self._on_node_status)
         self.bus.subscribe("audio.level", self._on_audio_level)

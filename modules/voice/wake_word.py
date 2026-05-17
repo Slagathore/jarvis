@@ -120,15 +120,16 @@ class WakeWordDetector:
                 "openwakeword not installed. Run: pip install openwakeword"
             ) from e
 
-        model_name = self._cfg.get("model", "hey_jarvis")
-        logger.info(f"[WakeWord] Loading model '{model_name}'...")
+        from modules.voice.wake_source import wake_model_names
+        models = wake_model_names(self._cfg)
+        logger.info(f"[WakeWord] Loading model(s) {models}...")
 
         try:
-            self._model = Model(wakeword_models=[model_name], inference_framework="onnx")
+            self._model = Model(wakeword_models=models, inference_framework="onnx")
             self.loaded = True
-            logger.info(f"[WakeWord] Model '{model_name}' ready")
+            logger.info(f"[WakeWord] Model(s) {models} ready")
         except Exception as e:
-            raise WakeWordError(f"Failed to load wake word model '{model_name}': {e}") from e
+            raise WakeWordError(f"Failed to load wake word model(s) {models}: {e}") from e
 
         # Resolve and log the input device that wake-listening AND the follow-up
         # recording will both use — Cole needs to know if the system grabbed the

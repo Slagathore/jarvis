@@ -43,8 +43,10 @@ class OrchestratorMixin:
     # can both read and assign them without the checker inferring a spurious
     # narrow / Optional type.
     _CALENDAR_TOOLS: Any
+    _active_speech: Any
     _active_user_room: Any
     _active_user_room_ts: Any
+    _barge_in_enabled: Any
     _audio_io_active: Any
     _bg_tasks: Any
     _calendar_alerted: Any

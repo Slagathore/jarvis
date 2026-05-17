@@ -90,6 +90,10 @@ voice:
       voice: af_nicole
       speed: 1.0
   wake_word:
+    # `model` accepts a single openWakeWord name OR a list — a list lets
+    # Jarvis answer to several wake words (§30). Pretrained names include
+    # hey_jarvis, alexa, hey_mycroft, hey_rhasspy. e.g.:
+    #   model: [hey_jarvis, hey_mycroft]
     model: hey_jarvis
     sensitivity: 0.5
     cooldown_seconds: 3
@@ -97,6 +101,15 @@ voice:
   audio_focus:
     enabled: true
     duck_factor: 0.2
+  # Barge-in (talk-over-TTS interruption). EXPERIMENTAL — default off.
+  # When on, sustained user speech while Jarvis is talking cuts the reply
+  # off at the next sentence boundary. Echo caveat: a room mic hears
+  # Jarvis's own voice, so on the Wyze rooms this can self-trigger —
+  # raise min_speech_ms / leave off if it does. Local PC speaker only.
+  barge_in:
+    enabled: false
+    min_speech_ms: 500          # sustained user speech needed to barge
+    grace_ms: 700               # ignore barge in the first N ms of a reply
   recording:
     sample_rate: 16000
     mode: silence

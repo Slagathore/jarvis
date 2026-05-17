@@ -41,6 +41,18 @@ OWW_CHUNK_SIZE = 1280       # 80ms at 16kHz — required by openWakeWord
 OWW_SAMPLE_RATE = 16000
 
 
+def wake_model_names(wake_cfg: dict) -> list[str]:
+    """Resolve config.voice.wake_word.model (a str OR a list) to the list
+    of openWakeWord model names to load (§30 — alternative wake words).
+    A list lets Jarvis answer to several wake words at once; any of the
+    openWakeWord pretrained names work (hey_jarvis, alexa, hey_mycroft …).
+    """
+    m = wake_cfg.get("model", "hey_jarvis")
+    names = [m] if isinstance(m, str) else list(m or [])
+    cleaned = [str(n).strip() for n in names if str(n).strip()]
+    return cleaned or ["hey_jarvis"]
+
+
 @runtime_checkable
 class WakeSource(Protocol):
     """A producer of 16kHz mono int16 audio chunks for one room.
@@ -101,10 +113,10 @@ class MicWakeRunner:
             raise RuntimeError(
                 "openwakeword not installed — multi-room wake disabled"
             ) from e
-        model_name = self._cfg.get("model", "hey_jarvis")
-        self._model = Model(wakeword_models=[model_name], inference_framework="onnx")
+        models = wake_model_names(self._cfg)
+        self._model = Model(wakeword_models=models, inference_framework="onnx")
         logger.info(
-            f"[WakeSource] Loaded OWW model '{model_name}' for room '{self.room}'"
+            f"[WakeSource] Loaded OWW model(s) {models} for room '{self.room}'"
         )
 
     async def run(self) -> None:
