@@ -116,6 +116,10 @@ class MemoryStore:
         # blob deserialization on every call. Rebuilt on add/delete.
         self._cache: list[tuple[int, np.ndarray]] = []
         self._cache_loaded: bool = False
+        # consolidate(): a new fact whose closest existing memory scores
+        # above this gate is checked for ADD/UPDATE/NOOP rather than blindly
+        # appended (the Mem0 "smart write" behavior).
+        self._consolidate_gate: float = 0.55
 
     @property
     def is_loaded(self) -> bool:
@@ -263,6 +267,80 @@ class MemoryStore:
             except Exception:
                 pass
         return True
+
+    # ── Consolidation (Mem0 "smart write") ─────────────────────────────────
+
+    async def consolidate(
+        self,
+        kind: str,
+        content: str,
+        subject: Optional[str] = None,
+        importance: float = 0.5,
+        source_event_id: Optional[int] = None,
+        source_kind: Optional[str] = None,
+    ) -> Optional[int]:
+        """Store a new fact, but first check whether it duplicates or
+        supersedes an existing memory — ADD / UPDATE / NOOP — so the store
+        does not accumulate near-identical or stale-contradicted memories.
+        This is the Mem0-style smart write; plain add() still appends
+        unconditionally for callers that want that. Returns the memory id
+        touched (new or updated), or None."""
+        content = (content or "").strip()
+        if not content:
+            return None
+        similar = await self.retrieve(content, k=1)
+        candidate = similar[0] if similar else None
+        if (candidate is None
+                or candidate.get("score", 0.0) < self._consolidate_gate):
+            # Nothing close enough — genuinely new.
+            return await self.add(kind, content, subject, importance,
+                                  source_event_id, source_kind)
+        decision = await self._consolidation_decision(content, candidate)
+        cid = int(candidate["id"])
+        if decision == "NOOP":
+            logger.debug(f"[MemoryV2] consolidate NOOP — '{content[:60]}' "
+                         f"~ existing #{cid}")
+            return cid
+        if decision == "UPDATE":
+            await self.update(
+                cid, content=content,
+                importance=max(importance,
+                               float(candidate.get("importance", 0.5))))
+            logger.info(f"[MemoryV2] consolidate UPDATE #{cid}: {content[:60]}")
+            return cid
+        return await self.add(kind, content, subject, importance,
+                              source_event_id, source_kind)
+
+    async def _consolidation_decision(
+        self, new_content: str, existing: dict
+    ) -> str:
+        """Decide ADD / UPDATE / NOOP for a new fact vs a similar one.
+        With no LLM, a very close embedding match is treated as a dup."""
+        if self._llm is None:
+            return "NOOP" if existing.get("score", 0.0) >= 0.75 else "ADD"
+        prompt = (
+            "A home assistant is storing a new fact about its user and "
+            "found the most similar fact already in memory.\n\n"
+            f"NEW fact:      {new_content!r}\n"
+            f"EXISTING fact: {existing.get('content', '')!r}\n\n"
+            "Reply with ONE word only:\n"
+            "  NOOP   - the new fact adds nothing over the existing one\n"
+            "  UPDATE - the new fact supersedes / corrects / refines it\n"
+            "  ADD    - the new fact is genuinely separate information"
+        )
+        try:
+            raw = await self._llm.chat([{"role": "user", "content": prompt}])
+        except Exception:
+            return "ADD"
+        token = (raw or "").strip().upper()
+        for decision in ("NOOP", "UPDATE", "ADD"):
+            if decision in token:
+                return decision
+        return "ADD"
+
+    async def search(self, query: str, limit: int = 8) -> list[dict]:
+        """Mem0-standard alias for retrieve() — semantic recall by query."""
+        return await self.retrieve(query, k=limit)
 
     async def delete(self, memory_id: int) -> bool:
         try:
@@ -436,7 +514,9 @@ class MemoryStore:
                 importance = max(0.0, min(1.0, float(item.get("importance", 0.5))))
             except (TypeError, ValueError):
                 importance = 0.5
-            mid = await self.add(
+            # Route through consolidate() — a turn often restates known
+            # facts; this UPDATEs or NOOPs them instead of piling up dups.
+            mid = await self.consolidate(
                 kind=kind, content=content, subject=subject,
                 importance=importance,
                 source_event_id=source_event_id,
