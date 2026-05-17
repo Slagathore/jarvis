@@ -34,6 +34,16 @@ from modules.world_model.pets import (
 from modules.world_model.store import WorldStore
 from modules.world_model.types import EntityState, Observation, WorldEntity
 from modules.world_model.world_model import WorldModel
+import modules.world_model.world_model as world_model_module
+
+# These synthetic tests use their inline landmark geometry. Point the
+# polygon-override path at a file that does not exist so a machine's
+# real data/polygon_overrides.json (saved by the dashboard polygon
+# viewer) can't silently replace the litterbox landmark and break the
+# landmark-dwell test. Mirrors test_world_model_synthetic.py.
+world_model_module._POLYGON_OVERRIDES_PATH = Path(
+    "data/__synthetic_tests_no_polygon_overrides__.json"
+)
 
 
 # ── In-memory db facade ─────────────────────────────────────────────────────
