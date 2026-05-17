@@ -121,6 +121,14 @@ voice:
     device: cuda               # cuda | cpu — YAMNet inference device
     threshold: 0.30            # min YAMNet class score to count as a hit
     top_k: 5
+    clap_escalate_below: 0.35  # YAMNet top score under this -> ask CLAP
+  clap:
+    # Open-vocab audio fallback. Runs only when YAMNet is confidently
+    # lost. Heavy (~600 MB download on first boot) — disable to skip it.
+    enabled: true
+    model: laion/clap-htsat-unfused
+    device: cuda               # cuda | cpu
+    min_score: 0.40            # softmax prob a CLAP match must clear
   triage:
     enabled: true
     model: qwen3.5:0.8b        # small resident triage model

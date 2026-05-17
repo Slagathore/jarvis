@@ -73,6 +73,7 @@ class OrchestratorMixin:
     bus: Any
     calendar: Any
     cameras: Any
+    clap_classifier: Any
     computer: Any
     config: Any
     curiosity: Any

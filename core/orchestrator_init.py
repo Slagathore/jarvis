@@ -186,6 +186,7 @@ class InitMixin(OrchestratorMixin):
         )
         self.sound_event_classifier = None
         self.triage_gate = None
+        self.clap_classifier = None
         if cascade_enabled:
             from modules.brain.triage_gate import TriageGate
             from modules.voice.sound_events import SoundEventClassifier
@@ -194,6 +195,16 @@ class InitMixin(OrchestratorMixin):
             )
             await asyncio.to_thread(self.sound_event_classifier.load)
             self.triage_gate = TriageGate(voice_cfg.get("triage", {}) or {})
+            # CLAP — the open-vocab fallback YAMNet escalates to when it
+            # is confidently lost. Heavy (~600 MB), so config-gated.
+            clap_cfg = voice_cfg.get("clap", {}) or {}
+            if clap_cfg.get("enabled", True):
+                from modules.voice.clap_classifier import ClapClassifier
+                self.clap_classifier = ClapClassifier(clap_cfg)
+                await asyncio.to_thread(self.clap_classifier.load)
+                if (self.clap_classifier.loaded
+                        and self.sound_event_classifier is not None):
+                    self.sound_event_classifier.attach_clap(self.clap_classifier)
             logger.info("[Init] Voice cascade enabled — components ready")
 
         # Multi-room wake registry — empty today, populated below from

@@ -37,7 +37,6 @@ Variables:
 """
 
 import asyncio
-from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -106,46 +105,21 @@ class AudioClassifier:
         await asyncio.to_thread(self._load_sync)
 
     def _load_sync(self) -> None:
-        """Synchronous model load. Runs in thread pool."""
+        """Synchronous model load. Runs in thread pool.
+
+        Uses the shared YAMNet loader so the model is loaded exactly once
+        per process — SoundEventClassifier (cascade Stage 2b) shares the
+        same instance instead of loading a second copy.
+        """
         try:
-            import tensorflow as tf
-            import tensorflow_hub as hub
-
-            logger.info("[AudioClassifier] Loading YAMNet from TensorFlow Hub...")
-            self._model = hub.load(YAMNET_MODEL_URL)
-            model = self._model
-            if model is None:
-                logger.error("[AudioClassifier] YAMNet returned no model object")
+            from modules.voice.yamnet_loader import load_yamnet
+            self._model, self._class_names = load_yamnet()
+            if self._model is None:
+                logger.error("[AudioClassifier] shared YAMNet unavailable")
                 return
-
-            # Load class names from local file or from hub
-            labels_path = Path("data/yamnet_labels.csv")
-            if labels_path.exists():
-                with open(labels_path, "r") as f:
-                    self._class_names = [
-                        line.strip().split(",")[2].strip('"')
-                        for line in f.readlines()[1:]  # skip header
-                    ]
-            else:
-                # Fallback: get class names from model asset
-                logger.warning(
-                    "[AudioClassifier] yamnet_labels.csv not found, "
-                    "using model-embedded class names"
-                )
-                class_map_path = model.class_map_path().numpy().decode("utf-8")
-                with tf.io.gfile.GFile(class_map_path) as f:
-                    self._class_names = [
-                        line.strip().split(",")[2].strip('"')
-                        for line in f.readlines()[1:]
-                    ]
-
             logger.info(
-                f"[AudioClassifier] YAMNet loaded — {len(self._class_names)} classes"
-            )
-        except ImportError:
-            logger.error(
-                "[AudioClassifier] tensorflow/tensorflow_hub not installed — "
-                "audio classification disabled"
+                f"[AudioClassifier] YAMNet ready (shared) — "
+                f"{len(self._class_names)} classes"
             )
         except Exception as e:
             logger.error(f"[AudioClassifier] Load failed: {e}")

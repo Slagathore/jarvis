@@ -25,14 +25,12 @@ Classes: SoundEventClassifier
 from __future__ import annotations
 
 import asyncio
-import csv
 from typing import Any, Optional
 
 import numpy as np
 from loguru import logger
 
 YAMNET_SAMPLE_RATE = 16000
-_YAMNET_HANDLE = "https://tfhub.dev/google/yamnet/1"
 
 # Jarvis-meaningful event → AudioSet display-name substrings (lowercased).
 # A category fires if ANY of its substrings matches a class scoring above
@@ -51,6 +49,29 @@ _DEFAULT_WATCHLIST: dict[str, list[str]] = {
     "knock":       ["knock", "doorbell", "ding-dong"],
 }
 
+# Natural-language prompts for the CLAP open-vocab fallback, one per
+# watched category. CLAP scores a clip against these (free text — no
+# retraining), so a sound outside YAMNet's 521 classes can still be
+# recognised.
+_CLAP_CATEGORY_PROMPTS: dict[str, str] = {
+    "fire_alarm":  "a fire alarm or smoke detector alarm sounding",
+    "alarm":       "an alarm, siren, or loud electronic buzzer",
+    "glass_break": "glass shattering or a window breaking",
+    "baby_cry":    "a baby or young child crying",
+    "scream":      "a person screaming or yelling in distress",
+    "dog":         "a dog barking or howling",
+    "knock":       "knocking on a door or a doorbell ringing",
+}
+
+# Neutral anchors — if CLAP picks one of these over every category
+# prompt, the sound is genuinely nothing Jarvis needs to act on.
+_CLAP_ANCHORS: list[str] = [
+    "ordinary quiet household background noise",
+    "people talking in normal conversation",
+    "music or television playing",
+    "silence",
+]
+
 
 class SoundEventClassifier:
     """AudioSet sound-event classifier for cascade Stage 2b.
@@ -61,6 +82,8 @@ class SoundEventClassifier:
         threshold:  float — min class score to count as a hit (0.30)
         watchlist:  dict — overrides _DEFAULT_WATCHLIST entirely if given
         top_k:      int — how many raw classes classify() returns (5)
+        clap_escalate_below: float — when YAMNet's top score is under this
+                    and nothing watched fired, escalate to CLAP (0.35)
     """
 
     def __init__(self, config: Optional[dict] = None) -> None:
@@ -69,62 +92,48 @@ class SoundEventClassifier:
         self._device = str(cfg.get("device", "cuda")).lower()
         self._threshold = float(cfg.get("threshold", 0.30))
         self._top_k = int(cfg.get("top_k", 5))
+        self._clap_escalate_below = float(cfg.get("clap_escalate_below", 0.35))
         self._watchlist: dict[str, list[str]] = {
             k: [s.lower() for s in v]
             for k, v in (cfg.get("watchlist") or _DEFAULT_WATCHLIST).items()
         }
         self._model: Any = None
         self._class_names: list[str] = []
+        self._clap: Any = None          # open-vocab fallback, attached later
         self.loaded = False
+
+    def attach_clap(self, clap: Any) -> None:
+        """Wire in a ClapClassifier as the open-vocab fallback. When
+        YAMNet is confidently lost (no watched hit + a low top score),
+        detect_events() asks CLAP for a free-text second opinion."""
+        self._clap = clap
 
     # ── Loading ──────────────────────────────────────────────────────────────
 
     def load(self) -> None:
-        """Load YAMNet (CPU-only). Blocking — call once at startup.
-        Never raises: on failure the classifier reports loaded=False and
-        detect_events() simply returns nothing."""
+        """Acquire the shared YAMNet model. Blocking — call once at
+        startup. Never raises: on failure loaded=False and detect_events()
+        returns nothing. The model is shared with AudioClassifier via
+        yamnet_loader so YAMNet is loaded exactly once per process."""
         if not self.enabled:
             logger.info("[SoundEvents] disabled by config")
             return
         try:
-            import tensorflow as tf
-            import tensorflow_hub as hub
-            if self._device == "cpu":
-                # Force YAMNet off the GPU so it cannot contend with the
-                # YOLO / Whisper torch stack for VRAM.
-                try:
-                    tf.config.set_visible_devices([], "GPU")
-                except Exception:
-                    pass
-            gpus = tf.config.list_physical_devices("GPU")
-            self._model = hub.load(_YAMNET_HANDLE)
-            self._class_names = self._load_class_names()
-            self.loaded = bool(self._class_names)
+            from modules.voice.yamnet_loader import load_yamnet
+            self._model, self._class_names = load_yamnet(device=self._device)
+            self.loaded = self._model is not None and bool(self._class_names)
             if self.loaded:
-                on_gpu = bool(gpus) and self._device != "cpu"
                 logger.info(
-                    f"[SoundEvents] YAMNet ready on "
-                    f"{'GPU' if on_gpu else 'CPU'} "
+                    f"[SoundEvents] ready "
                     f"({len(self._class_names)} classes, "
                     f"{len(self._watchlist)} watched categories)"
                 )
+            else:
+                logger.warning("[SoundEvents] shared YAMNet unavailable "
+                                "— stage disabled")
         except Exception as e:
             logger.warning(f"[SoundEvents] load failed ({e}) — stage disabled")
             self.loaded = False
-
-    def _load_class_names(self) -> list[str]:
-        """YAMNet ships a CSV (index, mid, display_name) at class_map_path()."""
-        try:
-            import tensorflow as tf
-            path = self._model.class_map_path().numpy().decode("utf-8")
-            names: list[str] = []
-            with tf.io.gfile.GFile(path) as f:
-                for row in csv.DictReader(f):
-                    names.append(row["display_name"])
-            return names
-        except Exception as e:
-            logger.warning(f"[SoundEvents] class map load failed: {e}")
-            return []
 
     # ── Classification ───────────────────────────────────────────────────────
 
@@ -147,22 +156,63 @@ class SoundEventClassifier:
 
     def detect_events(self, audio: np.ndarray) -> list[dict]:
         """Classify, then report any watched category that fired.
-        Returns [{category, class_name, score}], strongest first."""
+        Returns [{category, class_name, score, source}], strongest first.
+
+        If YAMNet finds nothing watched AND its own top score is low
+        (it is confidently lost), escalate to the open-vocab CLAP
+        fallback for a free-text second opinion."""
+        raw = self.classify(audio)
         hits: list[dict] = []
-        for class_name, score in self.classify(audio):
+        for class_name, score in raw:
             if score < self._threshold:
                 continue
             low = class_name.lower()
             for category, needles in self._watchlist.items():
                 if any(n in low for n in needles):
                     hits.append({
-                        "category": category,
-                        "class_name": class_name,
-                        "score": round(score, 4),
+                        "category": category, "class_name": class_name,
+                        "score": round(score, 4), "source": "yamnet",
                     })
                     break
-        hits.sort(key=lambda h: h["score"], reverse=True)
+        if hits:
+            hits.sort(key=lambda h: h["score"], reverse=True)
+            return hits
+
+        # Nothing watched fired. If YAMNet was also UNCERTAIN (low top
+        # score) the sound is outside its 521-class vocabulary — ask CLAP.
+        yamnet_top = raw[0][1] if raw else 0.0
+        if (self._clap is not None and getattr(self._clap, "loaded", False)
+                and yamnet_top < self._clap_escalate_below):
+            clap_hit = self._clap_escalate(audio)
+            if clap_hit is not None:
+                hits.append(clap_hit)
         return hits
+
+    def _clap_escalate(self, audio: np.ndarray) -> Optional[dict]:
+        """Run CLAP against descriptive prompts for each watched category
+        plus neutral anchors. Returns a hit dict only if CLAP picks a
+        category prompt over the anchors with enough confidence."""
+        prompts = list(_CLAP_CATEGORY_PROMPTS.items())     # (category, text)
+        labels = [text for _, text in prompts] + _CLAP_ANCHORS
+        try:
+            match = self._clap.best_match(audio, labels, src_rate=16000)
+        except Exception as e:
+            logger.debug(f"[SoundEvents] CLAP escalation failed: {e}")
+            return None
+        if match is None:
+            return None
+        label, score = match
+        for category, text in prompts:
+            if text == label:      # CLAP picked a real category, not an anchor
+                logger.info(
+                    f"[SoundEvents] CLAP escalation -> {category} "
+                    f"({score:.2f}) — YAMNet was uncertain"
+                )
+                return {
+                    "category": category, "class_name": label,
+                    "score": round(float(score), 4), "source": "clap",
+                }
+        return None  # CLAP picked a neutral anchor — genuinely nothing
 
     async def detect_events_async(self, audio: np.ndarray) -> list[dict]:
         """Non-blocking detect_events — inference runs in a thread."""
