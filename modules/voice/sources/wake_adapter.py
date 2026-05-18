@@ -201,6 +201,47 @@ class MicSourceWakeAdapter:
         pcm_int16 = np.concatenate(chunks)
         return pcm_int16.astype(np.float32) / 32768.0
 
+    def get_noise_floor_db(
+        self,
+        percentile: float = 25.0,
+        margin_db: float = 8.0,
+        fallback_db: float = -45.0,
+    ) -> float:
+        """Per-room silence threshold, calibrated from this room's own
+        rolling ambient buffer.
+
+        Mirrors WakeWordDetector.get_noise_floor_db so the orchestrator's
+        room-tap recording path gets an adaptive floor for EVERY room —
+        each room calibrates to its own ambient instead of every room
+        sharing one static silence_threshold_db. The regression this
+        fixes: a static -45 dBFS sits BELOW a noisy room's ambient (the
+        office idles ~-37 dBFS), so ambient reads as never-ending speech,
+        the recorder burns its full max_duration on room noise, and
+        Whisper hands back an empty transcript.
+
+        Returns (percentile of recent per-chunk dBFS) + margin_db. The
+        25th percentile reflects steady-state ambient while shrugging off
+        both transient quiet dips AND the wake word / start of speech
+        sitting in the buffer when this is called right after a wake —
+        those loud samples land in the top 75%. Capped at -25 dBFS so a
+        loud room can't push the bar above a normal speaking voice. Falls
+        back to fallback_db until at least 5 chunks (~0.4 s) have buffered.
+        """
+        chunks = [c for c in self._recent_audio if c.size]
+        if len(chunks) < 5:
+            return fallback_db
+        levels: list[float] = []
+        for chunk in chunks:
+            sq = chunk.astype(np.int64)
+            sq = sq * sq
+            mean = float(sq.mean())
+            rms = math.sqrt(mean) if mean > 0 else 0.0
+            levels.append(
+                20.0 * math.log10(rms / 32768.0) if rms > 0 else -90.0
+            )
+        floor_db = float(np.percentile(levels, percentile))
+        return min(-25.0, floor_db + margin_db)
+
     async def _mic_callback(self, pcm: bytes, sample_rate: int) -> None:
         """Called by MicSource per chunk. Slice into OWW-sized chunks and
         push to the queue. sample_rate is captured for logging only — OWW

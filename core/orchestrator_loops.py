@@ -1735,13 +1735,36 @@ class LoopsMixin(OrchestratorMixin):
                         )
                         audio_data = None
                 else:
-                    threshold_db = float(
+                    # Per-room adaptive floor (see _on_wake_detected): the
+                    # room's wake adapter calibrates the silence threshold
+                    # from its own rolling ambient. This is the fix for the
+                    # office follow-up capturing 60 s of room noise and
+                    # handing Whisper an empty transcript — office ambient
+                    # (~-37 dBFS) sat above the old static -45 floor.
+                    static_db = float(
                         recording_cfg.get("silence_threshold_db", -45.0)
                     )
-                    logger.debug(
-                        f"[Followup] room='{room}' tap, static floor: "
-                        f"{threshold_db:.1f} dBFS"
+                    floor_fn = getattr(
+                        room_adapter, "get_noise_floor_db", None
                     )
+                    if recording_cfg.get("adaptive_noise_floor", True) and floor_fn:
+                        threshold_db = floor_fn(
+                            margin_db=float(
+                                recording_cfg.get("noise_floor_margin_db", 8.0)
+                            ),
+                            fallback_db=static_db,
+                        )
+                        logger.debug(
+                            f"[Followup] room='{room}' adaptive floor: "
+                            f"{threshold_db:.1f} dBFS "
+                            f"(static fallback {static_db:.1f})"
+                        )
+                    else:
+                        threshold_db = static_db
+                        logger.debug(
+                            f"[Followup] room='{room}' static floor: "
+                            f"{threshold_db:.1f} dBFS"
+                        )
                     assert room_adapter is not None  # use_room_tap implies non-None
                     try:
                         audio_data = await record_until_silence_from_chunks(

@@ -121,10 +121,18 @@ voice:
     sample_rate: 16000
     mode: silence
     fixed_duration_seconds: 7
+    # Static lower bound / fallback for the silence threshold. With
+    # adaptive_noise_floor on, each room's live threshold is calibrated
+    # from its own ambient and only ever sits at or above this value.
     silence_threshold_db: -45
     silence_duration_ms: 2000
     max_duration_seconds: 60
+    # Per-room adaptive silence threshold. ON: every room (office + each
+    # Wyze room) calibrates its own floor from its wake adapter's rolling
+    # ambient buffer -- p25(ambient dBFS) + noise_floor_margin_db, capped
+    # at -25 dBFS. OFF: every room falls back to silence_threshold_db.
     adaptive_noise_floor: true
+    noise_floor_margin_db: 8        # speech must clear room ambient by this
     follow_up_listen_seconds: 6
   # ── Voice cascade (Option D) ──────────────────────────────────────────
   # Staged pipeline: VAD -> wake-word -> sound-event -> STT -> triage LLM.

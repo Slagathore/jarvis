@@ -619,18 +619,36 @@ class ConversationMixin(OrchestratorMixin):
                     # bedroom wake → office mic recording → STT picks up
                     # silence/distant noise, and Cole's actual followup is
                     # never transcribed (real bug observed 2026-05-09).
-                    # No pre-wake floor available for non-office rooms
-                    # (the wake detector isn't tracking ambient there like
-                    # wake_word does in the office). Use the configured
-                    # static threshold; works fine for Wyze RTSP audio
-                    # which is consistently moderate.
-                    threshold_db = float(
-                        recording_cfg["silence_threshold_db"]
+                    # Per-room adaptive floor: the room's wake adapter keeps
+                    # a rolling ambient buffer, so calibrate the silence
+                    # threshold from THIS room's own noise floor (p25 of
+                    # recent ambient + margin). The static config value is
+                    # the lower-bound fallback, used until the buffer fills
+                    # or when adaptive_noise_floor is off.
+                    static_db = float(
+                        recording_cfg.get("silence_threshold_db", -45.0)
                     )
-                    logger.debug(
-                        f"[Wake] room='{room}' using static floor: "
-                        f"{threshold_db:.1f} dBFS"
+                    floor_fn = getattr(
+                        room_adapter, "get_noise_floor_db", None
                     )
+                    if recording_cfg.get("adaptive_noise_floor", True) and floor_fn:
+                        threshold_db = floor_fn(
+                            margin_db=float(
+                                recording_cfg.get("noise_floor_margin_db", 8.0)
+                            ),
+                            fallback_db=static_db,
+                        )
+                        logger.debug(
+                            f"[Wake] room='{room}' adaptive floor: "
+                            f"{threshold_db:.1f} dBFS "
+                            f"(static fallback {static_db:.1f})"
+                        )
+                    else:
+                        threshold_db = static_db
+                        logger.debug(
+                            f"[Wake] room='{room}' static floor: "
+                            f"{threshold_db:.1f} dBFS"
+                        )
                     assert room_adapter is not None  # use_room_tap implies non-None
                     try:
                         audio_data = await record_until_silence_from_chunks(
