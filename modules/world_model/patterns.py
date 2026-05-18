@@ -47,8 +47,8 @@ class PatternMiner:
         self.days_back = int(days_back)
 
     async def run_nightly(self) -> int:
-        """Rebuild the pattern profile for every resident person.
-        Returns the number of profiles rebuilt."""
+        """Rebuild the pattern profile once per distinct resident.
+        Returns the number of residents whose profile was rebuilt."""
         try:
             async with self.world._lock:
                 residents = [
@@ -56,29 +56,42 @@ class PatternMiner:
                     if getattr(e, "is_resident", False)
                     and getattr(e, "entity_type", None) == "person"
                     and getattr(e, "person_id", None)
+                    and getattr(e, "archived_at", None) is None
                 ]
         except Exception as e:
             logger.warning(f"[PatternMiner] resident scan failed: {e}")
             return 0
 
-        rebuilt = 0
+        # The world model accumulates many entities per resident — one per
+        # tracking session. A profile is derived purely from person_id, so
+        # build it ONCE per distinct resident and fan the result out to
+        # every entity sharing that id. Iterating raw entities instead
+        # meant an N-session household ran N full 100k-event queries —
+        # minutes of DB hammering that starved the rest of the system.
+        by_person: dict[Any, list] = {}
         for ent in residents:
+            by_person.setdefault(ent.person_id, []).append(ent)
+
+        rebuilt = 0
+        for _person_id, ents in by_person.items():
             try:
-                profile = await self._build_profile_for(ent)
-                ent.metadata["pattern_profile"] = profile
-                ent.metadata["pattern_profile_updated_ts"] = (
-                    datetime.now(timezone.utc).isoformat()
-                )
-                await self.world.store.upsert_entity(ent)
+                profile = await self._build_profile_for(ents[0])
+                ts = datetime.now(timezone.utc).isoformat()
+                for ent in ents:
+                    ent.metadata["pattern_profile"] = profile
+                    ent.metadata["pattern_profile_updated_ts"] = ts
+                    await self.world.store.upsert_entity(ent)
                 rebuilt += 1
                 logger.info(
-                    f"[PatternMiner] rebuilt profile for {ent.display_name}: "
-                    f"{profile.get('n_events', 0)} events analyzed"
+                    f"[PatternMiner] rebuilt profile for "
+                    f"{ents[0].display_name}: "
+                    f"{profile.get('n_events', 0)} events analyzed "
+                    f"({len(ents)} entit{'y' if len(ents) == 1 else 'ies'})"
                 )
             except Exception:
                 logger.exception(
                     f"[PatternMiner] profile build failed for "
-                    f"{getattr(ent, 'display_name', '?')}"
+                    f"{getattr(ents[0], 'display_name', '?')}"
                 )
         return rebuilt
 
