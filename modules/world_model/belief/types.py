@@ -81,6 +81,11 @@ class BeliefHypothesis:
     hypothesis_id: str
     entity_key: str
     entity_type: str
+    # Human-readable name — a person's name, or an individuated pet's name.
+    # Refreshed from each sighting's evidence; in-memory only (not persisted),
+    # like the hysteresis counters below. Re-populates on the first sighting
+    # after a restart. None until a named sighting arrives.
+    display_name: Optional[str] = None
     state: str = BeliefState.UNKNOWN
     room: Optional[str] = None
     camera: Optional[str] = None

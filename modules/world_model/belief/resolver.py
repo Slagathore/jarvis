@@ -195,13 +195,28 @@ class BeliefResolver:
                             "person_name": getattr(obs, "person_name", None),
                         }
                     elif obj_class in ("cat", "dog"):
-                        key = f"{obj_class}:{room}"
                         etype = obj_class
                         score = float(getattr(obs, "confidence", 0.0))
                         omd = getattr(obs, "metadata", {}) or {}
+                        # Individuate the pet. The default key is the coarse
+                        # `species:room` — which collapses two cats in one
+                        # room into a single "a cat is here" hypothesis. If
+                        # the confirmed-sample bank can name this animal, key
+                        # by its identity so each pet gets its own belief.
+                        # Falls back to the coarse key on no match / no
+                        # samples / any error.
+                        pet_id, pet_name = await self._resolve_pet(
+                            obj_class, room, obs, omd
+                        )
+                        key = (
+                            f"pet:{pet_id}" if pet_id is not None
+                            else f"{obj_class}:{room}"
+                        )
                         meta = {
                             "color_class": omd.get("color_class"),
                             "size_normalized": omd.get("size_normalized"),
+                            "pet_id": pet_id,
+                            "pet_name": pet_name,
                         }
                     else:
                         continue
@@ -234,6 +249,43 @@ class BeliefResolver:
                             await self._ingest_absence(ev, hyp)
         except Exception:
             logger.exception("[BeliefResolver] observation ingest failed")
+
+    async def _resolve_pet(
+        self, species: str, room: Optional[str], obs: Any, omd: dict,
+    ) -> tuple[Optional[Any], Optional[str]]:
+        """Best-effort per-animal identity for a cat/dog observation.
+        Returns (pet_entity_id, pet_name) when the confirmed-sample bank
+        names this pet with enough confidence, else (None, None). Reuses the
+        visual descriptor already computed into the observation metadata —
+        no frame, no re-cropping."""
+        try:
+            from modules.world_model.pet_identity import (
+                match_pet_from_descriptor,
+            )
+            bbox = getattr(obs, "bbox", None)
+            query: dict[str, Any] = {
+                "species": species,
+                "room": room,
+                "bbox": list(bbox) if bbox else None,
+                "frame_width": omd.get("frame_width"),
+                "frame_height": omd.get("frame_height"),
+                "size_normalized": omd.get("size_normalized"),
+                "color_class": omd.get("color_class", "unknown"),
+                "color_histogram": omd.get("color_histogram"),
+            }
+            if species == "dog":
+                query["breed_class"] = omd.get("breed_class")
+            else:
+                query["coat_texture"] = omd.get("coat_texture")
+            match = await match_pet_from_descriptor(
+                db=self._db, species=species, room=room or "", query=query,
+            )
+            if (match and match.get("accepted")
+                    and match.get("entity_id") is not None):
+                return match["entity_id"], match.get("pet_name")
+        except Exception as e:
+            logger.debug(f"[BeliefResolver] pet identity resolve failed: {e}")
+        return None, None
 
     async def _ingest_sighting(self, ev: EvidenceFrame) -> None:
         key = ev.entity_key
@@ -306,6 +358,14 @@ class BeliefResolver:
         hyp.last_confirmed_ts = ev.ts
         hyp.last_evidence_ts = ev.ts
         hyp.evidence_breakdown = {"last": "sighting", "score": round(ev.score, 3)}
+        # Refresh the human-readable name from this sighting: person_name for
+        # people, the individuated pet_name for pets. Falls back to the
+        # entity_type ("cat"/"dog"/"person") only when nothing better is known.
+        name = (ev.payload or {}).get("person_name") or (ev.payload or {}).get("pet_name")
+        if name:
+            hyp.display_name = name
+        elif not hyp.display_name:
+            hyp.display_name = hyp.entity_type
 
     async def _ingest_absence(
         self, ev: EvidenceFrame, hyp: BeliefHypothesis
@@ -574,6 +634,7 @@ class BeliefResolver:
             primary = self._primary(key)
             out.append({
                 "entity_key": key,
+                "display_name": primary.display_name if primary else None,
                 "primary": self._hyp_dict(primary) if primary else None,
                 "competitors": [
                     self._hyp_dict(h) for h in hyps if not h.is_primary
@@ -585,6 +646,7 @@ class BeliefResolver:
     def _hyp_dict(h: BeliefHypothesis) -> dict:
         return {
             "state": h.state, "room": h.room,
+            "display_name": h.display_name,
             "confidence_location": h.confidence_location,
             "confidence_visibility": h.confidence_visibility,
             "confidence_state": h.confidence_state,
@@ -609,6 +671,7 @@ class BeliefResolver:
             await self._bus.publish("world.belief_changed", {
                 "entity_key": hyp.entity_key,
                 "entity_type": hyp.entity_type,
+                "entity_name": hyp.display_name,
                 "state": hyp.state,
                 "room": hyp.room,
                 "prev_state": prev_state,

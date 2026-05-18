@@ -155,6 +155,8 @@ async def match_pet_from_crop(
     bbox: list[float] | tuple[float, float, float, float],
     max_samples_per_pet: int = 20,
 ) -> Optional[dict]:
+    """Identify a pet from a live camera frame + bbox: crop, build a fresh
+    visual descriptor, and rank it against the confirmed-sample bank."""
     crop, clamped = clamp_crop(frame, bbox)
     if crop is None or crop.size == 0:
         return None
@@ -167,6 +169,34 @@ async def match_pet_from_crop(
         frame_width=fw,
         frame_height=fh,
     )
+    return await match_pet_from_descriptor(
+        db=db,
+        species=species,
+        room=room,
+        query=query,
+        max_samples_per_pet=max_samples_per_pet,
+    )
+
+
+async def match_pet_from_descriptor(
+    *,
+    db: Any,
+    species: str,
+    room: str,
+    query: dict,
+    max_samples_per_pet: int = 20,
+) -> Optional[dict]:
+    """Identify a pet from an ALREADY-BUILT visual descriptor — the same
+    descriptor family `descriptor_from_crop` produces.
+
+    The belief resolver uses this: a cat/dog observation already carries the
+    full descriptor (color_class / histogram / size / coat-or-breed) in its
+    metadata, and the resolver has no frame to re-crop from. Returns the same
+    shape as match_pet_from_crop — {pet_name, entity_id, score, margin,
+    accepted, sample_count} — or None when there is nothing to compare to.
+    """
+    if not query:
+        return None
     rows = await db.fetchall(
         "SELECT pet_entity_id, pet_name, species, room, bbox, descriptor_json "
         "FROM pet_visual_samples "
