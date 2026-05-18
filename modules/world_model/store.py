@@ -257,12 +257,11 @@ class WorldStore:
         )
 
     async def load_entities(self) -> list[WorldEntity]:
-        # Archived entities (consolidate_entities soft-deletes duplicates and
-        # stale rows) stay in the DB for history but are not hydrated into
-        # the live in-memory set.
-        rows = await self.db.fetchall(
-            "SELECT * FROM world_entities WHERE archived_at IS NULL"
-        )
+        # Returns ALL rows including archived — a raw store accessor.
+        # WorldModel._load_from_store skips archived when building its
+        # live set; pet bootstrap needs the archived rows to un-archive
+        # a pet that returned to config.
+        rows = await self.db.fetchall("SELECT * FROM world_entities")
         emb_rows = await self.db.fetchall(
             "SELECT entity_id, embedding FROM world_entity_embeddings"
         )

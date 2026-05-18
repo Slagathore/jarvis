@@ -337,6 +337,12 @@ class WorldModel:
         UNKNOWN_AT_BOOT for the first 30s — observations resolve, the
         timer demotes survivors to IN_HOUSE_UNMONITORED."""
         for ent in await self.store.load_entities():
+            # Archived entities (consolidate_entities soft-deletes
+            # duplicates + stale rows; pet bootstrap soft-archives pets
+            # dropped from config) stay in the DB for history but are not
+            # part of the live in-memory set.
+            if ent.archived_at is not None:
+                continue
             if ent.last_seen_ts is not None:
                 ent.last_seen_ts = _as_utc(ent.last_seen_ts)
             if ent.last_state_change_ts is not None:

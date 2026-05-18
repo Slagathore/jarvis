@@ -353,10 +353,13 @@ async def test_archived_pet_never_matches() -> None:
             bbox=(100, 100, 200, 200), confidence=0.9, ts=ts,
             metadata={"color_class": "black", "size_normalized": 0.04},
         )
-        # _pair_cost wraps the species dispatch + archive guard.
-        loaded_spooky = wm.find_entity_by_name("Spooky")
-        assert loaded_spooky is not None
-        cost = wm._pair_cost(obs, loaded_spooky)
+        # Archived entities are no longer hydrated into the live world
+        # model at all — verify that, then exercise the _pair_cost
+        # archive guard directly with the archived entity object.
+        assert wm.find_entity_by_name("Spooky") is None, (
+            "archived pet must be excluded from the live world model"
+        )
+        cost = wm._pair_cost(obs, spooky)
         assert cost >= 2.0  # cost_reject*2 = 2.0
     finally:
         await db.close()
