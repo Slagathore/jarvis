@@ -264,6 +264,7 @@ class LoopsMixin(OrchestratorMixin):
                         if self._current_state is not None else None
                     )
                     new_state = await self.state_fusion.fuse(signals, room="office")
+                    new_state.present = self._room_occupants(new_state.location)
                     self._current_state = new_state
 
                     # Persona auto-revert hook: feeds the away-timeout
@@ -824,6 +825,18 @@ class LoopsMixin(OrchestratorMixin):
                 person_id=recognized_pid, person_name=recognized_name,
             )
 
+    def _room_occupants(self, room: Optional[str]) -> list[str]:
+        """Recognized resident names currently in `room`, read from the
+        per-room scene cache. Empty when the room has no camera, nobody is
+        present, or the face was not recognized. The basis for
+        non-Cole-centric proactive speech — curiosity addresses whoever
+        this returns, by name."""
+        if not room:
+            return []
+        scene = self._scene_state.get(room) or {}
+        name = scene.get("person_name")
+        return [name] if name else []
+
     async def _curiosity_loop(self) -> None:
         """
         Periodically checks the curiosity engine for proactive speech opportunities.
@@ -838,7 +851,16 @@ class LoopsMixin(OrchestratorMixin):
                 if not self.curiosity or not self._current_state:
                     continue
 
-                utterance = await self.curiosity.check_async(self._current_state)
+                # Resolve who is actually in the room this proactive line
+                # will be spoken to, so curiosity addresses them by name (or
+                # stays generic) instead of assuming Cole.
+                target_room = (
+                    self._active_user_room or self._current_state.location
+                )
+                occupants = self._room_occupants(target_room)
+                utterance = await self.curiosity.check_async(
+                    self._current_state, occupants=occupants
+                )
                 if not utterance:
                     continue
 

@@ -66,6 +66,10 @@ class ActivityState:
     confidence: float = 0.0
     signals: list[str] = field(default_factory=list)
     context: dict = field(default_factory=dict)
+    # Recognized resident names currently in `location`. The basis for
+    # non-Cole-centric proactive speech — Jarvis addresses whoever is
+    # actually here. Empty when the room has no camera or nobody is seen.
+    present: list[str] = field(default_factory=list)
     updated_at: datetime = field(default_factory=datetime.now)
 
     def is_same_activity(self, other: "ActivityState") -> bool:
@@ -85,6 +89,7 @@ class ActivityState:
             "confidence":       round(self.confidence, 3),
             "signals":          list(self.signals),
             "context":          dict(self.context),
+            "present":          list(self.present),
             "updated_at":       self.updated_at.isoformat(),
         }
 

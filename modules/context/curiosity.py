@@ -106,15 +106,23 @@ class CuriosityEngine:
         self._greeted_today: Optional[datetime] = None
 
     async def check_async(
-        self, state: ActivityState
+        self, state: ActivityState, occupants: Optional[list[str]] = None,
     ) -> Optional[str]:
         """
         Check all topics in priority order. Return the first observation text
         that is ready (cooldown expired, conditions met, LLM generates something),
         or None if nothing is ready.
+
+        `occupants` — recognized resident names in the room this line will be
+        spoken to. Lets Jarvis address whoever is actually there instead of
+        assuming Cole. When None, falls back to state.present; when that is
+        empty too, the prompts phrase generically (second person, no name).
         """
         if state.interruptibility < self._min_interruptibility:
             return None
+
+        if occupants is None:
+            occupants = list(getattr(state, "present", None) or [])
 
         # Update activity timing tracking
         self._track_activity_timing(state)
@@ -122,7 +130,7 @@ class CuriosityEngine:
         for topic in TOPIC_ORDER:
             if self._is_on_cooldown(topic):
                 continue
-            observation = await self._evaluate_topic(topic, state)
+            observation = await self._evaluate_topic(topic, state, occupants)
             if observation:
                 self._mark_used(topic)
                 logger.info(f"[Curiosity] Firing topic '{topic}'")
@@ -131,7 +139,7 @@ class CuriosityEngine:
         return None
 
     async def _evaluate_topic(
-        self, topic: str, state: ActivityState
+        self, topic: str, state: ActivityState, occupants: list[str],
     ) -> Optional[str]:
         """Evaluate whether a specific topic is ready and generate its text."""
         now = datetime.now()
@@ -142,7 +150,7 @@ class CuriosityEngine:
                     now - self._greeted_today
                 ).total_seconds() > 3600 * 12:
                     self._greeted_today = now
-                    return await self._generate(topic, state)
+                    return await self._generate(topic, state, occupants)
 
         elif topic == "gaming_too_long":
             if state.activity == "gaming":
@@ -150,7 +158,9 @@ class CuriosityEngine:
                 if started:
                     hours = (now - started).total_seconds() / 3600
                     if hours >= 2.0:
-                        return await self._generate(topic, state, hours=hours)
+                        return await self._generate(
+                            topic, state, occupants, hours=hours
+                        )
 
         elif topic == "coding_too_long":
             if state.activity in ("coding", "programming"):
@@ -158,7 +168,9 @@ class CuriosityEngine:
                 if started:
                     hours = (now - started).total_seconds() / 3600
                     if hours >= 3.0:
-                        return await self._generate(topic, state, hours=hours)
+                        return await self._generate(
+                            topic, state, occupants, hours=hours
+                        )
 
         elif topic == "nap_checkin":
             if state.activity == "napping":
@@ -166,13 +178,15 @@ class CuriosityEngine:
                 if started:
                     mins = (now - started).total_seconds() / 60
                     if mins >= 15:
-                        return await self._generate(topic, state, minutes=mins)
+                        return await self._generate(
+                            topic, state, occupants, minutes=mins
+                        )
 
         elif topic == "comfyui_running":
             if state.context.get("process_name", "").lower() in (
                 "comfyui", "comfyui.exe", "python"
             ) or "comfyui" in state.context.get("window_title", "").lower():
-                return await self._generate(topic, state)
+                return await self._generate(topic, state, occupants)
 
         elif topic == "idle_too_long":
             if state.activity == "idle":
@@ -182,7 +196,9 @@ class CuriosityEngine:
                     if 9 <= now.hour < 22:
                         hours = (now - started).total_seconds() / 3600
                         if hours >= 1.0:
-                            return await self._generate(topic, state, hours=hours)
+                            return await self._generate(
+                                topic, state, occupants, hours=hours
+                            )
 
         return None
 
@@ -190,41 +206,63 @@ class CuriosityEngine:
         self,
         topic: str,
         state: ActivityState,
+        occupants: list[str],
         **kwargs,
     ) -> Optional[str]:
         """
         Use the LLM to generate a natural, brief observation for this topic.
         Returns None if LLM fails or returns empty.
+
+        Phrased for whoever is actually in the room (`occupants`) — by name
+        when recognized, second-person and nameless when not. Jarvis is a
+        household assistant; it is not Cole-only.
         """
+        # subject = the person these prompts are about. None when the room's
+        # occupant was not recognized (or nobody was seen there).
+        subject = occupants[0] if occupants else None
+        who = subject or "Someone"
+        if subject:
+            addressing = (
+                f"You are speaking to {subject}. Address {subject} by name, "
+                "warmly and naturally."
+            )
+        else:
+            addressing = (
+                "You do not know who is in the room. Address them directly "
+                "in the second person and do NOT use any name."
+            )
+
         prompts = {
             "morning_greeting": (
                 "Generate a brief, warm good morning greeting from Jarvis. "
-                "One or two sentences. Mention the time of day. Be natural, not robotic."
+                "One or two sentences. Mention the time of day. "
+                f"{addressing} Be natural, not robotic."
             ),
             "gaming_too_long": (
-                f"Cole has been gaming for {kwargs.get('hours', 2):.1f} hours. "
+                f"{who} has been gaming for {kwargs.get('hours', 2):.1f} hours. "
                 "Generate a short, casual, non-preachy check-in from Jarvis. "
-                "Maybe suggest a stretch. One sentence, friendly tone."
+                f"Maybe suggest a stretch. One sentence, friendly tone. {addressing}"
             ),
             "coding_too_long": (
-                f"Cole has been coding for {kwargs.get('hours', 3):.1f} hours. "
+                f"{who} has been coding for {kwargs.get('hours', 3):.1f} hours. "
                 "Generate a brief, encouraging check-in from Jarvis. "
-                "Suggest a short break. One sentence."
+                f"Suggest a short break. One sentence. {addressing}"
             ),
             "nap_checkin": (
-                f"Cole appears to be napping ({kwargs.get('minutes', 15):.0f} minutes). "
+                f"{who} appears to be napping "
+                f"({kwargs.get('minutes', 15):.0f} minutes). "
                 "Generate a gentle, soft-spoken check-in from Jarvis. "
-                "Ask if he wants a wake alarm. Very brief."
+                f"Ask if they want a wake alarm. Very brief. {addressing}"
             ),
             "comfyui_running": (
-                "Cole appears to be using ComfyUI for AI image generation. "
-                "Generate a brief, enthusiastic observation from Jarvis about creative work. "
-                "One sentence."
+                f"{who} appears to be using ComfyUI for AI image generation. "
+                "Generate a brief, enthusiastic observation from Jarvis about "
+                f"creative work. One sentence. {addressing}"
             ),
             "idle_too_long": (
-                f"Cole has been idle for {kwargs.get('hours', 1):.1f} hours. "
+                f"{who} has been idle for {kwargs.get('hours', 1):.1f} hours. "
                 "Generate a gentle, curious check-in from Jarvis. "
-                "Wonder what he's up to. One sentence, light tone."
+                f"Wonder what they're up to. One sentence, light tone. {addressing}"
             ),
         }
 
@@ -240,9 +278,10 @@ class CuriosityEngine:
                 {
                     "role": "system",
                     "content": (
-                        "You are Jarvis, Cole's ambient AI assistant. "
-                        "Generate exactly what you would say aloud — no meta-commentary, "
-                        "no quotes, just the speech. Keep it concise and natural."
+                        "You are Jarvis, an ambient AI assistant for the "
+                        "whole household. Generate exactly what you would "
+                        "say aloud — no meta-commentary, no quotes, just the "
+                        "speech. Keep it concise and natural."
                     ),
                 },
                 {"role": "user", "content": prompt_text},
