@@ -257,7 +257,12 @@ class WorldStore:
         )
 
     async def load_entities(self) -> list[WorldEntity]:
-        rows = await self.db.fetchall("SELECT * FROM world_entities")
+        # Archived entities (consolidate_entities soft-deletes duplicates and
+        # stale rows) stay in the DB for history but are not hydrated into
+        # the live in-memory set.
+        rows = await self.db.fetchall(
+            "SELECT * FROM world_entities WHERE archived_at IS NULL"
+        )
         emb_rows = await self.db.fetchall(
             "SELECT entity_id, embedding FROM world_entity_embeddings"
         )

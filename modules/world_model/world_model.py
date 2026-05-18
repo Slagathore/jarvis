@@ -201,6 +201,10 @@ class WorldModel:
             "visibility_seen_fraction_floor": 0.25,
             "visibility_grace_misses": 5,
             "landmark_dwell_frames": 3,
+            # consolidate_entities: a non-PRESENT person/cat/dog entity not
+            # seen in this many days is archived (soft-deleted). Canonical
+            # residents + named pets are exempt — never archived.
+            "entity_stale_archive_days": 5.0,
             # Spatial continuity for person obs that lost face
             # attribution. Within this window, an unattributed person
             # detection in the same room is merged into the nearest
@@ -297,6 +301,7 @@ class WorldModel:
         """Subscribe to bus topics, load persistent state, spawn timers."""
         await self.store.ensure_schema()
         await self._load_from_store()
+        await self.consolidate_entities()
         await self.bus.subscribe("vision.observation", self._on_observation_batch)
         await self.bus.subscribe("camera.health", self._on_camera_health)
         self._timer_task = asyncio.create_task(
@@ -345,6 +350,87 @@ class WorldModel:
                 ent.state = EntityState.UNKNOWN_AT_BOOT
                 ent.last_state_change_ts = boot_ts
                 await self.store.upsert_entity(ent)
+
+    async def consolidate_entities(self) -> dict:
+        """Archive duplicate and stale entities so the live set stays
+        bounded. The world model spawns a fresh entity whenever spatial
+        continuity breaks across a tracking session — so a resident
+        accumulates one entity per session (Cole reached 101; the DB held
+        1761 rows) and nothing ever archived them.
+
+        Run on every startup, this pass:
+          * keeps ONE canonical entity per person_id (newest last_seen),
+            archiving the older duplicates;
+          * keeps ONE canonical per named pet (entity_type + display_name);
+          * archives any other person/cat/dog entity that is not currently
+            PRESENT and has not been seen in `entity_stale_archive_days`.
+
+        Archiving is a soft-delete (sets archived_at) — rows and their
+        event history stay in the DB; load_entities() simply stops
+        hydrating them. Objects are left to prune_stale_objects.
+        Returns {duplicates, stale, kept, live}.
+        """
+        now = _utcnow()
+        stale_cutoff = now - timedelta(
+            days=float(self.cfg.get("entity_stale_archive_days", 5.0))
+        )
+        _floor = datetime.min.replace(tzinfo=timezone.utc)
+
+        def _seen(e: WorldEntity) -> datetime:
+            return _as_utc(e.last_seen_ts) if e.last_seen_ts else _floor
+
+        people: dict[int, list[WorldEntity]] = {}
+        named_pets: dict[tuple, list[WorldEntity]] = {}
+        others: list[WorldEntity] = []
+        for ent in self.entities.values():
+            if ent.archived_at is not None:
+                continue
+            if ent.entity_type == "person" and ent.person_id is not None:
+                people.setdefault(ent.person_id, []).append(ent)
+            elif (ent.entity_type in ("cat", "dog") and ent.display_name
+                    and not str(ent.display_name).startswith("unknown_")):
+                named_pets.setdefault(
+                    (ent.entity_type, ent.display_name), []
+                ).append(ent)
+            elif ent.entity_type in ("person", "cat", "dog"):
+                others.append(ent)
+
+        to_archive: list[WorldEntity] = []
+        for group in (*people.values(), *named_pets.values()):
+            group.sort(key=_seen, reverse=True)
+            to_archive.extend(group[1:])      # keep [0], archive the rest
+        dup_count = len(to_archive)
+
+        for ent in others:
+            if ent.state == EntityState.PRESENT:
+                continue
+            if _seen(ent) >= stale_cutoff:
+                continue
+            to_archive.append(ent)
+        stale_count = len(to_archive) - dup_count
+
+        for ent in to_archive:
+            ent.archived_at = now
+            try:
+                await self.store.upsert_entity(ent)
+            except Exception as e:
+                logger.debug(
+                    f"[WorldModel] archive upsert failed for {ent.id}: {e}"
+                )
+            self.entities.pop(ent.id, None)
+
+        if to_archive:
+            logger.info(
+                f"[WorldModel] consolidate_entities: archived {dup_count} "
+                f"duplicate + {stale_count} stale entit(ies); "
+                f"{len(self.entities)} live"
+            )
+        return {
+            "duplicates": dup_count,
+            "stale": stale_count,
+            "kept": len(people) + len(named_pets),
+            "live": len(self.entities),
+        }
 
     # ────────────────────────────────────────────────────────────────────────
     # MAIN ENTRY POINTS
@@ -999,7 +1085,8 @@ class WorldModel:
 
     def _find_entity_by_person_id(self, person_id: int) -> Optional[WorldEntity]:
         for ent in self.entities.values():
-            if ent.entity_type == "person" and ent.person_id == person_id:
+            if (ent.entity_type == "person" and ent.person_id == person_id
+                    and ent.archived_at is None):
                 return ent
         return None
 
