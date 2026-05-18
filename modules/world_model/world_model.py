@@ -735,7 +735,18 @@ class WorldModel:
         steps off (`landmark` becomes None or changes); we only debounce
         the *current* landmark to avoid double-firing during walks across
         multiple landmarks.
+
+        Landmark-visit events for OBJECTS fire only for named / tagged
+        objects (e.g. Cole's wallet at the leash hook) — never for
+        unknown_* blobs: an unknown cell phone parked near the dog's
+        water bowl is detector noise, not an interaction. People and pets
+        always pass — a cat dwelling at the litterbox is the whole point.
         """
+        etype = getattr(ent, "entity_type", None)
+        if etype not in ("person", "cat", "dog"):
+            name = getattr(ent, "display_name", None) or ""
+            if not name or name.startswith("unknown_"):
+                return None
         threshold = int(self.cfg.get("landmark_dwell_frames", 3))
         dwell: dict = ent.metadata.setdefault("landmark_dwell", {})
         if landmark is None:
