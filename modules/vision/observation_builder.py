@@ -391,6 +391,23 @@ class ObservationBuilder:
                     if (self.object_vocab is not None
                             and self.object_vocab.should_note(
                                 cls, det.confidence)):
+                        # Save a crop as picture evidence for the Review
+                        # tab — if it recurred enough to be asked about,
+                        # it was on screen long enough for a photo.
+                        # _save_animal_crop cooldown-gates per (room,cls),
+                        # so this is not per-frame disk I/O.
+                        ux1, uy1, ux2, uy2 = (int(v) for v in det.bbox)
+                        ux1 = max(0, min(frame_w - 1, ux1))
+                        uy1 = max(0, min(frame_h - 1, uy1))
+                        ux2 = max(0, min(frame_w, ux2))
+                        uy2 = max(0, min(frame_h, uy2))
+                        u_crop = (
+                            frame[uy1:uy2, ux1:ux2]
+                            if uy2 > uy1 and ux2 > ux1 else None
+                        )
+                        u_path = self._save_animal_crop(
+                            "unknown", u_crop, room, ts, label=cls
+                        )
                         self.object_vocab.note_unknown(
                             key=f"{room}:{cls}", room=room,
                             descriptor={
@@ -398,6 +415,7 @@ class ObservationBuilder:
                                 "bbox": [int(v) for v in det.bbox],
                                 "confidence": float(det.confidence),
                             },
+                            crop_path=str(u_path) if u_path else None,
                         )
                     continue
                 observations.append(obs)

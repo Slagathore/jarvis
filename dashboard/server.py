@@ -3049,6 +3049,112 @@ class DashboardServer:
                 "available": True,
             })
 
+        # ── Review tab: unknown objects Jarvis can't name yet ────────────
+        @app.get("/api/object_vocab/review")
+        async def object_vocab_review():
+            """Review-tab feed: unknown objects Jarvis keeps seeing but
+            cannot name, each with picture + spatial-persistence evidence,
+            plus the vocabulary already learned."""
+            orch = self._orchestrator
+            ov = getattr(orch, "object_vocab", None) if orch else None
+            if ov is None:
+                return JSONResponse(
+                    {"items": [], "learned": [], "available": False}
+                )
+            try:
+                snap = ov.snapshot()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[/api/object_vocab/review] {e}")
+                return JSONResponse(
+                    {"items": [], "learned": [], "available": False}
+                )
+            return JSONResponse({
+                "items": snap.get("pending", []),
+                "learned": snap.get("learned", []),
+                "available": True,
+            })
+
+        @app.post("/api/object_vocab/review/answer")
+        async def object_vocab_review_answer(request: Request):
+            """Name an unknown object from the dashboard. This is the fix
+            for the old voice-only ~6 s answer window — an unknown can be
+            named here any time, and joins the learned vocabulary at once."""
+            orch = self._orchestrator
+            ov = getattr(orch, "object_vocab", None) if orch else None
+            if ov is None:
+                raise HTTPException(
+                    status_code=503, detail="object_vocab unavailable"
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            key = str(body.get("key") or "").strip()
+            name = str(body.get("name") or "").strip()
+            if not key or not name:
+                raise HTTPException(
+                    status_code=400, detail="key and name are required"
+                )
+            entry = ov.record_answer(key, name, query=body.get("query"))
+            if entry is None:
+                raise HTTPException(
+                    status_code=404, detail="unknown key or empty name"
+                )
+            await self.broadcast({
+                "type": "object_vocab_learned",
+                "name": entry["name"], "key": key,
+            })
+            return JSONResponse({"ok": True, "entry": entry})
+
+        @app.post("/api/object_vocab/review/dismiss")
+        async def object_vocab_review_dismiss(request: Request):
+            """Dismiss an unknown — 'not worth tracking'. Persisted, so it
+            is not re-noted on the next sighting."""
+            orch = self._orchestrator
+            ov = getattr(orch, "object_vocab", None) if orch else None
+            if ov is None:
+                raise HTTPException(
+                    status_code=503, detail="object_vocab unavailable"
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            key = str(body.get("key") or "").strip()
+            if not key:
+                raise HTTPException(status_code=400, detail="key is required")
+            ov.dismiss(key)
+            return JSONResponse({"ok": True})
+
+        @app.get("/api/object_vocab/review/crop.jpg")
+        async def object_vocab_review_crop(key: str):
+            """Serve the saved crop (picture evidence) for an unknown."""
+            from fastapi.responses import Response
+            from pathlib import Path as _Path
+            orch = self._orchestrator
+            ov = getattr(orch, "object_vocab", None) if orch else None
+            if ov is None:
+                return Response(status_code=404)
+            crop_path = None
+            try:
+                for item in ov.review_items():
+                    if item.get("key") == key:
+                        crop_path = item.get("crop_path")
+                        break
+            except Exception:
+                crop_path = None
+            if not crop_path:
+                return Response(status_code=404)
+            path = _Path(crop_path)
+            if not path.is_file():
+                return Response(status_code=404)
+            try:
+                return Response(
+                    content=path.read_bytes(), media_type="image/jpeg"
+                )
+            except Exception:
+                return Response(status_code=404)
+
         @app.get("/api/world_model/anomalies")
         async def world_model_anomalies(limit: int = 50):
             """§25 anomaly review queue — recent fired anomalies, newest

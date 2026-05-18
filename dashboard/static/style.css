@@ -3307,3 +3307,60 @@ main {
   color: var(--red, #e57373);
   font-size: 10px;
 }
+
+/* ── Review tab: unknown objects ──────────────────────────────────────── */
+.objreview-wrap {
+  margin-top: 22px;
+  border-top: 1px solid var(--border, #2a2a3a);
+  padding-top: 16px;
+}
+.objreview-title { margin: 0 0 4px; font-size: 15px; }
+.objreview-sub {
+  margin: 0 0 12px;
+  font-size: 12px;
+  opacity: 0.65;
+  max-width: 640px;
+}
+.objreview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+.objreview-card {
+  background: var(--panel-bg, #1c1c28);
+  border: 1px solid var(--border, #2a2a3a);
+  border-radius: 8px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.objreview-crop,
+.objreview-nocrop {
+  width: 100%;
+  height: 130px;
+  border-radius: 6px;
+  background: #000;
+}
+.objreview-crop { object-fit: cover; }
+.objreview-nocrop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  opacity: 0.5;
+}
+.objreview-cls {
+  font-weight: 600;
+  font-size: 14px;
+  text-transform: capitalize;
+}
+.objreview-line { font-size: 12px; opacity: 0.8; }
+.objreview-dim { opacity: 0.55; }
+.objreview-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.objreview-name { flex: 1 1 100%; }

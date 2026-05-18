@@ -58,6 +58,10 @@ class ObjectVocabLearner:
         "keyboard", "mouse", "vase", "bench", "toaster",
     })
 
+    # How many recent detection bboxes to keep per unknown — the spatial
+    # trail behind the persistence / "it keeps showing up here" check.
+    _MAX_BBOXES: int = 24
+
     def __init__(
         self,
         config: Optional[dict] = None,
@@ -133,27 +137,48 @@ class ObjectVocabLearner:
     # ── Sighting intake ──────────────────────────────────────────────────────
 
     def note_unknown(
-        self, key: str, room: str, *, descriptor: Optional[dict] = None
+        self, key: str, room: str, *,
+        descriptor: Optional[dict] = None,
+        crop_path: Optional[str] = None,
     ) -> None:
         """Record one sighting of an un-nameable object. `key` must be
-        stable across sightings of the SAME object (e.g. a tracked
-        cluster id) so recurrences accumulate toward the ask threshold."""
+        stable across sightings of the SAME object (e.g. room:class) so
+        recurrences accumulate toward the ask threshold.
+
+        Each sighting also appends the detection's bbox to a rolling
+        spatial trail — the persistence Cole asked for: an unknown that
+        keeps re-appearing in the SAME spot is a real object worth a
+        photo and a question, not a one-off mis-detection. `crop_path`,
+        when given, is kept as the freshest picture evidence.
+        """
         if not self.enabled or not key:
             return
         if key in self._dismissed:
             return  # Cole already said this one is not worth tracking
         now = time.time()
         self._expire_stale(now)
+        desc = descriptor or {}
+        bbox = desc.get("bbox")
         rec = self._pending.get(key)
         if rec is None:
             self._pending[key] = {
                 "count": 1, "room": room, "first_ts": now, "last_ts": now,
-                "asked": False, "descriptor": descriptor or {},
+                "asked": False, "descriptor": desc,
+                "bboxes": [list(bbox)] if bbox else [],
+                "crop_path": crop_path,
             }
         else:
             rec["count"] += 1
             rec["last_ts"] = now
             rec["room"] = room
+            if bbox:
+                rec.setdefault("bboxes", []).append(list(bbox))
+                rec["bboxes"] = rec["bboxes"][-self._MAX_BBOXES:]
+            if crop_path:
+                rec["crop_path"] = crop_path
+            if desc:
+                # Refresh confidence/bbox; the YOLO class stays put.
+                rec["descriptor"] = {**rec.get("descriptor", {}), **desc}
 
     def _expire_stale(self, now: float) -> None:
         """Drop unknowns that stopped recurring before being asked —
@@ -168,8 +193,9 @@ class ObjectVocabLearner:
 
     def pending_question(self) -> Optional[dict]:
         """The next unknown worth asking Cole about, or None. Returns
-        {key, room, count, descriptor} — the caller turns it into a
-        spoken question (descriptor carries the YOLO class etc.)."""
+        {key, room, count, descriptor, crop_path, location} — the caller
+        turns it into a spoken question; crop_path/location also give the
+        dashboard Review tab its picture + 'where it keeps showing up'."""
         if not self.enabled:
             return None
         for key, rec in self._pending.items():
@@ -177,6 +203,10 @@ class ObjectVocabLearner:
                 return {
                     "key": key, "room": rec["room"], "count": rec["count"],
                     "descriptor": dict(rec.get("descriptor") or {}),
+                    "crop_path": rec.get("crop_path"),
+                    "location": self._location_summary(
+                        rec.get("bboxes") or []
+                    ),
                 }
         return None
 
@@ -239,12 +269,67 @@ class ObjectVocabLearner:
                 for e in self._learned if e.get("query")}
 
     def snapshot(self) -> dict:
-        """Dashboard view — learned vocabulary + in-flight unknowns."""
+        """Dashboard view — learned vocabulary + in-flight unknowns
+        (with picture + spatial evidence, via review_items)."""
         return {
             "learned": list(self._learned),
-            "pending": [
-                {"key": k, "count": r["count"], "room": r["room"],
-                 "asked": r["asked"]}
-                for k, r in self._pending.items()
-            ],
+            "pending": self.review_items(),
         }
+
+    def review_items(self) -> list[dict]:
+        """Every in-flight unknown, richest form — for the dashboard
+        Review tab. Each carries its YOLO class, freshest crop, sighting
+        count, ask state, and a spatial summary (parked in one spot, or
+        scattered?). Sorted most-sighted first."""
+        out: list[dict] = []
+        for key, rec in self._pending.items():
+            desc = rec.get("descriptor") or {}
+            out.append({
+                "key": key,
+                "room": rec["room"],
+                "count": rec["count"],
+                "asked": rec["asked"],
+                "yolo_class": desc.get("yolo_class"),
+                "confidence": desc.get("confidence"),
+                "crop_path": rec.get("crop_path"),
+                "location": self._location_summary(rec.get("bboxes") or []),
+                "first_ts": rec["first_ts"],
+                "last_ts": rec["last_ts"],
+            })
+        out.sort(key=lambda x: x["count"], reverse=True)
+        return out
+
+    @staticmethod
+    def _location_summary(bboxes: list) -> dict:
+        """Collapse a spatial trail of bboxes into {center, stability, n}.
+
+        stability is 0..1 — how tightly the sightings cluster in space.
+        Near 1.0: the object keeps appearing in the SAME place (a real
+        thing sitting somewhere — we can be confident it's there even
+        between detections). Near 0: scattered sightings, more likely
+        detector noise than one persistent object."""
+        pts: list[tuple[float, float]] = []
+        diag = 0.0
+        for b in bboxes:
+            try:
+                x1, y1, x2, y2 = (float(v) for v in b)
+            except Exception:
+                continue
+            pts.append(((x1 + x2) / 2.0, (y1 + y2) / 2.0))
+            diag = max(diag, ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
+        if not pts:
+            return {"center": None, "stability": 0.0, "n": 0}
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        center = [round(cx, 1), round(cy, 1)]
+        if len(pts) < 2 or diag <= 0:
+            return {"center": center,
+                    "stability": 1.0 if len(pts) == 1 else 0.5,
+                    "n": len(pts)}
+        spread = sum(
+            ((p[0] - cx) ** 2 + (p[1] - cy) ** 2) ** 0.5 for p in pts
+        ) / len(pts)
+        # Spread within one object-diagonal == "same spot". Clamp 0..1.
+        stability = max(0.0, min(1.0, 1.0 - spread / diag))
+        return {"center": center, "stability": round(stability, 3),
+                "n": len(pts)}

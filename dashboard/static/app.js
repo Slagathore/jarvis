@@ -4187,6 +4187,131 @@ loadAnomalies();
 // slow poll keeps the review queue fresh without busy-work.
 safeInterval(loadAnomalies, 15000);
 
+// ── Review tab: unknown objects ───────────────────────────────────────────
+// Things Jarvis saw recurring but can't name. The fix for the old voice-only
+// answer window — name or dismiss them here, any time, with the photo + the
+// "keeps showing up here" evidence in front of you.
+
+function renderObjReviewCard(item) {
+  const card = document.createElement("div");
+  card.className = "objreview-card";
+  const key = item.key;
+  const cls = item.yolo_class || "object";
+  const room = item.room || "?";
+  const count = item.count || 0;
+  const loc = item.location || {};
+  const stab = loc.stability != null ? Math.round(loc.stability * 100) : null;
+
+  const img = document.createElement("img");
+  img.className = "objreview-crop";
+  img.src = "/api/object_vocab/review/crop.jpg?key=" + encodeURIComponent(key);
+  img.alt = cls;
+  img.addEventListener("error", () => {
+    const ph = document.createElement("div");
+    ph.className = "objreview-nocrop";
+    ph.textContent = "no photo";
+    if (img.parentNode) img.replaceWith(ph);
+  });
+
+  const meta = document.createElement("div");
+  meta.className = "objreview-meta";
+  const clsEl = document.createElement("div");
+  clsEl.className = "objreview-cls";
+  clsEl.textContent = cls;
+  const lineEl = document.createElement("div");
+  lineEl.className = "objreview-line";
+  lineEl.textContent = room + " · seen " + count + "x";
+  meta.append(clsEl, lineEl);
+  if (stab != null) {
+    const stabEl = document.createElement("div");
+    stabEl.className = "objreview-line objreview-dim";
+    stabEl.textContent =
+      stab >= 70 ? "parked in one spot · " + stab + "% stable"
+        : stab >= 40 ? "roughly one area · " + stab + "% stable"
+          : "moving around · " + stab + "% stable";
+    meta.append(stabEl);
+  }
+
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.className = "reminder-input objreview-name";
+  nameInput.placeholder = "what is it?";
+
+  const answerBtn = document.createElement("button");
+  answerBtn.className = "dev-btn";
+  answerBtn.textContent = "Name it";
+  const dismissBtn = document.createElement("button");
+  dismissBtn.className = "dev-btn";
+  dismissBtn.textContent = "Dismiss";
+
+  answerBtn.addEventListener("click", async () => {
+    const name = nameInput.value.trim();
+    if (!name) { nameInput.focus(); return; }
+    answerBtn.disabled = true; dismissBtn.disabled = true;
+    try {
+      const res = await fetch("/api/object_vocab/review/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: key, name: name }),
+      });
+      if (res.ok) { loadObjectVocabReview(); }
+      else { answerBtn.disabled = false; dismissBtn.disabled = false; }
+    } catch (e) {
+      console.warn("[objreview answer] failed:", e);
+      answerBtn.disabled = false; dismissBtn.disabled = false;
+    }
+  });
+  dismissBtn.addEventListener("click", async () => {
+    answerBtn.disabled = true; dismissBtn.disabled = true;
+    try {
+      const res = await fetch("/api/object_vocab/review/dismiss", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: key }),
+      });
+      if (res.ok) { loadObjectVocabReview(); }
+      else { answerBtn.disabled = false; dismissBtn.disabled = false; }
+    } catch (e) {
+      console.warn("[objreview dismiss] failed:", e);
+      answerBtn.disabled = false; dismissBtn.disabled = false;
+    }
+  });
+  nameInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") answerBtn.click();
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "objreview-actions";
+  actions.append(nameInput, answerBtn, dismissBtn);
+  card.append(img, meta, actions);
+  return card;
+}
+
+async function loadObjectVocabReview() {
+  const grid = document.getElementById("objreview-grid");
+  if (!grid) return;
+  try {
+    const res = await fetch("/api/object_vocab/review");
+    if (!res.ok) return;
+    const body = await res.json();
+    if (!body.available) {
+      grid.innerHTML =
+        '<div class="who-empty">Object learning is disabled.</div>';
+      return;
+    }
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (items.length === 0) {
+      grid.innerHTML =
+        '<div class="who-empty">No unknown objects right now.</div>';
+      return;
+    }
+    grid.innerHTML = "";
+    items.forEach((it) => grid.appendChild(renderObjReviewCard(it)));
+  } catch (err) {
+    console.warn("[loadObjectVocabReview] failed:", err);
+  }
+}
+
 // ── Routine (§25 — PatternMiner behavioral heatmap) ───────────────────────
 // A resident's learned room-by-hour week — the baseline the AnomalyScorer
 // judges against. Cells where a recent anomaly fired are ringed so you can
@@ -4784,7 +4909,7 @@ safeInterval(loadClownStatus, 8000);
         el.hidden = k !== target;
       });
       if (target === "settings") loadSettings();
-      if (target === "reviews") loadReviewsTab();
+      if (target === "reviews") { loadReviewsTab(); loadObjectVocabReview(); }
       if (target === "logs") connectLogStream();
       if (target !== "logs") disconnectLogStream();
       if (target === "perf") startPerfRefresh();
