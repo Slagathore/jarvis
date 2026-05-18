@@ -4312,6 +4312,116 @@ async function loadObjectVocabReview() {
   }
 }
 
+// ── Review tab: unknown sounds ────────────────────────────────────────────
+// Sounds the cascade heard but couldn't identify (not wake / event / speech).
+// Each has a saved clip — play it back, name it, or dismiss the one-offs.
+
+function renderSoundCard(item) {
+  const card = document.createElement("div");
+  card.className = "objreview-card";
+  const id = item.id;
+  const room = item.room || "?";
+  const dur = item.duration_s != null ? item.duration_s : 0;
+
+  const audio = document.createElement("audio");
+  audio.className = "soundreview-audio";
+  audio.controls = true;
+  audio.preload = "none";
+  audio.src = "/api/sound_vocab/review/clip.wav?id=" + encodeURIComponent(id);
+
+  const meta = document.createElement("div");
+  meta.className = "objreview-meta";
+  const title = document.createElement("div");
+  title.className = "objreview-cls";
+  title.textContent = item.guess ? "sound · " + item.guess
+    : "unidentified sound";
+  const line = document.createElement("div");
+  line.className = "objreview-line";
+  const when = item.ts ? new Date(item.ts * 1000).toLocaleString() : "";
+  line.textContent = room + " · " + dur.toFixed(1) + "s"
+    + (when ? " · " + when : "");
+  meta.append(title, line);
+
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.className = "reminder-input objreview-name";
+  nameInput.placeholder = "what was it?";
+
+  const answerBtn = document.createElement("button");
+  answerBtn.className = "dev-btn";
+  answerBtn.textContent = "Name it";
+  const dismissBtn = document.createElement("button");
+  dismissBtn.className = "dev-btn";
+  dismissBtn.textContent = "Dismiss";
+
+  answerBtn.addEventListener("click", async () => {
+    const name = nameInput.value.trim();
+    if (!name) { nameInput.focus(); return; }
+    answerBtn.disabled = true; dismissBtn.disabled = true;
+    try {
+      const res = await fetch("/api/sound_vocab/review/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: id, name: name }),
+      });
+      if (res.ok) { loadSoundVocabReview(); }
+      else { answerBtn.disabled = false; dismissBtn.disabled = false; }
+    } catch (e) {
+      console.warn("[soundreview answer] failed:", e);
+      answerBtn.disabled = false; dismissBtn.disabled = false;
+    }
+  });
+  dismissBtn.addEventListener("click", async () => {
+    answerBtn.disabled = true; dismissBtn.disabled = true;
+    try {
+      const res = await fetch("/api/sound_vocab/review/dismiss", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: id }),
+      });
+      if (res.ok) { loadSoundVocabReview(); }
+      else { answerBtn.disabled = false; dismissBtn.disabled = false; }
+    } catch (e) {
+      console.warn("[soundreview dismiss] failed:", e);
+      answerBtn.disabled = false; dismissBtn.disabled = false;
+    }
+  });
+  nameInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") answerBtn.click();
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "objreview-actions";
+  actions.append(nameInput, answerBtn, dismissBtn);
+  card.append(audio, meta, actions);
+  return card;
+}
+
+async function loadSoundVocabReview() {
+  const grid = document.getElementById("soundreview-grid");
+  if (!grid) return;
+  try {
+    const res = await fetch("/api/sound_vocab/review");
+    if (!res.ok) return;
+    const body = await res.json();
+    if (!body.available) {
+      grid.innerHTML =
+        '<div class="who-empty">Sound learning is disabled.</div>';
+      return;
+    }
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (items.length === 0) {
+      grid.innerHTML =
+        '<div class="who-empty">No unidentified sounds right now.</div>';
+      return;
+    }
+    grid.innerHTML = "";
+    items.forEach((it) => grid.appendChild(renderSoundCard(it)));
+  } catch (err) {
+    console.warn("[loadSoundVocabReview] failed:", err);
+  }
+}
+
 // ── Routine (§25 — PatternMiner behavioral heatmap) ───────────────────────
 // A resident's learned room-by-hour week — the baseline the AnomalyScorer
 // judges against. Cells where a recent anomaly fired are ringed so you can
@@ -4909,7 +5019,11 @@ safeInterval(loadClownStatus, 8000);
         el.hidden = k !== target;
       });
       if (target === "settings") loadSettings();
-      if (target === "reviews") { loadReviewsTab(); loadObjectVocabReview(); }
+      if (target === "reviews") {
+        loadReviewsTab();
+        loadObjectVocabReview();
+        loadSoundVocabReview();
+      }
       if (target === "logs") connectLogStream();
       if (target !== "logs") disconnectLogStream();
       if (target === "perf") startPerfRefresh();

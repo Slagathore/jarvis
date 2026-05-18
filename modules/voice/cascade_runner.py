@@ -255,7 +255,15 @@ class CascadeWakeRunner:
                 f"[CascadeWake:{self.room}] ambient (logged only) -> "
                 f"{decision.transcript!r}"
             )
-        # CascadeAction.DROP / WAKE — nothing to do here.
+        elif (decision.action == CascadeAction.DROP
+              and decision.stage == "stt_empty"):
+            # VAD-segmented, but not a wake word, not a watched safety
+            # event, and not speech — a real sound Jarvis can't name.
+            # Hand it to the orchestrator for the Review tab.
+            await self._bus.publish("voice.unknown_sound", {
+                "room": self.room, "segment": segment,
+            })
+        # CascadeAction.DROP (other) / WAKE — nothing to do here.
 
     async def _on_speech_start(self, payload: dict) -> None:
         if payload.get("room") == self.room:

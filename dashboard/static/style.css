@@ -3364,3 +3364,4 @@ main {
   align-items: center;
 }
 .objreview-name { flex: 1 1 100%; }
+.soundreview-audio { width: 100%; height: 36px; }

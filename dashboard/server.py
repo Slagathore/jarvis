@@ -3155,6 +3155,103 @@ class DashboardServer:
             except Exception:
                 return Response(status_code=404)
 
+        # ── Review tab: unidentified sounds ──────────────────────────────
+        @app.get("/api/sound_vocab/review")
+        async def sound_vocab_review():
+            """Review-tab feed: recent sounds Jarvis heard but could not
+            identify, each with a saved audio clip, plus the sound
+            vocabulary already learned."""
+            orch = self._orchestrator
+            sv = getattr(orch, "sound_vocab", None) if orch else None
+            if sv is None:
+                return JSONResponse(
+                    {"items": [], "learned": [], "available": False}
+                )
+            try:
+                snap = sv.snapshot()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[/api/sound_vocab/review] {e}")
+                return JSONResponse(
+                    {"items": [], "learned": [], "available": False}
+                )
+            return JSONResponse({
+                "items": snap.get("pending", []),
+                "learned": snap.get("learned", []),
+                "available": True,
+            })
+
+        @app.post("/api/sound_vocab/review/answer")
+        async def sound_vocab_review_answer(request: Request):
+            """Name an unidentified sound from the dashboard."""
+            orch = self._orchestrator
+            sv = getattr(orch, "sound_vocab", None) if orch else None
+            if sv is None:
+                raise HTTPException(
+                    status_code=503, detail="sound_vocab unavailable"
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            name = str(body.get("name") or "").strip()
+            try:
+                item_id = int(body.get("id"))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="id is required")
+            if not name:
+                raise HTTPException(status_code=400, detail="name is required")
+            entry = sv.record_answer(item_id, name)
+            if entry is None:
+                raise HTTPException(
+                    status_code=404, detail="unknown id or empty name"
+                )
+            return JSONResponse({"ok": True, "entry": entry})
+
+        @app.post("/api/sound_vocab/review/dismiss")
+        async def sound_vocab_review_dismiss(request: Request):
+            """Dismiss an unidentified sound — a one-off, not worth keeping."""
+            orch = self._orchestrator
+            sv = getattr(orch, "sound_vocab", None) if orch else None
+            if sv is None:
+                raise HTTPException(
+                    status_code=503, detail="sound_vocab unavailable"
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            try:
+                item_id = int(body.get("id"))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="id is required")
+            sv.dismiss(item_id)
+            return JSONResponse({"ok": True})
+
+        @app.get("/api/sound_vocab/review/clip.wav")
+        async def sound_vocab_review_clip(id: int):
+            """Serve the saved audio clip for an unidentified sound."""
+            from fastapi.responses import Response
+            from pathlib import Path as _Path
+            orch = self._orchestrator
+            sv = getattr(orch, "sound_vocab", None) if orch else None
+            if sv is None:
+                return Response(status_code=404)
+            try:
+                clip_path = sv.clip_path_for(int(id))
+            except Exception:
+                clip_path = None
+            if not clip_path:
+                return Response(status_code=404)
+            path = _Path(clip_path)
+            if not path.is_file():
+                return Response(status_code=404)
+            try:
+                return Response(
+                    content=path.read_bytes(), media_type="audio/wav"
+                )
+            except Exception:
+                return Response(status_code=404)
+
         @app.get("/api/world_model/anomalies")
         async def world_model_anomalies(limit: int = 50):
             """§25 anomaly review queue — recent fired anomalies, newest

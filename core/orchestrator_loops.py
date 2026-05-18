@@ -2008,6 +2008,67 @@ class LoopsMixin(OrchestratorMixin):
             logger.debug(f"[LiveEnroll] name extraction failed: {e}")
             return None
 
+    # ── Unknown-sound review ───────────────────────────────────────────────
+
+    async def _on_unknown_sound(self, payload: dict) -> None:
+        """A voice.unknown_sound from the cascade — a VAD segment that was
+        not a wake word, a watched safety event, or speech. Save a clip
+        and note it for the dashboard Review tab. Throttled per room so a
+        persistently noisy room cannot flood the store."""
+        sv = getattr(self, "sound_vocab", None)
+        if sv is None:
+            return
+        room = payload.get("room") or "?"
+        segment = payload.get("segment")
+        import time as _t
+        now = _t.monotonic()
+        # One capture per room per 20 s — enough to catch recurring
+        # mystery sounds without logging every cough and chair scrape.
+        if now - self._unknown_sound_last.get(room, 0.0) < 20.0:
+            return
+        self._unknown_sound_last[room] = now
+        clip_path = None
+        dur = 0.0
+        if segment is not None and len(segment):
+            dur = len(segment) / 16000.0
+            clip_path = self._save_sound_clip(room, segment)
+        sv.note_unknown(room, clip_path=clip_path, duration_s=dur)
+        logger.info(
+            f"[UnknownSound] unidentified sound in '{room}' ({dur:.1f}s)"
+        )
+        try:
+            await self._broadcast({"type": "unknown_sound", "room": room})
+        except Exception:
+            pass
+
+    def _save_sound_clip(self, room: str, segment) -> Optional[str]:
+        """Write a VAD segment (float32 [-1,1] @ 16 kHz) to a mono 16-bit
+        WAV under data/sound_snapshots/. Returns the path, or None."""
+        try:
+            import uuid
+            import wave
+            from datetime import datetime as _dt
+            from pathlib import Path
+            import numpy as _np
+
+            out_dir = Path("data/sound_snapshots")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            seg = _np.asarray(segment, dtype=_np.float32).flatten()
+            pcm = _np.clip(seg * 32768.0, -32768, 32767).astype(_np.int16)
+            path = out_dir / (
+                f"unknown_{room}_{_dt.now().strftime('%Y%m%dT%H%M%S')}_"
+                f"{uuid.uuid4().hex[:6]}.wav"
+            )
+            with wave.open(str(path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                wav.writeframes(pcm.tobytes())
+            return str(path)
+        except Exception as e:
+            logger.debug(f"[UnknownSound] clip save failed: {e}")
+            return None
+
     # ── §23 ask-to-learn object vocabulary ─────────────────────────────────
 
     async def _object_vocab_loop(self) -> None:

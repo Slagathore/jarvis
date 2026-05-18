@@ -309,6 +309,11 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # §23 ask-to-learn object vocabulary — built alongside the
         # ObservationBuilder (None when the world model is disabled).
         self.object_vocab: Optional[Any] = None
+        # Unknown-sound review store — the sound-side analogue of
+        # object_vocab. Built unconditionally in run(); fed by the voice
+        # cascade via the voice.unknown_sound bus event.
+        self.sound_vocab: Optional[Any] = None
+        self._unknown_sound_last: dict[str, float] = {}
         self.alarm_dispatcher: Optional[Any] = None
         # LLM-facing query layer — built alongside WorldModel. The four
         # tools (get_entity_status, list_entities_in_room, who_is_home,
@@ -452,6 +457,15 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # Voice cascade (Option D) outcomes — published by CascadeWakeRunner.
         self.bus.subscribe("voice.triage_escalate", self._on_triage_escalate)
         self.bus.subscribe("voice.sound_event", self._on_cascade_sound_event)
+        # Unknown-sound review — the cascade publishes voice.unknown_sound
+        # for VAD segments that were not wake / watched-event / speech.
+        if self.sound_vocab is None:
+            from modules.voice.sound_vocab import SoundVocabLearner
+            self.sound_vocab = SoundVocabLearner(
+                (self.config.get("voice", {}) or {}).get("sound_vocab", {})
+                or {}
+            )
+        self.bus.subscribe("voice.unknown_sound", self._on_unknown_sound)
         self.bus.subscribe("voice.barge_in", self._on_barge_in)
         self.bus.subscribe("appliance.state_changed", self._on_appliance_changed)
         self.bus.subscribe("node.status", self._on_node_status)
