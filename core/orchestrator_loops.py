@@ -2022,7 +2022,11 @@ class LoopsMixin(OrchestratorMixin):
         if learner is None:
             return
         key = question.get("key", "")
-        room = question.get("room") or self._active_user_room or "office"
+        # The object's room goes in the question TEXT; the question is
+        # spoken to where Cole actually is (his active room), not into the
+        # empty room the object happens to sit in.
+        object_room = question.get("room") or "the house"
+        target_room = self._active_user_room or "office"
         descriptor = question.get("descriptor") or {}
         yolo_class = str(descriptor.get("yolo_class") or "object")
         count = int(question.get("count", 0))
@@ -2032,27 +2036,28 @@ class LoopsMixin(OrchestratorMixin):
         import time as _time
         learner.mark_asked(key)
         self._pending_object_question = {
-            "key": key, "room": room, "asked_ts": _time.monotonic(),
+            "key": key, "room": target_room, "asked_ts": _time.monotonic(),
         }
         logger.info(
-            f"[ObjectVocab] asking about '{yolo_class}' in '{room}' "
-            f"(seen {count}x)"
+            f"[ObjectVocab] asking Cole (in '{target_room}') about "
+            f"'{yolo_class}' seen in '{object_room}' ({count}x)"
         )
         line = await self._compose_in_character(
             prompt=(
                 f"The vision system keeps seeing an object it labels "
-                f"'{yolo_class}' in the {room} — about {count} times — but "
-                f"it is not in your tracked-objects list. Ask Cole, in one "
-                f"short in-character line, what it actually is. No preamble, "
-                f"no quotes."
+                f"'{yolo_class}' in the {object_room} — about {count} times "
+                f"— but it is not in your tracked-objects list. Ask Cole, "
+                f"in one short in-character line, what it actually is. "
+                f"No preamble, no quotes."
             ),
             fallback=(
-                f"I keep noticing a {yolo_class} in the {room} — what is "
-                f"that, exactly?"
+                f"I keep noticing a {yolo_class} in the {object_room} — "
+                f"what is that, exactly?"
             ),
         )
         await self._speak(
-            line, room=room, priority="curiosity", expects_response=True,
+            line, room=target_room, priority="curiosity",
+            expects_response=True,
         )
 
     async def _complete_object_vocab_answer(
