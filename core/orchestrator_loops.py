@@ -1167,6 +1167,22 @@ class LoopsMixin(OrchestratorMixin):
                         f"[WorldModel] object prune failed: {e}"
                     )
 
+                # Entity consolidation — archive per-id duplicates + stale
+                # rows. Also runs on startup; the nightly pass keeps a
+                # long-running instance from drifting back up.
+                try:
+                    cons = await world.consolidate_entities()
+                    if cons.get("duplicates") or cons.get("stale"):
+                        logger.info(
+                            f"[WorldModel] nightly: consolidated "
+                            f"{cons['duplicates']} duplicate + "
+                            f"{cons['stale']} stale entit(ies)"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[WorldModel] entity consolidation failed: {e}"
+                    )
+
                 # Snapshot retention: drop JPEGs older than 48h that
                 # aren't in the per-pet keep-N set. Keeps disk bounded
                 # now that we save crops aggressively for interaction

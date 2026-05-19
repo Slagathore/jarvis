@@ -3414,14 +3414,28 @@ class DashboardServer:
                     status_code=503, detail="World model not registered"
                 )
             assert orch is not None  # narrowed by the ws/wm check above
+            cluster_cfg = (orch.config.get("world_model") or {}).get(
+                "cluster_builder", {}
+            )
+            # Disabled by default: the color+room+size feature vector
+            # cannot separate same-colour pets, and the real discriminator
+            # (a per-pet visual embedding) is the pet-tag path instead.
+            # Re-enable via world_model.cluster_builder.enabled once pets
+            # have good tagged samples.
+            if not cluster_cfg.get("enabled", False):
+                return JSONResponse({
+                    "clusters": {}, "ready": False, "disabled": True,
+                    "message": (
+                        "The cluster builder is disabled — tag pets in "
+                        "frame to build per-pet visual identity instead. "
+                        "Re-enable via world_model.cluster_builder.enabled."
+                    ),
+                })
             species = str(payload.get("species") or "cat")
             n_clusters = payload.get("n_clusters")
             days_back = int(payload.get("days_back", 7))
             from modules.world_model.cluster_builder import (
                 AnimalClusterBuilder,
-            )
-            cluster_cfg = (orch.config.get("world_model") or {}).get(
-                "cluster_builder", {}
             )
             builder = AnimalClusterBuilder(ws, cluster_cfg)
             try:

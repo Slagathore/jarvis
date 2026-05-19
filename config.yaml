@@ -787,6 +787,15 @@ world_model:
   # _vision_loop path — that is the instant revert if the unified path
   # misbehaves.
   unified_perception: true
+  # §22.5 cold-start animal cluster builder. Disabled: its color+room+size
+  # feature vector cannot separate same-colour pets — per-pet visual
+  # identity (tag a pet in frame) is the path instead. Flip to true once
+  # every pet has good tagged samples.
+  cluster_builder:
+    enabled: false
+  # consolidate_entities: a non-PRESENT person/cat/dog entity not seen in
+  # this many days is archived (soft-deleted). Runs on startup + nightly.
+  entity_stale_archive_days: 5
   # Nightly behavioral profile rebuild (§22.6). Once per interval_hours.
   nightly:
     interval_hours: 24
