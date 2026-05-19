@@ -15,11 +15,12 @@ No cloud subscriptions. No wake-word-to-server round trips. Everything runs on y
 - **Understands context** — knows if you're gaming, on a call, asleep, or cooking, and adjusts interruptibility accordingly
 - **Watches rooms via camera** for mess, light state, posture, and presence using YOLOv8 + MediaPipe
 - **Classifies ambient audio** (appliances, music, silence) via TensorFlow/YAMNet
-- **Learns object names by asking** — when it keeps seeing something it can't name, it asks you what it is, then recognises it by name from then on
+- **Learns object + sound names** — unknowns it keeps seeing or hearing surface in the dashboard **Review tab** with a photo or audio clip; name them there (or by voice) and it recognises them from then on
+- **Identifies residents and pets individually** — face + voice for people, a per-pet visual identity for cats and dogs; proactive speech addresses whoever is actually in the room, not one default person
 - **Flags behavioral anomalies** — learns each resident's daily routine and surfaces genuinely-unusual events (off-hours activity, an unexpected room) in a dashboard review queue
 - **Speaks proactively** when curiosity fires and you're interruptible — "Washer's done." / "Kitchen counter's looking a bit busy." Speech is local via [Piper](https://github.com/rhasspy/piper) or the more expressive [Kokoro](https://github.com/hexgrad/kokoro) backend, selectable per voice
 - **Responds to direct questions** via Ollama LLM running locally or configured cloud-backed models
-- **Real-time dashboard** at `http://localhost:7070` — activity state, room status, conversation log, appliance tracking, behavioral-anomaly review queue, degraded-mode status, wake calibration, and perf/model-call metrics
+- **Real-time dashboard** at `http://localhost:7070` — activity state, room status, conversation log, appliance tracking, a **Review tab** (unknown faces / objects / sounds), behavioral-anomaly queue, degraded-mode status, wake calibration, and perf/model-call metrics
 - **Multi-room support** via ESP32-CAM nodes over MQTT (optional hardware expansion)
 
 ---
@@ -157,10 +158,13 @@ jarvis/
 │
 ├── modules/
 │   ├── voice/                  # STT (Whisper), TTS (Piper + Kokoro), wake word + voice cascade
-│   ├── brain/                  # LLM (Ollama), session memory, prompt builder
+│   ├── brain/                  # LLM (Ollama), session memory, prompt builder, personas
 │   ├── context/                # State fusion, interruptibility, curiosity, sleep
 │   ├── activity/               # PC monitor, audio classifier, appliance tracker
-│   ├── vision/                 # Camera, YOLOv8, MediaPipe pose, scene analysis
+│   ├── vision/                 # Camera, YOLOv8, MediaPipe pose, object-vocab learner
+│   ├── identity/               # Cross-modal person identity (ArcFace face + voice)
+│   ├── world_model/            # Persistent entities, belief tracker, pets, anomalies
+│   ├── safety/                 # Alarm subsystem (fire, door, cat-escape, clown)
 │   ├── integrations/           # Sensor/actuator plugin contracts
 │   ├── memory/                 # SQLite database, event log, room baselines
 │   └── network/                # MQTT client, ESP32 node manager
@@ -174,10 +178,13 @@ jarvis/
 │
 ├── scripts/
 │   ├── setup.py                # Environment validator (run before first launch)
-│   ├── test_voice.py           # Phase 1 test: wake word → STT → TTS
-│   ├── test_context.py         # Phase 2 test: activity detection pipeline
-│   ├── test_vision.py          # Phase 3 test: camera + detection pipeline
-│   └── test_mqtt.py            # Phase 4 test: MQTT + node connectivity
+│   ├── test_*.py               # Phase smoke tests (voice/context/vision/mqtt)
+│   ├── test_*_synthetic.py     # Assert-based unit suites (run any time, no hardware)
+│   ├── diagnose_recognition.py # Read-only face-bank health report
+│   └── clean_face_bank.py      # Rebuild a face bank around its coherent core
+│
+├── start.ps1 / stop.ps1        # Launch / graceful-stop Jarvis
+├── force_stop.ps1              # Guaranteed kill — every Jarvis process, nothing else
 │
 └── data/                       # Runtime data (gitignored)
     ├── jarvis.db               # SQLite event/conversation log
@@ -222,6 +229,7 @@ The dashboard now includes:
 - **Degraded Mode card** — best-effort loaded/degraded/disabled status for wake word, STT, TTS, LLM, MQTT, cameras, identity, world model, open-vocab objects, and registered integrations.
 - **Wake Calibration card** — per-room RMS, peak level, wake score, false-positive count, and suggested sensitivity.
 - **Anomalies card** — behavioral-anomaly review queue (§25): events that scored unusual against a resident's learned routine, each with its score, the triggering event, the per-signal breakdown, and a "not unusual" button that feeds threshold auto-tuning.
+- **Review tab** — name or dismiss what Jarvis can't yet identify: unknown faces (the face-bank pending queue), unknown **objects** (with the saved crop and where they keep appearing), and unknown **sounds** (with a playback clip).
 
 ### `modules/context/state_fusion.py`
 
@@ -249,7 +257,7 @@ Credentials are **never** committed:
 
 ## Limitations / Roadmap
 
-- **Split the large coordinators** — `core/orchestrator.py` and `dashboard/server.py` are intentionally scheduled for decomposition; see `TODO_SPLIT_ORCHESTRATOR_DASHBOARD.md`.
+- **Large coordinators** — `core/orchestrator.py` is split into mixins (init / loops / conversation / tools); `dashboard/server.py` is still one large file and is the remaining decomposition candidate.
 - **Migrate integrations gradually** — existing camera/audio/MQTT integrations still live in the orchestrator path, but new sensors/actuators should use `modules/integrations/`.
 - **Dashboard auth** — keep the dashboard on a trusted network until token auth is added, especially when `dashboard_host` is `0.0.0.0`.
 - **YAMNet on CPU** — TensorFlow CUDA support requires additional setup; YAMNet runs on CPU by default.
