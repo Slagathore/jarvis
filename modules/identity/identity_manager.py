@@ -128,6 +128,26 @@ PENDING_MERGE_THRESHOLD = {
 # stays finite even if the merge fails to consolidate them all.
 MAX_UNRESOLVED_PENDING = 200
 
+# ── Passive-capture quality (recognition self-improvement) ──────────────────
+# Coherence gate: a drift / live_question face sample is kept only if it
+# AGREES with the person's existing bank — cosine to the bank mean must
+# clear _COHERENCE_FLOOR. Stops misattributed / low-quality captures from
+# poisoning a bank. Skipped for deliberate enroll and for cold-start (a
+# person with < _COHERENCE_MIN_CORE samples has no core to judge against).
+_COHERENCE_FLOOR = 0.20
+_COHERENCE_MIN_CORE = 8
+
+# Nightly bank gardener: per person, the lowest-centrality face samples
+# (least like the rest of that person's bank — drift, misattribution) are
+# quarantined. Conservative + gradual — at most _GARDENER_MAX_EVICT per
+# person per run, never below _GARDENER_MIN_KEEP, only samples below
+# _GARDENER_OUTLIER_FLOOR. Quarantine re-tags model_version (the loader
+# filters to the exact active tag); clean_face_bank.py --undo reverses it.
+_GARDENER_OUTLIER_FLOOR = 0.15
+_GARDENER_MIN_KEEP = 20
+_GARDENER_MAX_EVICT = 5
+QUARANTINE_MODEL_VERSION = ACTIVE_FACE_MODEL_VERSION + "_quarantined"
+
 
 @dataclass
 class PersonMatch:
@@ -995,6 +1015,34 @@ class IdentityManager:
         )
         return "pending_drift"
 
+    def _passes_coherence_gate(
+        self, person_id: int, emb: np.ndarray, source: str
+    ) -> bool:
+        """A passively-captured face sample is kept only if it agrees with
+        the person's existing bank — cosine to the bank mean must clear
+        _COHERENCE_FLOOR. Skipped for deliberate enroll/migration and for
+        cold-start (< _COHERENCE_MIN_CORE samples — no core to judge yet)."""
+        if source in ("enroll", "migration"):
+            return True
+        existing = self._face_samples.get(person_id, [])
+        if len(existing) < _COHERENCE_MIN_CORE:
+            return True  # cold start — no core to judge against yet
+        mean = np.mean(np.stack(existing), axis=0)
+        ea = emb.astype(np.float32)
+        na = float(np.linalg.norm(ea))
+        nm = float(np.linalg.norm(mean))
+        if na <= 0.0 or nm <= 0.0:
+            return True
+        sim = float(np.dot(ea, mean) / (na * nm))
+        if sim < _COHERENCE_FLOOR:
+            logger.info(
+                f"[Identity] coherence gate rejected a '{source}' face "
+                f"sample for person {person_id} "
+                f"(sim {sim:.2f} < {_COHERENCE_FLOOR})"
+            )
+            return False
+        return True
+
     async def _save_sample(
         self,
         modality: str,
@@ -1030,6 +1078,10 @@ class IdentityManager:
             )
             self._voice_samples.setdefault(person_id, []).append(emb_f32)
         else:
+            # Coherence gate — a passive capture that doesn't look like
+            # the person it's attributed to never enters the bank.
+            if not self._passes_coherence_gate(person_id, emb_f32, source):
+                return
             cap = int(SAMPLES_PER_PERSON_MAX)
             existing = list(self._face_samples.get(person_id, []))
             if len(existing) >= cap and len(existing) > 0:
@@ -1114,6 +1166,62 @@ class IdentityManager:
                 (cutoff,),
             )
         return n
+
+    async def prune_bank_incoherent(self) -> dict:
+        """Nightly bank gardener. Per person, quarantine the lowest-
+        centrality face samples — the ones least like the rest of that
+        person's bank (drift, misattribution). Conservative + gradual:
+        at most _GARDENER_MAX_EVICT per person per run, never below
+        _GARDENER_MIN_KEEP, only samples below _GARDENER_OUTLIER_FLOOR.
+        On a healthy bank this is a no-op; on a degraded one it lifts
+        cohesion a little each night. Quarantine re-tags model_version
+        (clean_face_bank.py --undo reverses). Returns {quarantined,
+        scanned_persons}."""
+        quarantined = 0
+        persons = list(self._face_samples.keys())
+        for pid in persons:
+            embs = self._face_samples.get(pid, [])
+            if len(embs) <= _GARDENER_MIN_KEEP:
+                continue
+            mat = np.stack([
+                e / (float(np.linalg.norm(e)) or 1.0) for e in embs
+            ])
+            n = mat.shape[0]
+            sims = mat @ mat.T
+            centrality = (sims.sum(axis=1) - 1.0) / (n - 1)
+            evict_idx: list[int] = []
+            for i in sorted(range(n), key=lambda j: centrality[j]):
+                if centrality[i] >= _GARDENER_OUTLIER_FLOOR:
+                    break
+                if n - len(evict_idx) <= _GARDENER_MIN_KEEP:
+                    break
+                if len(evict_idx) >= _GARDENER_MAX_EVICT:
+                    break
+                evict_idx.append(i)
+            if not evict_idx:
+                continue
+            # Cache order mirrors face_samples.id ASC (see _evict_most_
+            # redundant). Re-query to map index -> row id.
+            rows = await self._db.fetchall(
+                "SELECT id FROM face_samples WHERE person_id=? "
+                "AND model_version=? ORDER BY id ASC",
+                (pid, ACTIVE_FACE_MODEL_VERSION),
+            )
+            if len(rows) != n:
+                continue  # cache/DB out of sync — skip this person
+            for i in sorted(evict_idx, reverse=True):
+                await self._db.execute(
+                    "UPDATE face_samples SET model_version=? WHERE id=?",
+                    (QUARANTINE_MODEL_VERSION, int(rows[i]["id"])),
+                )
+                del embs[i]
+                quarantined += 1
+        if quarantined:
+            logger.info(
+                f"[Identity] bank gardener: quarantined {quarantined} "
+                f"incoherent face sample(s)"
+            )
+        return {"quarantined": quarantined, "scanned_persons": len(persons)}
 
     async def prune_bank_redundancy(
         self,
