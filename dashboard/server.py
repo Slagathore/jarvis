@@ -3194,10 +3194,13 @@ class DashboardServer:
             except Exception:
                 body = {}
             name = str(body.get("name") or "").strip()
-            try:
-                item_id = int(body.get("id"))
-            except (TypeError, ValueError):
+            raw_id = body.get("id")
+            if raw_id is None:
                 raise HTTPException(status_code=400, detail="id is required")
+            try:
+                item_id = int(raw_id)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="id must be an integer")
             if not name:
                 raise HTTPException(status_code=400, detail="name is required")
             entry = sv.record_answer(item_id, name)
@@ -3220,10 +3223,13 @@ class DashboardServer:
                 body = await request.json()
             except Exception:
                 body = {}
-            try:
-                item_id = int(body.get("id"))
-            except (TypeError, ValueError):
+            raw_id = body.get("id")
+            if raw_id is None:
                 raise HTTPException(status_code=400, detail="id is required")
+            try:
+                item_id = int(raw_id)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="id must be an integer")
             sv.dismiss(item_id)
             return JSONResponse({"ok": True})
 

@@ -1259,8 +1259,9 @@ class LoopsMixin(OrchestratorMixin):
                 # Recognition bank gardener — quarantine incoherent face
                 # samples so per-person cohesion climbs a little each night.
                 try:
-                    if getattr(self, "identity", None) is not None:
-                        g = await self.identity.prune_bank_incoherent()
+                    ident = getattr(self, "identity", None)
+                    if ident is not None:
+                        g = await ident.prune_bank_incoherent()
                         if g.get("quarantined"):
                             logger.info(
                                 f"[Maintenance] bank gardener quarantined "
