@@ -1008,6 +1008,17 @@ class WorldModel:
                 )
                 return
 
+        # Per-pet identity: a cat/dog observation that didn't match by
+        # continuity is routed to its declared pet entity via the
+        # confirmed pet-sample bank — the people-have-person_id
+        # equivalent for pets. Without this, every re-acquisition spawns
+        # a fresh entity (the runaway cat/dog entity count).
+        if obs.obj_class in ("cat", "dog"):
+            pet_ent, pet_conf = await self._resolve_pet_entity(obs)
+            if pet_ent is not None:
+                await self._update_matched(pet_ent, obs, ts, pet_conf)
+                return
+
         # Wider pool for cats/objects: same-type entity with strong
         # embedding match. People are caught by the person_id path above.
         # §23.8 — for objects we additionally lower the threshold when
@@ -1095,6 +1106,49 @@ class WorldModel:
                     and ent.archived_at is None):
                 return ent
         return None
+
+    async def _resolve_pet_entity(
+        self, obs: Observation
+    ) -> tuple[Optional[WorldEntity], float]:
+        """Per-pet identity: match a cat/dog observation against the
+        confirmed pet-sample bank (the tag-a-pet path) and route it to
+        that pet's canonical world entity — the people-have-person_id
+        equivalent for pets, and the cure for the runaway cat/dog entity
+        count. Returns (entity, score), or (None, 0.0) when there is no
+        confident match or no tagged samples."""
+        try:
+            from modules.world_model.pet_identity import (
+                match_pet_from_descriptor,
+            )
+            md = obs.metadata or {}
+            bbox = obs.bbox
+            query: dict = {
+                "species": obs.obj_class,
+                "room": obs.room,
+                "bbox": list(bbox) if bbox else None,
+                "frame_width": md.get("frame_width"),
+                "frame_height": md.get("frame_height"),
+                "size_normalized": md.get("size_normalized"),
+                "color_class": md.get("color_class", "unknown"),
+                "color_histogram": md.get("color_histogram"),
+            }
+            if obs.obj_class == "dog":
+                query["breed_class"] = md.get("breed_class")
+            else:
+                query["coat_texture"] = md.get("coat_texture")
+            match = await match_pet_from_descriptor(
+                db=self.store.db, species=obs.obj_class,
+                room=obs.room or "", query=query,
+            )
+            if match and match.get("accepted") and match.get("pet_name"):
+                ent = self.find_entity_by_name(match["pet_name"])
+                if (ent is not None
+                        and ent.entity_type == obs.obj_class
+                        and ent.archived_at is None):
+                    return ent, float(match.get("score") or 0.0)
+        except Exception as e:
+            logger.debug(f"[WorldModel] pet identity resolve failed: {e}")
+        return None, 0.0
 
     # ────────────────────────────────────────────────────────────────────────
     # ENTITY EXPECTED, NOT SEEN — bounded-house disappearance logic
