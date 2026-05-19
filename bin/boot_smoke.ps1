@@ -48,6 +48,7 @@ if ($crashed) {
 } else {
     Write-Host '[boot-smoke] init window elapsed; probing endpoints...'
     foreach ($ep in @('/api/health', '/api/object_vocab/review',
+                      '/api/sound_vocab/review',
                       '/api/world_model/beliefs', '/api/state')) {
         try {
             $r = Invoke-WebRequest -Uri ("http://127.0.0.1:7070" + $ep) `
