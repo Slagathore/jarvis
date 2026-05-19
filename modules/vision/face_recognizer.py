@@ -33,9 +33,6 @@ Spec:    new 2.md §11 (The ArcFace Upgrade).
 #todo: Detect when CUDAExecutionProvider isn't actually wired (e.g. cuDNN
        missing) and fall back to CPU with a logger.warning instead of
        silently using CPU. Today onnxruntime hides that downgrade.
-#todo: ArcFace uses input size 112×112; if the largest detected face is
-       smaller than that, log it — sub-resolution faces produce noisy
-       embeddings that pollute the centroid bank.
 """
 from __future__ import annotations
 
@@ -71,6 +68,10 @@ MARGIN_THRESHOLD = 0.10
 # is 112×112; anything appreciably smaller is upscaled by the encoder
 # and produces noisy embeddings.
 _MIN_FACE_AREA = 30 * 30
+# ArcFace's aligned-input edge. A detected face whose shorter side falls
+# below this is upscaled into the encoder — flagged `low_res` on the face
+# dict + logged, so quality gates / diagnostics can see noisy captures.
+_ARCFACE_INPUT_PX = 112
 
 
 class FaceRecognizer:
@@ -260,11 +261,19 @@ class FaceRecognizer:
         if not faces:
             return None
         # Largest face wins (closest to camera). Tie-broken arbitrarily.
-        return max(
+        best = max(
             faces,
             key=lambda f: (f["bbox"][2] - f["bbox"][0])
                           * (f["bbox"][3] - f["bbox"][1]),
         )
+        if best.get("low_res"):
+            bb = best["bbox"]
+            logger.debug(
+                f"[FaceRec] largest face is sub-{_ARCFACE_INPUT_PX}px "
+                f"({bb[2] - bb[0]}x{bb[3] - bb[1]}) — embedding will be "
+                f"noisy; a weak enrollment / drift sample"
+            )
+        return best
 
     # ── Legacy enroll/identify/list/delete (v1 `faces` table) ──────────────
     # These kept for backwards compatibility — the dashboard's old enroll
@@ -382,10 +391,16 @@ def _face_to_dict(f: Any, bbox: tuple) -> dict:
     of the system passes around. Embedding is `normed_embedding` —
     already L2-normalized, 512-dim float32."""
     pose = getattr(f, "pose", None)  # array [pitch, yaw, roll] or None
+    width = int(bbox[2]) - int(bbox[0])
+    height = int(bbox[3]) - int(bbox[1])
     return {
         "bbox": bbox,
         "embedding": np.asarray(f.normed_embedding, dtype=np.float32),
         "det_score": float(f.det_score),
+        # True when the detected face's shorter side is below ArcFace's
+        # 112px aligned input — the chip is upscaled, the embedding noisy
+        # and a poor centroid-bank sample. Consumers can branch on it.
+        "low_res": bool(min(width, height) < _ARCFACE_INPUT_PX),
         "yaw":   float(pose[1]) if pose is not None else 0.0,
         "pitch": float(pose[0]) if pose is not None else 0.0,
         "roll":  float(pose[2]) if pose is not None else 0.0,
