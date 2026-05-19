@@ -17,11 +17,6 @@ Mission: The WorldModel orchestrator. Receives Observations, holds the
 Modules: modules/world_model/world_model.py
 Classes: WorldModel
 Spec:    new 2.md §13 (Association Algorithm), §17 (Full Code).
-
-#todo: Phase 4 object cost function fills `_object_pair_cost`. Today the
-       stub hard-rejects every object candidate so objects become
-       FIRST_SEEN per observation — fine for Phase 1 (no objects
-       tracked yet), wrong once §23 lands.
 """
 from __future__ import annotations
 
