@@ -1,4 +1,4 @@
-# boot_smoke.ps1 — one-shot live boot smoke test.
+# boot_smoke.ps1 -- one-shot live boot smoke test.
 #
 # Boots Jarvis, waits up to 150 s for the dashboard, probes a few HTTP
 # endpoints (including the new Review-tab API), then force-stops it.

@@ -1,4 +1,4 @@
-# start.ps1 — Launch Jarvis in the current terminal window.
+# start.ps1 -- Launch Jarvis in the current terminal window.
 # Activate the venv if not already active, then run main.py.
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path

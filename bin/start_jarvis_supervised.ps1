@@ -10,8 +10,8 @@
 #   - Self-edit restart (Jarvis exited with code 42): relaunch and watch
 #     for data/heartbeat.txt for 60 seconds. If absent AND the most
 #     recent commit message starts with 'selfedit:', revert that one
-#     commit and try again. ANY other state — non-selfedit last commit,
-#     unclear cause — supervisor refuses to revert and exits so Cole
+#     commit and try again. ANY other state -- non-selfedit last commit,
+#     unclear cause -- supervisor refuses to revert and exits so Cole
 #     can investigate manually.
 #
 # Usage:
@@ -39,7 +39,7 @@ while ($true) {
     if ($justSelfEdited) {
         # Post-selfedit restart: enforce a heartbeat within 60 seconds. If
         # the new code can't even boot, the self-edit broke something.
-        Write-Host "[Supervisor] post-selfedit restart — watching for heartbeat (60s)..." -ForegroundColor Yellow
+        Write-Host "[Supervisor] post-selfedit restart -- watching for heartbeat (60s)..." -ForegroundColor Yellow
         $startWatch = [System.Diagnostics.Stopwatch]::StartNew()
         $startupOk = $false
         while ($startWatch.Elapsed.TotalSeconds -lt 60) {
@@ -49,7 +49,7 @@ while ($true) {
         }
 
         if (-not $startupOk) {
-            Write-Host "[Supervisor] post-selfedit startup failed — examining HEAD" -ForegroundColor Red
+            Write-Host "[Supervisor] post-selfedit startup failed -- examining HEAD" -ForegroundColor Red
             if (-not $process.HasExited) {
                 try { Stop-Process -Id $process.Id -Force } catch {}
             }
@@ -70,7 +70,7 @@ while ($true) {
                     Start-Sleep -Seconds 2
                     continue
                 } else {
-                    Write-Host "[Supervisor] last commit is NOT a selfedit ('$lastMsg') — refusing to revert." -ForegroundColor Red
+                    Write-Host "[Supervisor] last commit is NOT a selfedit ('$lastMsg') -- refusing to revert." -ForegroundColor Red
                     Write-Host "[Supervisor] something else is wrong with startup. Stopping supervisor; investigate manually." -ForegroundColor Red
                     Pop-Location
                     break
@@ -81,7 +81,7 @@ while ($true) {
             }
         }
 
-        # Heartbeat received — selfedit didn't break startup, clear the flag
+        # Heartbeat received -- selfedit didn't break startup, clear the flag
         $justSelfEdited = $false
         Write-Host "[Supervisor] heartbeat received; selfedit applied successfully." -ForegroundColor Green
     } else {
@@ -89,7 +89,7 @@ while ($true) {
         # Whisper + sentence-transformers + face-encoder loads can take a
         # full minute on a fresh boot, and we never want the supervisor to
         # mistake slow startup for a broken self-edit.
-        Write-Host "[Supervisor] cold start — Jarvis owns its own startup time. No git enforcement." -ForegroundColor DarkGray
+        Write-Host "[Supervisor] cold start -- Jarvis owns its own startup time. No git enforcement." -ForegroundColor DarkGray
     }
 
     # Wait for the process to finish, no matter how long that takes.
@@ -97,24 +97,24 @@ while ($true) {
     $exitCode = $process.ExitCode
 
     # An explicit stop (stop.ps1 wrote data/stop.flag) overrides every
-    # restart path below — including a non-zero exit from a force-kill.
+    # restart path below -- including a non-zero exit from a force-kill.
     # On a graceful stop the orchestrator already removed the flag and the
     # exit code is 0; this check is the belt for the force-kill fallback.
     if (Test-Path $stopFlag) {
-        Write-Host "[Supervisor] stop.flag present — explicit stop, not respawning." -ForegroundColor Yellow
+        Write-Host "[Supervisor] stop.flag present -- explicit stop, not respawning." -ForegroundColor Yellow
         Remove-Item $stopFlag -Force -ErrorAction SilentlyContinue
         break
     }
 
     if ($exitCode -eq 42) {
-        # Self-edit's restart_self — engage the heartbeat-or-revert dance.
+        # Self-edit's restart_self -- engage the heartbeat-or-revert dance.
         Write-Host "[Supervisor] self-edit restart requested; relaunching with heartbeat watch..." -ForegroundColor Cyan
         $justSelfEdited = $true
         continue
     }
 
     if ($exitCode -eq 43) {
-        # Dashboard-triggered restart — plain relaunch. NO heartbeat
+        # Dashboard-triggered restart -- plain relaunch. NO heartbeat
         # enforcement, NO revert path. The user explicitly asked Jarvis to
         # restart; nothing about that should ever touch git.
         Write-Host "[Supervisor] dashboard restart requested; plain relaunch (no heartbeat watch, no revert)..." -ForegroundColor Cyan

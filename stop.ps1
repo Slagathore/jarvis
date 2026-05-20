@@ -1,7 +1,7 @@
-# stop.ps1 — Stop a running Jarvis instance.
+# stop.ps1 -- Stop a running Jarvis instance.
 #
 # Writes data/stop.flag, which the orchestrator's stop-flag watcher turns
-# into a real graceful shutdown (cameras released, DB closed) — and which
+# into a real graceful shutdown (cameras released, DB closed) -- and which
 # the supervisor (bin/start_jarvis_supervised.ps1) consumes so it stops
 # respawning instead of treating the stop as a crash.
 #
@@ -16,7 +16,7 @@ $stopFlag  = Join-Path $scriptDir "data\stop.flag"
 New-Item -ItemType File -Path $stopFlag -Force | Out-Null
 Write-Host "Requested graceful shutdown (data/stop.flag)..." -ForegroundColor Yellow
 
-# 2. Identify the Jarvis process — PID file first, then port 7070.
+# 2. Identify the Jarvis process -- PID file first, then port 7070.
 $jarvisPid = $null
 if (Test-Path $pidFile) {
     try { $jarvisPid = [int](Get-Content $pidFile -Raw).Trim() } catch {}
@@ -45,7 +45,7 @@ $exited = $proc.WaitForExit(20000)
 if ($exited) {
     Write-Host "Jarvis stopped gracefully." -ForegroundColor Green
 } else {
-    Write-Host "Graceful shutdown timed out (20s) — force-killing." -ForegroundColor Red
+    Write-Host "Graceful shutdown timed out (20s) -- force-killing." -ForegroundColor Red
     try { Stop-Process -Id $jarvisPid -Force } catch {}
     Write-Host "Jarvis stopped (forced)." -ForegroundColor Yellow
 }
