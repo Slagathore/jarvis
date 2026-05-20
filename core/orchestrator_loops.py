@@ -16,8 +16,24 @@ Classes: LoopsMixin
 from core.orchestrator_base import OrchestratorMixin
 import asyncio
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+
+def _delay_to_next_local_hour(hour: int) -> float:
+    """Seconds until the next local-time HH:00:00.
+
+    Used by the nightly maintenance loop to schedule against wall-clock
+    instead of boot-time. The previous shape -- sleep grace_s, run, sleep
+    24h -- meant the heavy nightly pass landed ~60s after every boot,
+    starving the DB right when the dashboard was loading. Anchoring to a
+    real off-peak hour (default 03:00) makes the pass invisible.
+    """
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target = target + timedelta(days=1)
+    return (target - now).total_seconds()
 
 import numpy as np
 from loguru import logger
@@ -1096,31 +1112,55 @@ class LoopsMixin(OrchestratorMixin):
 
     async def _world_model_nightly_loop(self) -> None:
         """
-        §22.6 BehavioralProfileBuilder. Once per `interval_hours` (24 by
-        default), iterate over every resident pet entity and rebuild its
-        behavioral profile from the last 30 days of events. The first
-        run waits `startup_grace_seconds` to avoid stampeding boot.
+        §22.6 + nightly maintenance. Once a day at `run_at_hour` (03:00
+        local by default), iterate over every resident pet entity and
+        rebuild its behavioral profile, then run the full DB / snapshot
+        / consolidation / pattern / bank-gardener pass.
+
+        Anchors to a wall-clock hour rather than "boot+grace, then every
+        N hours" -- the prior boot-anchored shape landed the heavy pass
+        ~60s into every boot, stalling the DB at exactly the moment the
+        dashboard and every other loop were doing their first reads, and
+        gave Cole a multi-minute boot freeze. 03:00 local is off-peak,
+        so the inevitable DB contention is invisible.
+
+        `startup_grace_seconds` is now a floor: if today's run_at_hour
+        is closer than that (we booted at 02:59 and run_at_hour=3), we
+        push to the next day so we still never fire mid-boot.
         """
         cfg = (self.config.get("world_model") or {}).get("nightly", {})
-        interval_hours = float(cfg.get("interval_hours", 24))
+        run_at_hour = int(cfg.get("run_at_hour", 3))
         grace_s = float(cfg.get("startup_grace_seconds", 60))
         days_back = int(cfg.get("profile_days_back", 30))
 
         logger.info(
-            f"[WorldModel] nightly profile builder loop starting "
-            f"(every {interval_hours}h, {days_back}d window)"
+            f"[WorldModel] nightly maintenance loop starting "
+            f"(fires at {run_at_hour:02d}:00 local, {days_back}d window)"
         )
-        try:
-            await asyncio.sleep(grace_s)
-        except asyncio.CancelledError:
-            return
 
         builder = BehavioralProfileBuilder()
         while True:
+            # Wall-clock schedule: sleep to the next run_at_hour. If we
+            # booted just before the hour and the next firing would be
+            # inside the startup-grace window, push to the day after --
+            # the maintenance pass must never land mid-boot again.
+            delay = _delay_to_next_local_hour(run_at_hour)
+            if delay < grace_s:
+                delay += 86400.0
+            hours = delay / 3600.0
+            logger.info(
+                f"[WorldModel] nightly: sleeping {hours:.1f}h until "
+                f"next {run_at_hour:02d}:00 local"
+            )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            logger.info("[WorldModel] nightly: starting maintenance pass")
             try:
                 world = self.world_model
                 if world is None:
-                    await asyncio.sleep(interval_hours * 3600)
+                    # No world model this boot -- skip to the next slot.
                     continue
                 # Snapshot the entity list under the lock so we don't
                 # rebuild the same dict twice if entities mutate mid-pass.
@@ -1275,10 +1315,8 @@ class LoopsMixin(OrchestratorMixin):
                 logger.exception(
                     "[WorldModel] nightly loop iteration crashed"
                 )
-            try:
-                await asyncio.sleep(interval_hours * 3600)
-            except asyncio.CancelledError:
-                break
+            # Loop -- next iteration recomputes the delay to the next
+            # wall-clock run_at_hour, drift-free.
 
     # ── Event Handlers ─────────────────────────────────────────────────────
 

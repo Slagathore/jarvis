@@ -21,13 +21,21 @@ Classes: PatternMiner
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger
 
+from modules.world_model.event_windows import RoomTimeIndex
+
 _PRESENT_EVENTS = ("reappeared", "moved_to", "first_seen")
+# Safety cap for the one-shot "all present events in the window" query
+# used by _co_presence. Covers ~30 days of household event volume with
+# headroom; if it's ever exceeded we lose oldest-first via the DESC LIMIT
+# in store.search_events -- acceptable degradation for a 30-day profile.
+_PRESENT_QUERY_LIMIT = 250000
 
 
 def _parse_ts(value: Any) -> datetime:
@@ -102,6 +110,23 @@ class PatternMiner:
         )
         if not events:
             return {"n_events": 0, "window_start": since.isoformat()}
+        # _co_presence does its own (one) windowed DB query; everything
+        # else is pure CPU and gets offloaded so we never block the
+        # event loop for more than the DB round-trip itself, even with
+        # 100k events.
+        co_presence = await self._co_presence(ent, events)
+        return await asyncio.to_thread(
+            self._build_histograms, events, since, co_presence,
+        )
+
+    def _build_histograms(
+        self,
+        events: list[dict],
+        since: datetime,
+        co_presence: dict[str, float],
+    ) -> dict[str, Any]:
+        """Pure-CPU profile assembly. Called via asyncio.to_thread so the
+        per-pass histogram work never touches the event loop."""
         return {
             "n_events": len(events),
             "window_start": since.isoformat(),
@@ -109,7 +134,7 @@ class PatternMiner:
             "arrival_by_weekday": self._arrival_distribution(events),
             "departure_by_weekday": self._departure_distribution(events),
             "room_by_weekday_hour": self._room_by_weekday_hour(events),
-            "co_presence": await self._co_presence(ent, events),
+            "co_presence": co_presence,
             "morning_routine": self._morning_routine(events),
             "long_stays_by_room": self._long_stays_by_room(events),
             "weekly_active_hours": self._weekly_active_hours(events),
@@ -161,8 +186,21 @@ class PatternMiner:
     # ── co-presence ──────────────────────────────────────────────────────────
 
     async def _co_presence(self, ent: Any, my_events: list[dict]) -> dict[str, float]:
-        """{other_resident_name: fraction of my present-windows overlapping
-        with them in the same room within ±2 minutes}."""
+        """{other_resident_name: avg matching events per my present-window}.
+
+        Same semantic as the original: for each of my present-events
+        in (room, ts), count how many OTHER people's present-events
+        fall within +/-2 min in the same room, then divide by the
+        count of my windows. (Can exceed 1.0 -- it's a count ratio,
+        not a probability.)
+
+        Mechanics: one windowed query for every PRESENT-event in the
+        analysis window, then an in-memory bisect via RoomTimeIndex.
+        The previous shape was one DB query per of-my-events and was
+        the dominant share of the boot-time DB freeze -- a resident
+        with 30k present-events fired 30k sequential round-trips
+        through the single shared aiosqlite connection.
+        """
         my_present = [
             (_parse_ts(e["ts"]), e.get("room"))
             for e in my_events
@@ -170,14 +208,16 @@ class PatternMiner:
         ]
         if not my_present:
             return {}
+        since = datetime.now(timezone.utc) - timedelta(days=self.days_back)
+        all_present = await self.world.store.search_events(
+            event_types=list(_PRESENT_EVENTS),
+            since=since,
+            limit=_PRESENT_QUERY_LIMIT,
+        )
+        index = RoomTimeIndex(all_present)
         overlaps: dict[str, int] = defaultdict(int)
         for ts, room in my_present:
-            window = await self.world.store.search_events(
-                room=room, event_types=list(_PRESENT_EVENTS),
-                since=ts - timedelta(minutes=2),
-                until=ts + timedelta(minutes=2), limit=50,
-            )
-            for w in window:
+            for w in index.window(room, ts, 120.0):
                 if (w.get("entity_type") == "person"
                         and w.get("entity_id") != ent.id
                         and w.get("entity_name")):

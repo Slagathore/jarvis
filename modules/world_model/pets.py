@@ -38,8 +38,18 @@ from typing import Any, Optional
 import numpy as np
 from loguru import logger
 
+from modules.world_model.event_windows import RoomTimeIndex
 from modules.world_model.store import WorldStore
 from modules.world_model.types import EntityState, WorldEntity
+
+# Present-event types we care about for co-presence reasoning -- when a
+# pet "shows up" somewhere. Matches patterns._PRESENT_EVENTS by design;
+# the two profile builders observe the same notion of "present."
+_APPEAR_TYPES = ("reappeared", "moved_to", "first_seen")
+# Safety cap on the one-shot windowed query that backs both
+# co-presence calculators. See event_windows for why this is ONE query
+# now instead of one per pet event.
+_PRESENT_QUERY_LIMIT = 250000
 
 
 def _utcnow() -> datetime:
@@ -325,6 +335,14 @@ class BehavioralProfileBuilder:
 
         Returns the freshly built profile dict and writes it to
         `ent.metadata['behavioral_profile']` + persists via upsert.
+
+        Co-presence reasoning (human_avoidance + co_occurrence) used to
+        fire one DB query per pet PRESENT-event -- thousands of round-
+        trips on the single shared aiosqlite connection that helped
+        stall the whole DB ~60s after every boot. We now do TWO queries
+        for the whole pass: one for the pet's own events, one for every
+        PRESENT-event in the window, both calculators sharing a single
+        room-bucketed index. See event_windows.RoomTimeIndex.
         """
         since = _utcnow() - timedelta(days=days_back)
         events = await world.store.search_events(
@@ -333,13 +351,19 @@ class BehavioralProfileBuilder:
         if not events:
             return ent.metadata.get("behavioral_profile") or {}
 
+        all_present = await world.store.search_events(
+            event_types=list(_APPEAR_TYPES), since=since,
+            limit=_PRESENT_QUERY_LIMIT,
+        )
+        index = RoomTimeIndex(all_present)
+
         profile = {
             "room_distribution": self._room_distribution(events),
             "room_distribution_by_hour": self._room_distribution_by_hour(events),
             "bbox_size_per_room": self._bbox_size_per_room(events),
             "stationary_fraction": self._stationary_fraction(events),
-            "human_avoidance_score": await self._human_avoidance(world, ent, since),
-            "co_occurrence_partners": await self._co_occurrence(world, ent, since),
+            "human_avoidance_score": self._human_avoidance(events, index),
+            "co_occurrence_partners": self._co_occurrence(ent, events, index),
             "n_observations": len(events),
             "window_start": since.isoformat(),
             "window_end": _utcnow().isoformat(),
@@ -420,16 +444,20 @@ class BehavioralProfileBuilder:
         ratio = movements / max(appearances, 1)
         return float(max(0.0, min(1.0, 1.0 - ratio / 5.0)))
 
-    async def _human_avoidance(
-        self, world: Any, ent: WorldEntity, since: datetime,
+    @staticmethod
+    def _human_avoidance(
+        events: list[dict], index: RoomTimeIndex,
     ) -> float:
         """For each pet PRESENT-event, check whether a person was also in
-        the same room within ±60s. Avoidance = 1 - cohabitation rate."""
-        appear_types = ["reappeared", "moved_to", "first_seen"]
-        pet_events = await world.store.search_events(
-            entity_id=ent.id, event_types=appear_types,
-            since=since, limit=10000,
-        )
+        the same room within +/-60s. Avoidance = 1 - cohabitation rate.
+
+        Now consumes the shared windowed `index` instead of issuing one
+        DB query per pet event. `events` is the pet's full event list
+        from rebuild_for; we filter to PRESENT-events in memory.
+        """
+        pet_events = [
+            e for e in events if e.get("event_type") in _APPEAR_TYPES
+        ]
         if not pet_events:
             return 0.5
         cohab = 0
@@ -437,26 +465,22 @@ class BehavioralProfileBuilder:
             ts = _parse_event_ts(ce)
             if ts is None:
                 continue
-            window = await world.store.search_events(
-                room=ce.get("room"),
-                event_types=appear_types,
-                since=ts - timedelta(seconds=60),
-                until=ts + timedelta(seconds=60),
-                limit=50,
-            )
+            window = index.window(ce.get("room"), ts, 60.0)
             if any(w.get("entity_type") == "person" for w in window):
                 cohab += 1
         return float(1.0 - (cohab / max(len(pet_events), 1)))
 
-    async def _co_occurrence(
-        self, world: Any, ent: WorldEntity, since: datetime,
+    @staticmethod
+    def _co_occurrence(
+        ent: WorldEntity, events: list[dict], index: RoomTimeIndex,
     ) -> dict[str, float]:
-        """Same window logic — find which other pets show up alongside us."""
-        appear_types = ["reappeared", "moved_to", "first_seen"]
-        pet_events = await world.store.search_events(
-            entity_id=ent.id, event_types=appear_types,
-            since=since, limit=10000,
-        )
+        """Same window logic -- which other pets show up alongside us.
+
+        Same one-shared-index restructure as _human_avoidance.
+        """
+        pet_events = [
+            e for e in events if e.get("event_type") in _APPEAR_TYPES
+        ]
         if not pet_events:
             return {}
         partner_counts: dict[str, int] = defaultdict(int)
@@ -464,14 +488,7 @@ class BehavioralProfileBuilder:
             ts = _parse_event_ts(ce)
             if ts is None:
                 continue
-            window = await world.store.search_events(
-                room=ce.get("room"),
-                event_types=appear_types,
-                since=ts - timedelta(seconds=60),
-                until=ts + timedelta(seconds=60),
-                limit=50,
-            )
-            for w in window:
+            for w in index.window(ce.get("room"), ts, 60.0):
                 if (w.get("entity_type") in ("cat", "dog")
                         and w.get("entity_id") != ent.id
                         and w.get("entity_name")):

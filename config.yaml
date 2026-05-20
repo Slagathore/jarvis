@@ -796,9 +796,14 @@ world_model:
   # consolidate_entities: a non-PRESENT person/cat/dog entity not seen in
   # this many days is archived (soft-deleted). Runs on startup + nightly.
   entity_stale_archive_days: 5
-  # Nightly behavioral profile rebuild (§22.6). Once per interval_hours.
+  # Nightly behavioral profile rebuild + DB maintenance (§22.6). Anchored
+  # to wall-clock `run_at_hour` (local time), NOT boot+N hours. The prior
+  # boot-anchored schedule landed the heavy pass ~60s into every boot and
+  # stalled the dashboard / DB for minutes; an off-peak hour is invisible.
+  # startup_grace_seconds is a floor: if `run_at_hour` is closer than this
+  # (we booted at 02:59 and run_at_hour=3), push to the day after.
   nightly:
-    interval_hours: 24
+    run_at_hour: 3
     startup_grace_seconds: 60
     profile_days_back: 30
     # DB retention for the nightly maintenance pass. world_entity_events is
