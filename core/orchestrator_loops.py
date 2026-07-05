@@ -38,6 +38,7 @@ def _delay_to_next_local_hour(hour: int) -> float:
 import numpy as np
 from loguru import logger
 
+from core.async_utils import log_throttled
 from core.task_supervisor import TaskPolicy, TaskSupervisor
 from core.event_bus import EventBus
 from core.exceptions import JarvisError
@@ -446,7 +447,10 @@ class LoopsMixin(OrchestratorMixin):
                                         )
                                         self._set_active_user_room(room_id)
                             except Exception as e:
-                                logger.debug(f"[Identity/face] identify failed: {e}")
+                                log_throttled(
+                                    "identity.face_identify",
+                                    f"[Identity/face] identify failed: {e}",
+                                )
 
                         # Persona system hooks. Two updates per pass:
                         #   1. Room occupancy snapshot — feeds the activation
@@ -474,8 +478,9 @@ class LoopsMixin(OrchestratorMixin):
                                         identity=recognized_name,
                                     )
                                 except Exception as e:
-                                    logger.debug(
-                                        f"[Persona] face notify failed: {e}"
+                                    log_throttled(
+                                        "persona.face_notify",
+                                        f"[Persona] face notify failed: {e}",
                                     )
 
                         # Drift verify (passive): if a recent wake matched
@@ -506,7 +511,10 @@ class LoopsMixin(OrchestratorMixin):
                                             "outcome": outcome,
                                         })
                                 except Exception as e:
-                                    logger.debug(f"[Identity/drift] verify_face failed: {e}")
+                                    log_throttled(
+                                        "identity.drift_verify_face",
+                                        f"[Identity/drift] verify_face failed: {e}",
+                                    )
 
                         # Drift verify reverse direction: if a face was just
                         # matched and we have a recent wake audio buffer
@@ -533,7 +541,10 @@ class LoopsMixin(OrchestratorMixin):
                                         "outcome": outcome,
                                     })
                             except Exception as e:
-                                logger.debug(f"[Identity/drift] verify_voice failed: {e}")
+                                log_throttled(
+                                    "identity.drift_verify_voice",
+                                    f"[Identity/drift] verify_voice failed: {e}",
+                                )
 
                         # Scene description — SceneAnalyzer self-gates on local
                         # frame-change detection, so we always call it and let
@@ -2106,8 +2117,8 @@ class LoopsMixin(OrchestratorMixin):
         )
         try:
             await self._broadcast({"type": "unknown_sound", "room": room})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[UnknownSound] dashboard broadcast failed: {e}")
 
     def _save_sound_clip(self, room: str, segment) -> Optional[str]:
         """Write a VAD segment (float32 [-1,1] @ 16 kHz) to a mono 16-bit
@@ -2774,8 +2785,10 @@ class LoopsMixin(OrchestratorMixin):
                     recents = await self.memory.list_recent(limit=15)
                     for r in recents[:8]:
                         ctx_lines.append(f"- ({r['kind']}) {r['content']}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        f"[Reflection] list_recent failed, reflecting without memory context: {e}"
+                    )
                 prompt = (
                     "You're Jarvis with a quiet moment. Reflect on what you've "
                     "noticed recently — patterns in Cole's day, things you're "

@@ -25,9 +25,40 @@ Usage:
 """
 
 import asyncio
+import time
 from typing import Coroutine, Optional
 
 from loguru import logger
+
+# ── Throttled logging ────────────────────────────────────────────────────
+# For failures inside hot loops (per-room vision pass, per-frame hooks):
+# a broken subsystem should be VISIBLE at the default INFO level, but not
+# emit hundreds of identical lines per minute. One warning per key per
+# window; repeats within the window drop to DEBUG so the file log keeps
+# the full record.
+
+_throttle_last_emit: dict[str, float] = {}
+
+
+def log_throttled(
+    key: str,
+    message: str,
+    *,
+    level: str = "WARNING",
+    interval_s: float = 300.0,
+) -> None:
+    """Log `message` at `level`, at most once per `key` per `interval_s`.
+
+    Suppressed repeats are still logged at DEBUG so the rotating file log
+    (which captures DEBUG) retains every occurrence for diagnosis.
+    """
+    now = time.monotonic()
+    last = _throttle_last_emit.get(key)
+    if last is not None and (now - last) < interval_s:
+        logger.debug(f"{message} (repeat, throttled)")
+        return
+    _throttle_last_emit[key] = now
+    logger.log(level, message)
 
 
 class TrackedTaskSet:

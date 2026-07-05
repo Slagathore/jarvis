@@ -264,8 +264,8 @@ class MemoryStore:
         if self._broadcast is not None:
             try:
                 await self._broadcast({"type": "memory.updated", "id": int(memory_id)})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[MemoryV2] dashboard broadcast failed: {e}")
         return True
 
     # ── Consolidation (Mem0 "smart write") ─────────────────────────────────
@@ -352,8 +352,8 @@ class MemoryStore:
         if self._broadcast is not None:
             try:
                 await self._broadcast({"type": "memory.deleted", "id": int(memory_id)})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[MemoryV2] dashboard broadcast failed: {e}")
         return True
 
     async def archive(self, memory_id: int) -> bool:
@@ -362,13 +362,14 @@ class MemoryStore:
                 "UPDATE memories SET archived = 1 WHERE id = ?", (memory_id,)
             )
             await self._reload_cache()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[MemoryV2] archive failed: {e}")
             return False
         if self._broadcast is not None:
             try:
                 await self._broadcast({"type": "memory.deleted", "id": int(memory_id)})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[MemoryV2] dashboard broadcast failed: {e}")
         return True
 
     # ── Retrieval ───────────────────────────────────────────────────────────
@@ -427,8 +428,8 @@ class MemoryStore:
                     "WHERE id = ?",
                     (now, mid),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[MemoryV2] access-stat update failed for id={mid}: {e}")
 
         out: list[dict] = []
         for score, mid in top:
@@ -590,8 +591,10 @@ class MemoryStore:
                 "UPDATE memories SET surfaced_at = ? WHERE id = ?",
                 (_now_iso(), memory_id),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # A stuck surfaced_at means this memory gets re-surfaced to Cole
+            # over and over — worth a visible line, not a silent pass.
+            logger.warning(f"[MemoryV2] mark_surfaced failed for id={memory_id}: {e}")
 
     # ── Listing for dashboard ──────────────────────────────────────────────
 
