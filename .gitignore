@@ -43,10 +43,20 @@ data/personas.local.yml
 data/heartbeat.txt
 data/last_safe_sha.txt
 data/restart_pending.txt
+data/stop.flag
+
+# Rotated log archives (loguru compression output)
+data/*.log.zip
+
+# One-off captured test fixtures
+data/test_living_room_audio.wav
+data/test_living_room_frame.jpg
 
 # Local config / secrets
 hardware/esphome/secrets.yaml
 hardware/esphome/.esphome/
+hardware/wyze/wpa_supplicant.conf
+hardware/wyze/etc/ssh/authorized_keys
 *.pem
 *.key
 *.crt
