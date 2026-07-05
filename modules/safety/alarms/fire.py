@@ -106,6 +106,15 @@ class FireAlarm(Alarm):
         await self.bus.subscribe("fire.signal", self._on_fire_signal)
         await self.bus.subscribe("world.entity_event", self._on_entity_event)
         logger.info("[FireAlarm] watching fire.signal + world.entity_event")
+        # No module in the codebase publishes fire.signal yet (see the
+        # #todo in this file's header) — until a smoke/thermal/vision
+        # detector lands, this alarm is armed but can never trigger.
+        # Shout at boot so nobody assumes fire coverage exists.
+        # DELETE this warning in the same change that ships a publisher.
+        logger.warning(
+            "[FireAlarm] armed but INERT: nothing publishes fire.signal — "
+            "there is NO fire detection until a detector module ships"
+        )
 
     async def stop(self) -> None:
         for t in list(self._watch_tasks):
