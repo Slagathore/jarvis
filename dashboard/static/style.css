@@ -18,9 +18,12 @@
   --green: #00ff88;
   --amber: #ffb300;
   --red: #ff4444;
+  /* Dim/muted must stay readable on --bg-card (#0f0f18): the old
+     #606080 / #303050 pair fell below 3:1 contrast and card labels,
+     timestamps, and empty-states were near-invisible on real monitors. */
   --text: #e0e0f0;
-  --text-dim: #606080;
-  --text-muted: #303050;
+  --text-dim: #8a90b4;
+  --text-muted: #575e80;
   --mono: "Space Mono", monospace;
   --sans: "Inter", sans-serif;
   --radius: 4px;
@@ -246,6 +249,25 @@ main {
 .card-primary {
   border-color: var(--border-glow);
   box-shadow: var(--glow-blue);
+}
+
+/* Attention tiers — JS toggles these on cards whose content needs eyes
+   (degraded capabilities, offline services, unreviewed anomalies) so a
+   wall-glance separates "problem" cards from ambient status. */
+.card.card-attention {
+  border-left: 3px solid var(--amber);
+  padding-left: 14px;
+}
+.card.card-attention > .card-label {
+  color: var(--amber);
+}
+.card.card-alert {
+  border-left: 3px solid var(--red);
+  padding-left: 14px;
+  box-shadow: 0 0 20px #ff444422;
+}
+.card.card-alert > .card-label {
+  color: var(--red);
 }
 
 .card-tall {

@@ -381,6 +381,16 @@ function updateSingleAppliance(name, status, runtimeMinutes) {
   }
 }
 
+// Attention tier: flag a card as needing eyes ("attention" amber /
+// "alert" red / null to clear). Pairs with .card-attention/.card-alert
+// in style.css so problem cards pop out of the wall of ambient status.
+function setCardTier(cardId, tier) {
+  const card = document.getElementById(cardId);
+  if (!card) return;
+  card.classList.toggle("card-attention", tier === "attention");
+  card.classList.toggle("card-alert", tier === "alert");
+}
+
 function updateHealth(system) {
   if (!system) return;
 
@@ -392,6 +402,10 @@ function updateHealth(system) {
 
   setDot("h-whisper", system.whisper?.loaded ? "online" : "offline");
   setText("h-whisper-detail", system.whisper?.model || "—");
+
+  const anyDown =
+    !system.ollama?.online || !system.mqtt?.online || !system.whisper?.loaded;
+  setCardTier("health-card", anyDown ? "attention" : null);
 }
 
 async function loadDegradedStatus() {
@@ -412,6 +426,7 @@ function renderDegradedStatus(data) {
   const overall = data?.overall === "ok" ? "ok" : "degraded";
   summary.textContent = overall === "ok" ? "All core capabilities nominal" : "Running with degraded capabilities";
   summary.className = `degraded-summary ${overall}`;
+  setCardTier("degraded-card", overall === "ok" ? null : "attention");
   list.innerHTML = items.map((item) => {
     const status = item.status || "unknown";
     const detail = item.detail ? ` · ${escapeHtml(item.detail)}` : "";
@@ -4164,6 +4179,7 @@ async function loadAnomalies() {
       list.innerHTML =
         '<div class="who-empty">Anomaly scoring unavailable.</div>';
       if (thresholdEl) thresholdEl.textContent = "";
+      setCardTier("anomalies-card", null);
       return;
     }
     if (thresholdEl) {
@@ -4171,6 +4187,7 @@ async function loadAnomalies() {
         body.threshold != null ? `· fires above ${body.threshold}` : "";
     }
     const anomalies = Array.isArray(body.anomalies) ? body.anomalies : [];
+    setCardTier("anomalies-card", anomalies.length > 0 ? "attention" : null);
     if (anomalies.length === 0) {
       list.innerHTML =
         '<div class="who-empty">No anomalies — behavior looks normal.</div>';
