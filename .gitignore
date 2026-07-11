@@ -84,6 +84,15 @@ data/voices/
 Thumbs.db
 
 .claude/
+# AI tooling / assistant files (kept locally, not committed)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursor/
+.cursorrules
+.aider*
+.github/copilot-instructions.md
+FABLES_AUDIT_*.md
 data/jarvis.pid
 data/polygon_overrides.json
 
