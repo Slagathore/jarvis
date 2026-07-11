@@ -47,28 +47,12 @@ class ModelCapabilities:
 
 # Direct-API entries — always available regardless of what Ollama has
 # installed. The OllamaLLM dispatcher routes these through their respective
-# direct clients (currently: Gemini via modules/brain/gemini_direct.py).
-# Model name suffix ':gapi' = Google API direct.
-API_DIRECT_MODELS: list[ModelCapabilities] = [
-    ModelCapabilities(
-        name="gemini-3-flash-preview:gapi",
-        is_cloud=True,
-        is_api_direct=True,
-        context_window=1_000_000,
-        tool_use=True,
-        vision=True,
-        notes="Google API direct (no Ollama). ~300ms first token, full tool calling, native vision. Requires GEMINI_API_KEY in .env.",
-    ),
-    ModelCapabilities(
-        name="gemini-flash-latest:gapi",
-        is_cloud=True,
-        is_api_direct=True,
-        context_window=1_000_000,
-        tool_use=True,
-        vision=True,
-        notes="Google's auto-rolling 'latest flash' alias. Same caps as gemini-3-flash-preview but moves forward when Google releases newer flash.",
-    ),
-]
+# direct clients (model name suffix ':gapi' = Google API direct, via
+# modules/brain/gemini_direct.py). Empty since the 2026-07 consolidation on
+# kimi-k2.7-code:cloud via the native Ollama API — the Gemini direct route
+# is retired from the defaults. The dispatcher + gemini_direct.py remain, so
+# re-registering a ':gapi' entry here is all it takes to bring it back.
+API_DIRECT_MODELS: list[ModelCapabilities] = []
 
 
 # Hardcoded capability table for well-known models. Match by prefix so e.g.
@@ -81,13 +65,13 @@ API_DIRECT_MODELS: list[ModelCapabilities] = [
 CAPABILITIES_TABLE: list[ModelCapabilities] = [
     # ── Cloud (Ollama-hosted) ──────────────────────────────────────────────
     ModelCapabilities(
-        name="gemini-3-flash-preview",
+        name="kimi-k2.7-code",
         is_cloud=True,
-        context_window=1_000_000,
+        context_window=256_000,
         tool_use=True,
-        vision=True,
-        thinking_mode=False,
-        notes="Google Gemini 3 Flash via Ollama Cloud. 1M context, fast tool calling, native image understanding.",
+        vision=False,
+        thinking_mode=True,
+        notes="Moonshot Kimi K2.7 code via Ollama Cloud. Default cloud workhorse. Supports the native `think` parameter (true/false and low/medium/high).",
     ),
     ModelCapabilities(
         name="gemini-3-pro",

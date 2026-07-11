@@ -24,18 +24,19 @@ system:
         per_second: 0.5
         burst: 2
 ollama:
-  model: gemini-3-flash-preview:cloud
-  vision_model: gemini-3-flash-preview:cloud
-  action_model: gemini-3-flash-preview:cloud
+  model: kimi-k2.7-code:cloud
+  vision_model: kimi-k2.7-code:cloud
+  action_model: kimi-k2.7-code:cloud
   base_url: http://localhost:11434
   timeout_seconds: 30
-  # Models routed through Ollama's OpenAI-compatible /v1 endpoint instead of
-  # the native API. Workaround for ollama/ollama#14567 — the native API drops
-  # Gemini-3's thought_signature on tool-call round-trips, which 400s every
-  # multi-turn tool call. The /v1 surface round-trips it intact. Remove a
-  # model from this list once Ollama patches the native path (PR #14676).
-  openai_compat_models:
-    - gemini-3-flash-preview:cloud
+  # Thinking (reasoning) pass for models that support Ollama's `think`
+  # parameter (kimi-k2.7-code does). false = no think kwarg sent (model
+  # default); true or "low"/"medium"/"high" enables it. Per-model dashboard
+  # settings (model_settings.thinking_enabled) override this global default.
+  think: false
+  # Whether message.thinking is logged when a response carries it. Thinking
+  # is NEVER mixed into spoken/displayed content regardless of this flag.
+  show_thinking: false
   system_prompt: "You are Jarvis, an ambient home AI assistant.\nYou live in the house\
     \ and pay attention to what's going on around you.\nYou are observant, helpful,\
     \ and have a dry wit. You know when to stay quiet.\nYou speak like a smart friend,\

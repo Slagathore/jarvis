@@ -1,3 +1,4 @@
+<!-- markdownlint-disable -->
 # JARVIS — PERSONA SYSTEM BOOTSTRAP
 
 > **Read this entire document before writing a single line of code.**
@@ -31,7 +32,7 @@ later. The framework supports them — the bindings just don't ship in v1.
 |---|---|---|
 | Trigger surface (v1) | Dashboard only — dropdown OR command box | Lowest blast radius while we tune. Voice triggers ride on top later. |
 | Multiple personas? | Yes — `default`, `uwu`, leave room for `focus`, etc. | Future-proofs the system. uwu is just one row in the table. |
-| Model swap per persona? | NO — global Gemini 3 Flash Preview handles all personas. | Strong prompt-following on a capable model is enough; eliminates a whole class of config + lifecycle complexity. |
+| Model swap per persona? | NO — the single global model (now kimi-k2.7-code:cloud) handles all personas. | Strong prompt-following on a capable model is enough; eliminates a whole class of config + lifecycle complexity. |
 | Voice swap per persona? | NO — TTS plays whatever voice is currently active. | User will swap voice manually if they want; not worth the wiring. |
 | uwu visibility | Hidden — never referenced unless asked directly AND alone | User's private feature. Discretion is a hard requirement, not a polish item. |
 | Memory model | Shared across personas | Conversation continuity. Discretion handled at PROMPT layer, not memory layer. |
@@ -413,7 +414,7 @@ Optional but recommended. Before any LLM output goes to TTS or dashboard:
   - On match, log a leak event for tuning (you'll want this signal)
 
 This catches LLM slips when discretion fails at the prompt layer. Cheap
-insurance, even with a strong model like Gemini Flash.
+insurance, even with a strong model like Kimi K2.7.
 
 ---
 

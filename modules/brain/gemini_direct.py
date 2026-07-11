@@ -31,7 +31,7 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def _strip_gapi_suffix(model_name: str) -> str:
-    """'gemini-3-flash-preview:gapi' -> 'gemini-3-flash-preview'."""
+    """'gemini-flash-latest:gapi' -> 'gemini-flash-latest'."""
     return model_name.replace(":gapi", "").strip()
 
 

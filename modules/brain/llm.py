@@ -45,7 +45,7 @@ class OllamaLLM:
     Async Ollama LLM client for chat and vision queries.
 
     Config keys used (from config["ollama"]):
-        model:           Text model to use (e.g., "gemini-3-flash-preview:cloud")
+        model:           Text model to use (e.g., "kimi-k2.7-code:cloud")
         vision_model:    Vision model. Defaults to `model` when omitted.
         base_url:        Ollama API URL (default "http://localhost:11434")
         timeout_seconds: Request timeout
@@ -69,6 +69,15 @@ class OllamaLLM:
         self._base_url: str = cfg.get("base_url", "http://localhost:11434")
         self._timeout: int = cfg.get("timeout_seconds", 30)
         self._system_prompt: str = cfg.get("system_prompt", "You are Jarvis.")
+        # Global thinking default (config.ollama.think): False (default)
+        # sends no think kwarg so every model keeps its own default; True or
+        # "low"/"medium"/"high" enables the thinking pass on models that
+        # support it (kimi-k2.7-code does). Per-model dashboard settings
+        # (thinking_enabled) override this.
+        self._default_think: Any = cfg.get("think", False)
+        # Whether message.thinking gets logged when a response carries it.
+        # Thinking is never mixed into returned content either way.
+        self._show_thinking: bool = bool(cfg.get("show_thinking", False))
 
         try:
             import ollama
@@ -80,16 +89,6 @@ class OllamaLLM:
         # the ':gapi' suffix gets selected — keeps the import + httpx pool out
         # of the boot path for users who never use the direct API.
         self._gemini_direct: Optional[Any] = None
-        # OpenAI-compat side-route. Models listed here are routed through
-        # Ollama's /v1 endpoint instead of the native API — a per-model
-        # workaround for the native API dropping Gemini-3's thought_signature
-        # on tool-call round-trips (ollama/ollama#14567). See
-        # modules/brain/openai_compat.py. Empty the config list once Ollama
-        # patches it upstream and this route goes dormant.
-        self._openai_compat_models: set[str] = {
-            str(m) for m in (cfg.get("openai_compat_models") or [])
-        }
-        self._openai_compat: Optional[Any] = None
         # Shared httpx client for the async health check — avoids paying TLS
         # / connection setup on every probe of /api/tags. Sync is_available()
         # is one-shot at boot, so it stays plain httpx.get.
@@ -169,19 +168,6 @@ class OllamaLLM:
             self._gemini_direct = GeminiDirectClient(timeout=self._timeout)
         return self._gemini_direct
 
-    def _uses_openai_compat(self, model_name: str) -> bool:
-        """True for models routed through Ollama's /v1 OpenAI-compatible
-        endpoint instead of the native API (config.ollama.openai_compat_models)."""
-        return (model_name or "") in self._openai_compat_models
-
-    def _get_openai_compat(self) -> Any:
-        if self._openai_compat is None:
-            from modules.brain.openai_compat import OpenAICompatClient
-            self._openai_compat = OpenAICompatClient(
-                base_url=self._base_url, timeout=self._timeout,
-            )
-        return self._openai_compat
-
     @property
     def model(self) -> str:
         """Current text-chat model name. Read by health checks + dashboard."""
@@ -234,26 +220,26 @@ class OllamaLLM:
             except Exception:
                 pass
             self._gemini_direct = None
-        if self._openai_compat is not None:
-            try:
-                await self._openai_compat.aclose()
-            except Exception:
-                pass
-            self._openai_compat = None
 
     async def _build_options_and_think(self, model_name: str) -> tuple[dict, Optional[bool]]:
         """Translate stored model_settings into Ollama's options dict + think
         kwarg. Skips fields the user hasn't overridden so the model's
-        defaults remain in effect for everything not explicitly tuned."""
+        defaults remain in effect for everything not explicitly tuned.
+
+        The think fallback is the global config.ollama.think knob: False
+        means "send nothing" (models keep their own default), anything else
+        (True / "low" / "medium" / "high") is passed through. A per-model
+        thinking_enabled setting always wins over the global knob."""
+        default_think = self._default_think if self._default_think is not False else None
         if not hasattr(self, "_settings_provider") or self._settings_provider is None:
-            return {}, None
+            return {}, default_think
         try:
             s = await self._settings_provider.get_settings(model_name)
         except Exception as e:
             logger.debug(f"[LLM] settings lookup failed: {e}")
-            return {}, None
+            return {}, default_think
         if not s:
-            return {}, None
+            return {}, default_think
         options: dict = {}
         # Map our field names to Ollama's option keys (note: repeat_penalty,
         # not repetition_penalty).
@@ -270,6 +256,8 @@ class OllamaLLM:
             if v is not None:
                 options[theirs] = v
         think = s.get("thinking_enabled")
+        if think is None:
+            think = default_think
         return options, think
 
     async def chat(self, messages: list[dict[str, Any]]) -> str:
@@ -289,9 +277,6 @@ class OllamaLLM:
         # Dispatch: ':gapi' models go through Google's direct API instead of Ollama.
         if self._is_gemini_direct(self._model):
             return await self._get_gemini_direct().chat(messages, model=self._model)
-        # Dispatch: openai-compat models go through Ollama's /v1 endpoint.
-        if self._uses_openai_compat(self._model):
-            return await self._get_openai_compat().chat(messages, self._model)
 
         options, think = await self._build_options_and_think(self._model)
         chat_kwargs: dict = {"model": self._model, "messages": messages}
@@ -306,6 +291,9 @@ class OllamaLLM:
                 timeout=self._timeout,
             )
             text = response["message"]["content"].strip()
+            thinking = response["message"].get("thinking")
+            if thinking and self._show_thinking:
+                logger.info(f"[LLM] Thinking: {thinking}")
             logger.debug(f"[LLM] Response ({len(text)} chars): {text[:100]}...")
             self._record_model_call("ollama", self._model, started, ok=True)
             return text
@@ -362,21 +350,6 @@ class OllamaLLM:
         # it's faster and we don't need swapping anyway.
         if self._is_gemini_direct(self._model) and not self._action_model:
             return await self._get_gemini_direct().chat_with_tools(
-                messages=messages,
-                tools=tools,
-                model=self._model,
-                tool_dispatcher=tool_handlers,
-                max_iterations=max_iterations,
-            )
-        # OpenAI-compat side-route — runs the whole tool loop through Ollama's
-        # /v1 endpoint. Taken when the chat model is openai-compat AND the
-        # action model is unset or also openai-compat (no cross-transport
-        # Pattern-D swap needed). A mixed local action_model falls through to
-        # the native per-iteration loop below.
-        if (self._uses_openai_compat(self._model)
-                and (not self._action_model
-                     or self._uses_openai_compat(self._action_model))):
-            return await self._get_openai_compat().chat_with_tools(
                 messages=messages,
                 tools=tools,
                 model=self._model,
@@ -529,6 +502,9 @@ class OllamaLLM:
                     )
 
                 message = response.get("message", {}) or {}
+                thinking = message.get("thinking")
+                if thinking and self._show_thinking:
+                    logger.info(f"[LLM] Thinking: {thinking}")
                 tool_calls = message.get("tool_calls") or []
 
             if not tool_calls:
@@ -647,11 +623,6 @@ class OllamaLLM:
             return await self._get_gemini_direct().vision_query(
                 buf.tobytes(), prompt, model=self._vision_model
             )
-        # Dispatch: openai-compat models go through Ollama's /v1 endpoint.
-        if self._uses_openai_compat(self._vision_model):
-            return await self._get_openai_compat().vision_query(
-                buf.tobytes(), prompt, model=self._vision_model
-            )
 
         img_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
 
@@ -675,6 +646,9 @@ class OllamaLLM:
                 timeout=self._timeout,
             )
             description = response["message"]["content"].strip()
+            thinking = response["message"].get("thinking")
+            if thinking and self._show_thinking:
+                logger.info(f"[LLM] Thinking: {thinking}")
             logger.debug(f"[LLM] Vision: {description[:120]}")
             self._record_model_call("ollama-vision", self._vision_model, started, ok=True)
             return description
