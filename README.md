@@ -1,27 +1,28 @@
-# Jarvis — Ambient Home AI
+# Jarvis, ambient home AI
 
-A local, always-on ambient AI assistant that lives in your house instead of in a cloud.
-It watches what you're doing, respects when you're busy, and speaks up when it has something worth saying.
+A local, always-on assistant that lives in your house instead of in a cloud. It watches what you're doing, stays quiet when you're busy, and speaks up when it has something worth saying.
 
-No cloud subscriptions. No wake-word-to-server round trips. Everything runs on your local GPU.
+No cloud subscriptions, no wake word to server round trips. Everything runs on your local GPU.
 
 ---
 
-## What It Does
+## What it does
 
-- **Wakes on a custom wake word** ("Hey Jarvis") detected locally via [openWakeWord](https://github.com/dscripka/openWakeWord)
-- **Triages ambient speech** through a staged voice cascade (VAD → wake → sound-event → STT → triage) so it can act on things said *near* it, not only after a wake word — every room mic, including the office PC mic, runs the cascade
-- **Transcribes speech** with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CUDA-accelerated)
-- **Understands context** — knows if you're gaming, on a call, asleep, or cooking, and adjusts interruptibility accordingly
-- **Watches rooms via camera** for mess, light state, posture, and presence using YOLOv8 + MediaPipe
-- **Classifies ambient audio** (appliances, music, silence) via TensorFlow/YAMNet
-- **Learns object + sound names** — unknowns it keeps seeing or hearing surface in the dashboard **Review tab** with a photo or audio clip; name them there (or by voice) and it recognises them from then on
-- **Identifies residents and pets individually** — face + voice for people, a per-pet visual identity for cats and dogs; proactive speech addresses whoever is actually in the room, not one default person
-- **Flags behavioral anomalies** — learns each resident's daily routine and surfaces genuinely-unusual events (off-hours activity, an unexpected room) in a dashboard review queue
-- **Speaks proactively** when curiosity fires and you're interruptible — "Washer's done." / "Kitchen counter's looking a bit busy." Speech is local via [Piper](https://github.com/rhasspy/piper) or the more expressive [Kokoro](https://github.com/hexgrad/kokoro) backend, selectable per voice
-- **Responds to direct questions** via Ollama LLM running locally or configured cloud-backed models
-- **Real-time dashboard** at `http://localhost:7070` — activity state, room status, conversation log, appliance tracking, a **Review tab** (unknown faces / objects / sounds), behavioral-anomaly queue, degraded-mode status, wake calibration, and perf/model-call metrics
-- **Multi-room support** via ESP32-CAM nodes over MQTT (optional hardware expansion)
+Jarvis listens and watches across your rooms and acts on what it notices:
+
+- Wakes on a custom wake word ("Hey Jarvis") detected locally via [openWakeWord](https://github.com/dscripka/openWakeWord).
+- Triages ambient speech through a staged voice cascade (VAD, wake, sound event, STT, triage) so it can act on things said near it, not only after a wake word. Every room mic runs the cascade, including the office PC mic.
+- Transcribes speech with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), CUDA accelerated.
+- Tracks context. It knows if you're gaming, on a call, asleep, or cooking, and adjusts how willing it is to interrupt.
+- Watches rooms via camera for mess, light state, posture, and presence using YOLOv8 plus MediaPipe.
+- Classifies ambient audio (appliances, music, silence) via TensorFlow/YAMNet.
+- Learns object and sound names. Unknowns it keeps seeing or hearing surface in the dashboard Review tab with a photo or audio clip. Name them there or by voice and it recognizes them from then on.
+- Identifies residents and pets individually. Face plus voice for people, a per-pet visual identity for cats and dogs. Proactive speech addresses whoever is actually in the room, not one default person.
+- Flags behavioral anomalies. It learns each resident's daily routine and surfaces genuinely unusual events (off-hours activity, an unexpected room) in a dashboard review queue.
+- Speaks proactively when curiosity fires and you're interruptible. "Washer's done." "Kitchen counter's looking a bit busy." Speech is local via [Piper](https://github.com/rhasspy/piper) or the more expressive [Kokoro](https://github.com/hexgrad/kokoro) backend, selectable per voice.
+- Answers direct questions via an Ollama LLM running locally or a configured cloud model.
+- Serves a live dashboard at `http://localhost:7070`: activity state, room status, conversation log, appliance tracking, the Review tab (unknown faces, objects, sounds), the behavioral-anomaly queue, degraded-mode status, wake calibration, and per-model call metrics.
+- Supports multiple rooms via ESP32-CAM nodes over MQTT (optional hardware expansion).
 
 ---
 
@@ -30,7 +31,7 @@ No cloud subscriptions. No wake-word-to-server round trips. Everything runs on y
 ```text
 ┌─────────────────────────────────────────────────────┐
 │                    Orchestrator                      │
-│  (core/orchestrator.py — async task coordinator)    │
+│  (core/orchestrator.py - async task coordinator)    │
 └───────────────┬─────────────────────────────────────┘
                 │ EventBus (priority pub/sub, no direct imports)
     ┌───────────┼───────────────────────────────┐
@@ -57,22 +58,22 @@ No cloud subscriptions. No wake-word-to-server round trips. Everything runs on y
         └───────────────┘
 ```
 
-Most runtime modules communicate through the async event bus. The bus is bounded, priority-aware, and rate-limits high-volume telemetry topics so wake, safety, alarm, and control events do not sit behind bursts of camera/world/debug traffic.
+Most runtime modules talk through the async event bus. The bus is bounded, priority aware, and rate-limits high-volume telemetry topics so wake, safety, alarm, and control events do not sit behind bursts of camera, world, and debug traffic.
 
 ---
 
 ## Hardware
 
-### Minimum (single-room, software only)
+### Minimum (single room, software only)
 
 - Windows 10/11 PC with a discrete GPU (NVIDIA recommended)
 - Microphone
 - Speakers
 
-### Full multi-room build
+### Full multiroom build
 
-- As above, plus one or more **AI-Thinker ESP32-CAM** nodes per room
-- Each node provides: microphone input, speaker output, camera stream, and MQTT heartbeat
+- As above, plus one or more AI-Thinker ESP32-CAM nodes per room
+- Each node provides microphone input, speaker output, a camera stream, and an MQTT heartbeat
 - See [hardware/esphome/BUILD_OFFICE_NODE.md](hardware/esphome/BUILD_OFFICE_NODE.md) for the first node build guide
 
 ---
@@ -81,8 +82,8 @@ Most runtime modules communicate through the async event bus. The bus is bounded
 
 - Python 3.10+
 - [Ollama](https://ollama.com) running locally with your chosen model
-- [Mosquitto MQTT broker](https://mosquitto.org/download/) (for multi-room; optional for single-room)
-- NVIDIA GPU with CUDA (strongly recommended — Whisper + YOLO are significantly faster)
+- [Mosquitto MQTT broker](https://mosquitto.org/download/) for multiroom (optional for single room)
+- NVIDIA GPU with CUDA. Strongly recommended, since Whisper and YOLO are much faster on it.
 
 ---
 
@@ -100,7 +101,7 @@ python -m venv .venv
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. (CUDA — recommended) Reinstall torch with GPU support
+# 4. (CUDA, recommended) Reinstall torch with GPU support
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 # 5. Copy and fill in secrets
@@ -112,14 +113,14 @@ ollama serve
 ollama pull YOUR_CHOSEN_MODEL    # e.g. ollama pull llama3.1:8b
 mosquitto -v                     # or start as a Windows service
 
-# 7. Run the setup validator — must show all PASS before launching
+# 7. Run the setup validator. It must show all PASS before you launch.
 python scripts/setup.py
 
 # 8. Launch
 python main.py
 ```
 
-Dashboard opens automatically. Browse to `http://localhost:7070`.
+The dashboard opens automatically. Otherwise browse to `http://localhost:7070`.
 
 ---
 
@@ -132,22 +133,22 @@ Key sections:
 | Section | What to change |
 | --- | --- |
 | `ollama.model` | Which Ollama model to use for chat and vision |
-| `ollama.system_prompt` | Personality and household context — customize to your setup |
-| `voice.whisper.model_size` | STT accuracy vs. speed (`base` → `large-v3`) |
+| `ollama.system_prompt` | Personality and household context. Customize to your setup. |
+| `voice.whisper.model_size` | STT accuracy vs. speed (`base` up to `large-v3`) |
 | `voice.wake_word.model` | openWakeWord model name |
 | `system.event_bus` | Queue size and per-topic telemetry rate limits |
-| `rooms` | Per-room `video` / `mic` / `speaker` channels — see `WYZE_SETUP.md` |
+| `rooms` | Per-room video, mic, and speaker channels. See `WYZE_SETUP.md`. |
 | `interruptibility.activity_scores` | How interruptible each detected activity is |
 | `curiosity.topic_cooldowns_hours` | How often Jarvis can proactively comment on each topic |
-| `process_activity_map` | Map your specific game/app .exe names to activities |
+| `process_activity_map` | Map your specific game or app .exe names to activities |
 
 ---
 
-## Project Structure
+## Project structure
 
 ```text
 jarvis/
-├── main.py                     # Entry point — boots orchestrator
+├── main.py                     # Entry point, boots orchestrator
 ├── config.yaml                 # Single source of truth for all config
 ├── requirements.txt
 │
@@ -171,7 +172,7 @@ jarvis/
 │
 ├── dashboard/
 │   ├── server.py               # FastAPI + WebSocket server
-│   └── static/                 # Vanilla JS/CSS — no build step
+│   └── static/                 # Vanilla JS/CSS, no build step
 │
 ├── hardware/
 │   └── esphome/                # ESPHome firmware configs for ESP32-CAM nodes
@@ -184,7 +185,7 @@ jarvis/
 │   └── clean_face_bank.py      # Rebuild a face bank around its coherent core
 │
 ├── start.ps1 / stop.ps1        # Launch / graceful-stop Jarvis
-├── force_stop.ps1              # Guaranteed kill — every Jarvis process, nothing else
+├── force_stop.ps1              # Guaranteed kill, every Jarvis process, nothing else
 │
 └── data/                       # Runtime data (gitignored)
     ├── jarvis.db               # SQLite event/conversation log
@@ -193,75 +194,75 @@ jarvis/
 
 ---
 
-## ESP32-CAM Nodes (Multi-Room)
+## ESP32-CAM nodes (multiroom)
 
 Nodes are flashed with [ESPHome](https://esphome.io). Each node provides:
 
-- MJPEG camera stream (OpenCV connects over HTTP)
-- MQTT status heartbeat (birth/will messages)
+- An MJPEG camera stream (OpenCV connects over HTTP)
+- An MQTT status heartbeat (birth and will messages)
 - Microphone and speaker via I2S (INMP441 + MAX98357A)
 
 See the [build guide](hardware/esphome/BUILD_OFFICE_NODE.md) to bring up the first node.
 
-To add a node: copy `hardware/esphome/secrets.yaml.example` to `hardware/esphome/secrets.yaml`, fill in your network details, then set `has_node: true` and `node_ip` for that room in `config.yaml`.
+To add a node, copy `hardware/esphome/secrets.yaml.example` to `hardware/esphome/secrets.yaml`, fill in your network details, then set `has_node: true` and `node_ip` for that room in `config.yaml`.
 
 ---
 
-## What Each Module Does
+## What each module does
 
 ### `core/orchestrator.py`
 
-The only file that imports from multiple modules. Everything else communicates via the event bus. Orchestrator starts all async loops, routes wake-word events through the voice pipeline, and calls `_broadcast()` to keep the dashboard current.
+The only file that imports from multiple modules. Everything else talks over the event bus. The orchestrator starts all async loops, routes wake-word events through the voice pipeline, and calls `_broadcast()` to keep the dashboard current.
 
 ### `core/event_bus.py`
 
-Async priority queue. Producers call `await bus.publish(topic, payload)`. Consumers register with `bus.subscribe(topic, handler)`. Wake/safety/control topics are dispatched ahead of world/telemetry/debug topics, high-volume telemetry has token-bucket rate limits, and a crashed handler never takes down the bus.
+Async priority queue. Producers call `await bus.publish(topic, payload)`. Consumers register with `bus.subscribe(topic, handler)`. Wake, safety, and control topics dispatch ahead of world, telemetry, and debug topics. High-volume telemetry gets token-bucket rate limits, and a crashed handler never takes down the bus.
 
 ### `modules/integrations/`
 
-Small plugin-style contracts for future sensors and actuators. New integrations should implement `SensorPlugin` or `ActuatorPlugin`, publish/subscribe through `EventBus`, and register with `IntegrationRegistry` instead of adding more direct wiring to `core/orchestrator.py`.
+Small plugin-style contracts for future sensors and actuators. New integrations should implement `SensorPlugin` or `ActuatorPlugin`, publish and subscribe through `EventBus`, and register with `IntegrationRegistry` instead of adding more direct wiring to `core/orchestrator.py`.
 
-### Dashboard Operations
+### Dashboard operations
 
-The dashboard now includes:
+The dashboard includes:
 
-- **Perf tab model tracking** — per provider/model daily calls, cloud calls, average latency, timeout rate, and average tool-loop iterations.
-- **Degraded Mode card** — best-effort loaded/degraded/disabled status for wake word, STT, TTS, LLM, MQTT, cameras, identity, world model, open-vocab objects, and registered integrations.
-- **Wake Calibration card** — per-room RMS, peak level, wake score, false-positive count, and suggested sensitivity.
-- **Anomalies card** — behavioral-anomaly review queue (§25): events that scored unusual against a resident's learned routine, each with its score, the triggering event, the per-signal breakdown, and a "not unusual" button that feeds threshold auto-tuning.
-- **Review tab** — name or dismiss what Jarvis can't yet identify: unknown faces (the face-bank pending queue), unknown **objects** (with the saved crop and where they keep appearing), and unknown **sounds** (with a playback clip).
+- Perf tab model tracking: per provider and model, daily calls, cloud calls, average latency, timeout rate, and average tool-loop iterations.
+- Degraded Mode card: best-effort loaded, degraded, or disabled status for wake word, STT, TTS, LLM, MQTT, cameras, identity, world model, open-vocab objects, and registered integrations.
+- Wake Calibration card: per-room RMS, peak level, wake score, false-positive count, and suggested sensitivity.
+- Anomalies card: the behavioral-anomaly review queue (§25). Events that scored unusual against a resident's learned routine, each with its score, the triggering event, the per-signal breakdown, and a "not unusual" button that feeds threshold auto-tuning.
+- Review tab: name or dismiss what Jarvis can't yet identify. Unknown faces (the face-bank pending queue), unknown objects (with the saved crop and where they keep appearing), and unknown sounds (with a playback clip).
 
 ### `modules/context/state_fusion.py`
 
-Combines signals from PC monitor, audio classifier, posture detector, and vision into a single `ActivityState`. Weighted voting with confidence scores. The state drives interruptibility decisions.
+Combines signals from the PC monitor, audio classifier, posture detector, and vision into a single `ActivityState`. Weighted voting with confidence scores. That state drives interruptibility decisions.
 
 ### `modules/context/interruptibility.py`
 
-Given the current activity state and a speech priority level (`conversation` / `ambient` / `urgent` / `notification`), returns whether Jarvis should speak right now. Enforces quiet hours and inter-interrupt cooldowns.
+Given the current activity state and a speech priority level (`conversation`, `ambient`, `urgent`, `notification`), it returns whether Jarvis should speak right now. It enforces quiet hours and inter-interrupt cooldowns.
 
 ### `modules/context/curiosity.py`
 
-Topic-based proactive speech engine. Each topic (gaming, cooking, napping, etc.) has a cooldown. When activity matches a topic and the cooldown has elapsed and interruptibility allows, the engine generates a relevant one-liner via LLM and triggers `_speak()`.
+Topic-based proactive speech engine. Each topic (gaming, cooking, napping, and so on) has a cooldown. When activity matches a topic, the cooldown has elapsed, and interruptibility allows it, the engine generates a relevant one-liner via the LLM and triggers `_speak()`.
 
 ---
 
-## Secrets Management
+## Secrets management
 
-Credentials are **never** committed:
+Credentials are never committed:
 
-- Copy `.env.example` → `.env` for MQTT credentials
-- Copy `hardware/esphome/secrets.yaml.example` → `hardware/esphome/secrets.yaml` for WiFi/OTA credentials
-- Both files are in `.gitignore`
+- Copy `.env.example` to `.env` for MQTT credentials.
+- Copy `hardware/esphome/secrets.yaml.example` to `hardware/esphome/secrets.yaml` for WiFi and OTA credentials.
+- Both target files are in `.gitignore`.
 
 ---
 
-## Limitations / Roadmap
+## Limitations and roadmap
 
-- **Large coordinators** — `core/orchestrator.py` is split into mixins (init / loops / conversation / tools); `dashboard/server.py` is still one large file and is the remaining decomposition candidate.
-- **Migrate integrations gradually** — existing camera/audio/MQTT integrations still live in the orchestrator path, but new sensors/actuators should use `modules/integrations/`.
-- **Dashboard auth** — keep the dashboard on a trusted network until token auth is added, especially when `dashboard_host` is `0.0.0.0`.
-- **YAMNet on CPU** — TensorFlow CUDA support requires additional setup; YAMNet runs on CPU by default.
-- **Open-vocab weights** — `open-clip-torch` and `transformers` are now in requirements because `config.yaml` enables open-vocabulary object tracking by default. First boot downloads CLIP/OWLv2 weights to the Hugging Face cache.
+- Large coordinators. `core/orchestrator.py` is split into mixins (init, loops, conversation, tools). `dashboard/server.py` is still one large file and is the remaining decomposition candidate.
+- Migrating integrations gradually. Existing camera, audio, and MQTT integrations still live in the orchestrator path, but new sensors and actuators should use `modules/integrations/`.
+- Dashboard auth. Keep the dashboard on a trusted network until token auth is added, especially when `dashboard_host` is `0.0.0.0`.
+- YAMNet on CPU. TensorFlow CUDA support needs extra setup, so YAMNet runs on CPU by default.
+- Open-vocab weights. `open-clip-torch` and `transformers` are in requirements because `config.yaml` enables open-vocabulary object tracking by default. First boot downloads CLIP and OWLv2 weights to the Hugging Face cache.
 
 ---
 

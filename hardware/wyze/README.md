@@ -43,11 +43,11 @@ hands out).
 The base wz_mini.conf you pulled was missing two lines that close the
 OTA-config gap. The conf files in this folder add them:
 
-- `WEB_SERVER_OPTIONS="cam config car jpeg multicam diag status"` — turns on
+- `WEB_SERVER_OPTIONS="cam config car jpeg multicam diag status"` turns on
   the WZ Mini Web Tools at `http://<cam>/` (config editor, status page,
   jpeg snapshots, diagnostic CGI). Without it the index renders blank
   and CGI endpoints 404.
-- `ENABLE_FILESERVER="true"` — exposes a file PUT endpoint so future
+- `ENABLE_FILESERVER="true"` exposes a file PUT endpoint so future
   config tweaks (rotating creds, bitrates, paths) can be done with curl
   instead of another SD trip.
 
@@ -68,14 +68,14 @@ WYZE_SSH_PASSWORD=
 WYZE_SSH_KEY_PATH=C:/Users/Cole/.ssh/jarvis_wyze
 ```
 
-(Already set — see `.env`.)
+(Already set, see `.env`.)
 
 ## Verifying the path
 
 `wz_mini/etc/ssh/authorized_keys` matches the SD_ROOT layout in the
 wz_mini_hacks repo (`wz_mini_hacks-master/SD_ROOT/wz_mini/etc/ssh/`),
 which is what your build is using. wz_mini_hacks here runs OpenSSH
-(`sshd`), not Dropbear — so the path is the standard OpenSSH location.
+(`sshd`), not Dropbear, so the path is the standard OpenSSH location.
 
 After the first cam boots, you can confirm by SSH-ing in and running:
 
