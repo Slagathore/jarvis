@@ -2,7 +2,7 @@
 
 A local, always-on assistant that lives in your house instead of in a cloud. It watches what you're doing, stays quiet when you're busy, and speaks up when it has something worth saying.
 
-No cloud subscriptions, no wake word to server round trips. Everything runs on your local GPU.
+No cloud required. Nothing has to leave your machine. Free and fully local capable, local or cloud model, configurable. Wake word detection runs locally, so there are no wake word to server round trips.
 
 ---
 
