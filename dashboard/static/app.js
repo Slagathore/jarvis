@@ -19,6 +19,80 @@
 
 "use strict";
 
+// ── Dashboard access token ─────────────────────────────────────────────────
+// The dashboard exempts localhost from auth, so on Cole's own machine this is
+// a no-op. For off-box access the token arrives once as ?token=… in the URL
+// (a bookmarkable link); we stash it in localStorage + a same-origin cookie,
+// strip it from the visible URL, and let it ride along automatically on every
+// request — fetch (via header), <img>/<audio>/WebSocket (via the cookie) — so
+// no token is ever typed by hand. A localhost page also gets the token
+// injected server-side as window.__JARVIS_DASHBOARD_TOKEN__.
+const JARVIS_TOKEN = (function () {
+  const KEY = "jarvis_dashboard_token";
+  let token = "";
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const fromUrl = params.get("token");
+    if (fromUrl) {
+      token = fromUrl;
+      params.delete("token");
+      const q = params.toString();
+      const clean =
+        window.location.pathname + (q ? "?" + q : "") + window.location.hash;
+      window.history.replaceState({}, "", clean);
+    }
+  } catch (e) {}
+  if (!token) {
+    try {
+      token = localStorage.getItem(KEY) || "";
+    } catch (e) {}
+  }
+  if (!token && window.__JARVIS_DASHBOARD_TOKEN__) {
+    token = window.__JARVIS_DASHBOARD_TOKEN__;
+  }
+  if (token) {
+    try {
+      localStorage.setItem(KEY, token);
+    } catch (e) {}
+    // The cookie carries the token to same-origin fetch, <img>, <audio>, and
+    // WebSocket requests automatically. Lax so cross-site POSTs don't send it;
+    // one-year lifetime so a bookmarked plain URL keeps working off-box.
+    try {
+      document.cookie =
+        KEY +
+        "=" +
+        encodeURIComponent(token) +
+        "; path=/; max-age=31536000; SameSite=Lax";
+    } catch (e) {}
+    // Header fallback for fetch when cookies are unavailable.
+    const origFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      init = Object.assign({}, init);
+      const headers = new Headers(
+        (init && init.headers) ||
+          (input && typeof input === "object" && input.headers) ||
+          {}
+      );
+      if (!headers.has("X-Dashboard-Token")) {
+        headers.set("X-Dashboard-Token", token);
+      }
+      init.headers = headers;
+      return origFetch(input, init);
+    };
+  }
+  return token;
+})();
+
+// Build a WebSocket URL, appending the token (browsers can't set WS headers,
+// and the cookie covers same-origin, but this is a belt-and-suspenders path).
+function jarvisWsUrl(path) {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const base = proto + "://" + location.host + path;
+  return JARVIS_TOKEN
+    ? base + "?token=" + encodeURIComponent(JARVIS_TOKEN)
+    : base;
+}
+
 // Keeps the latest room data so updateRooms always renders the full set
 let roomsCache = {};
 let activeTab = "home";
@@ -74,7 +148,7 @@ document.addEventListener("visibilitychange", () => {
 
 // ── WebSocket Connection ───────────────────────────────────────────────────
 
-const WS_URL = `ws://${window.location.host}/ws`;
+const WS_URL = jarvisWsUrl("/ws");
 let ws = null;
 let reconnectTimeout = null;
 
@@ -5813,8 +5887,7 @@ const LOG_MAX_LINES = 2000;
 
 function connectLogStream() {
   if (_logSocket && _logSocket.readyState <= 1) return;
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  _logSocket = new WebSocket(`${proto}://${location.host}/ws/logs`);
+  _logSocket = new WebSocket(jarvisWsUrl("/ws/logs"));
   _logSocket.addEventListener("open", () => {
     _sendLogFilter();
   });

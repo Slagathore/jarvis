@@ -13,7 +13,12 @@ system:
   data_dir: data/
   dashboard_enabled: true
   dashboard_port: 7070
-  dashboard_host: 0.0.0.0
+  # Bind address. 127.0.0.1 keeps the dashboard on this machine only, which is
+  # the safe default: it exposes cameras, mics, config, and computer control.
+  # Set to 0.0.0.0 to reach it from other devices on the LAN. Off-box requests
+  # then require the auto-generated access token (data/dashboard_token);
+  # localhost is always exempt, so your own access here never changes.
+  dashboard_host: 127.0.0.1
   event_bus:
     max_queue_size: 1000
     rate_limits:

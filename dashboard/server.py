@@ -31,9 +31,14 @@ Endpoints:
     GET  /static/*   → serves CSS, JS
     WS   /ws         → real-time event stream to browser
     GET  /api/state  → current full state snapshot
-    GET  /api/health → liveness check
+    GET  /api/health → liveness check (auth-exempt)
 
-#todo: Add authentication (simple token header) to prevent unauthorized dashboard access
+Auth: every HTTP + WebSocket route is guarded by TokenAuthMiddleware
+    (dashboard/auth.py). Localhost / 127.0.0.1 is exempt so the local user
+    needs nothing; off-box requests must present the auto-generated token via
+    the X-Dashboard-Token header, a `token` query parameter, or the
+    same-origin cookie the UI sets. /api/health is the only exempt path.
+
 #todo: Add event replay buffer — allow catching up on missed events after reconnect
 #todo: Add REST API to manually set Jarvis DND mode from the dashboard
 """
@@ -52,6 +57,11 @@ from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from core.async_utils import TrackedTaskSet
+from dashboard.auth import (
+    TokenAuthMiddleware,
+    is_local_host,
+    load_or_create_token,
+)
 
 try:
     import cv2
@@ -64,10 +74,57 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 
 class DashboardServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 7070):
+    # Routes that never require the token. A liveness probe must answer even
+    # an un-tokened off-box monitor.
+    _AUTH_EXEMPT_PATHS = ("/api/health",)
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 7070,
+        *,
+        auth_token: Optional[str] = None,
+        require_auth: bool = True,
+        data_dir: "str | os.PathLike[str]" = "data",
+    ):
         self.host = host
         self.port = port
+        # Access token for off-box requests. Localhost is always exempt, so
+        # this never affects Cole opening the dashboard on the same machine.
+        # An explicit auth_token wins (tests pin one); otherwise load or
+        # generate one and persist it to a gitignored file, unless auth is
+        # turned off entirely.
+        if auth_token is not None:
+            self._auth_token: Optional[str] = auth_token or None
+        elif require_auth:
+            self._auth_token = load_or_create_token(data_dir)
+        else:
+            self._auth_token = None
+        # "Wide" = bound to anything other than loopback, i.e. reachable from
+        # the LAN. With no token that is a fully open control surface; warn
+        # loudly but do NOT hard-fail Cole's own startup.
+        self._bound_wide = not is_local_host(host)
+        if self._bound_wide and self._auth_token is None:
+            logger.warning(
+                f"[Dashboard] Bound to {host!r} (LAN-reachable) with NO access "
+                "token. Every camera, mic, and computer-control route is open "
+                "to anyone on the network. Set JARVIS_DASHBOARD_TOKEN or bind "
+                "dashboard_host to 127.0.0.1."
+            )
+        elif self._bound_wide:
+            logger.info(
+                f"[Dashboard] Bound to {host!r}; off-box requests require the "
+                "access token, localhost is exempt."
+            )
         self.app = FastAPI(title="Jarvis Dashboard", docs_url=None, redoc_url=None)
+        # Token guard over every HTTP + WebSocket route (localhost + the
+        # health probe are exempt). Reuses the same shared-secret pattern as
+        # the X-Webhook-Token check further down this file.
+        self.app.add_middleware(
+            TokenAuthMiddleware,
+            token=self._auth_token,
+            exempt_paths=self._AUTH_EXEMPT_PATHS,
+        )
         self._clients: list[WebSocket] = []
         # Tracks fire-and-forget tasks the dashboard spawns from HTTP
         # handlers (chat, voice-switch). Anchors them against GC and
@@ -457,14 +514,27 @@ class DashboardServer:
             app.mount("/static", NoCacheStatic(directory=str(STATIC_DIR)), name="static")
 
         @app.get("/", response_class=HTMLResponse)
-        async def index():
+        async def index(request: Request):
             html_path = STATIC_DIR / "index.html"
             if html_path.exists():
                 # Same no-cache treatment for the HTML shell — otherwise
                 # an updated index.html (new <script> tags, new section
                 # markup) won't show up either.
+                html = html_path.read_text(encoding="utf-8")
+                # For a LOCAL viewer, inject the access token so the UI carries
+                # it automatically (localhost is exempt anyway, so this only
+                # matters if a request is later addressed off-box). Off-box
+                # viewers are never handed the token here — they must already
+                # hold it to have reached this route at all.
+                client_host = request.client.host if request.client else None
+                if self._auth_token and is_local_host(client_host):
+                    inject = (
+                        "<script>window.__JARVIS_DASHBOARD_TOKEN__="
+                        f"{json.dumps(self._auth_token)};</script>"
+                    )
+                    html = html.replace("</head>", inject + "</head>", 1)
                 return HTMLResponse(
-                    content=html_path.read_text(encoding="utf-8"),
+                    content=html,
                     headers={"Cache-Control": "no-store, max-age=0"},
                 )
             return HTMLResponse(content="<h1>Dashboard loading...</h1>")

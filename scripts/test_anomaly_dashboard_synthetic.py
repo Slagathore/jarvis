@@ -100,7 +100,11 @@ def _row(anomaly_id: str, score: float, invalidated: int = 0) -> dict:
 
 
 def _client(scorer=None, world_model=None) -> TestClient:
-    server = DashboardServer(host="127.0.0.1", port=0)
+    # require_auth=False: this suite exercises the anomaly/routine endpoints,
+    # not the token guard (covered in test_dashboard_auth_synthetic.py).
+    # TestClient's synthetic peer host is not loopback, so leaving auth on
+    # would 401 every call here; disabling it keeps this test focused.
+    server = DashboardServer(host="127.0.0.1", port=0, require_auth=False)
     if scorer is not None or world_model is not None:
         server._orchestrator = StubOrchestrator(scorer, world_model)
     return TestClient(server.app)

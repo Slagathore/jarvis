@@ -437,8 +437,9 @@ class Orchestrator(ToolsMixin, InitMixin, ConversationMixin, LoopsMixin):
         # Dashboard
         if self.config["system"].get("dashboard_enabled", True):
             self.dashboard = DashboardServer(
-                host=self.config["system"].get("dashboard_host", "0.0.0.0"),
+                host=self.config["system"].get("dashboard_host", "127.0.0.1"),
                 port=self.config["system"].get("dashboard_port", 7070),
+                data_dir=self.config["system"].get("data_dir", "data"),
             )
         else:
             self.dashboard = None

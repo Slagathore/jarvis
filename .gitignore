@@ -39,6 +39,8 @@ data/test_frame_*.jpg
 # of the public repo while still loading them at runtime.
 data/personas.local.yaml
 data/personas.local.yml
+# Dashboard off-box access token (auto-generated on first boot)
+data/dashboard_token
 # Supervisor / self-edit runtime state
 data/heartbeat.txt
 data/last_safe_sha.txt
